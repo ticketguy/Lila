@@ -5,7 +5,11 @@ typedef struct LilaTokenizer LilaTokenizer;
 
 LilaTokenizer *lila_load_tokenizer(const char *vocab_path);
 const char *lila_decode_token(LilaTokenizer *tok, int token_id);
-int lila_encode_char(LilaTokenizer *tok, char c);
+char *lila_decode_sequence(LilaTokenizer *tok, const int *tokens, int n_tokens);
+int lila_encode(LilaTokenizer *tok, const char *text, int *output_ids, int max_tokens);
+int lila_get_bos(LilaTokenizer *tok);
+int lila_get_eos(LilaTokenizer *tok);
+int lila_get_vocab_size(LilaTokenizer *tok);
 void lila_free_tokenizer(LilaTokenizer *tok);
 
 #endif
