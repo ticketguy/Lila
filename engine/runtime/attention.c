@@ -1,4 +1,7 @@
 #include "model.h"
+
+/* From inference.c */
+extern void dequant_matvec(float *out, const LilaQuantWeight *w, const float *vec);
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -132,4 +135,4 @@ void lila_attention(
 }
 
 /* Forward declaration for dequant_matvec (defined in inference.c) */
-extern void dequant_matvec(float *out, const LilaQuantWeight *w, const float *vec);
+

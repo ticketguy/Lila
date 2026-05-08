@@ -1,5 +1,12 @@
 #include "model.h"
 #include <math.h>
+
+/* External declarations */
+extern void lila_rmsnorm_avx2(float *out, const float *x, const float *weight, int size, float eps);
+extern void lila_attention(float *output, const float *input, LilaLayer *layer,
+                           LilaKVCache *cache, int layer_idx, int position);
+extern void dequant_matvec(float *out, const LilaQuantWeight *w, const float *vec);
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -14,10 +21,9 @@
  */
 
 /* External kernel declarations */
-extern void lila_rmsnorm_avx2(float *out, const float *x, const float *weight, int size, float eps);
-extern void lila_attention(float *output, const float *input, LilaLayer *layer,
-                           LilaKVCache *cache, int layer_idx, int position);
-extern void dequant_matvec(float *out, const LilaQuantWeight *w, const float *vec);
+
+
+
 
 /* SiLU activation (will be assembly in Phase 4) */
 static inline float silu_f(float x) {

@@ -36,7 +36,7 @@ static void softmax(float *x, int size) {
 }
 
 /* Matrix-vector multiply — THE hot path. Will be assembly. */
-static void matvec(float *out, const float *mat, const float *vec, int rows, int cols) {
+void matvec(float *out, const float *mat, const float *vec, int rows, int cols) {
     for (int i = 0; i < rows; i++) {
         float sum = 0.0f;
         for (int j = 0; j < cols; j++) {
@@ -47,7 +47,7 @@ static void matvec(float *out, const float *mat, const float *vec, int rows, int
 }
 
 /* INT4 dequant + matvec — fused for cache efficiency */
-static void dequant_matvec(float *out, const LilaQuantWeight *w, const float *vec) {
+void dequant_matvec(float *out, const LilaQuantWeight *w, const float *vec) {
     int rows = w->rows;
     int cols = w->cols;
     

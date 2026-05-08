@@ -1,7 +1,7 @@
 # Lila Inference Engine — Build System
 UNAME_M := $(shell uname -m)
 CC := gcc
-CFLAGS := -O3 -march=native -Wall -Wextra -std=c11 -pthread
+CFLAGS := -D_GNU_SOURCE -O3 -march=native -Wall -Wextra -std=c11 -pthread
 LDFLAGS := -lm -lpthread
 
 ifeq ($(UNAME_M),x86_64)
