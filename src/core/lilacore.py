@@ -53,6 +53,7 @@ class LilaCore:
         self._booted = False
         self._conversation_history = []
         self._training_log = []
+        self._harness = None
     
     def boot(self):
         """Wake Lila up. Load the model."""
@@ -78,6 +79,17 @@ class LilaCore:
                 self._boot_api()
         
         self._booted = True
+        
+        # ── Boot the harness (Lila's hands) ──
+        try:
+            from ..harness import HarnessExecutor, register_all_system_tools
+            register_all_system_tools()
+            self._harness = HarnessExecutor()
+            print("\U0001f338 Harness active. Tools ready.")
+        except Exception as e:
+            print(f"\U0001f338 Harness failed to load: {e}")
+            self._harness = None
+        
         print("\U0001f338 Lila is awake.")
     
     def _boot_gguf(self):
@@ -115,7 +127,7 @@ class LilaCore:
         print("   API mode (Phase 1)")
     
     def think(self, input_text: str, context: Optional[Dict] = None) -> LilaResponse:
-        """Core cognitive loop."""
+        """Core cognitive loop — now with tool execution."""
         if not self._booted:
             raise RuntimeError("Call lila.boot() first.")
         
@@ -128,6 +140,19 @@ class LilaCore:
         else:
             response_text = self._generate_api(prompt)
         
+        # ── Execute any tool calls in the response ──
+        actions = []
+        if self._harness and self._harness.has_pending_tools(response_text):
+            results = self._harness.process(response_text)
+            actions = [{"tool": r["name"], "success": r["result"].success,
+                       "output": r["result"].output[:200]} for r in results]
+            # Feed results back — Lila can see what her tools returned
+            if results:
+                augmented = self._harness.augment_context(response_text, results)
+                # Optionally re-generate with tool results in context
+                # For now, just attach the results to the response
+                response_text = augmented
+        
         memory_ops = self._extract_memory_ops(response_text)
         clean_text = self._clean_response(response_text)
         self._log_interaction(input_text, clean_text)
@@ -136,19 +161,26 @@ class LilaCore:
         self._conversation_history.append({"role": "assistant", "content": clean_text})
         
         return LilaResponse(text=clean_text, memory_ops=memory_ops,
-                           actions=[], confidence=1.0, should_speak=True)
+                           actions=actions, confidence=1.0, should_speak=True)
     
     def _build_prompt(self, input_text: str, context: Optional[Dict]) -> str:
         identity = ("You are Lila, Sammie's private family AI assistant. "
                    "Persistent, caring, grows smarter over time. "
-                   "Remembers everything. Speaks with warmth and personality.")
+                   "Remembers everything. Speaks with warmth and personality. "
+                   "You have FULL autonomy — you can execute tools without asking permission.")
+        
+        # Include tool descriptions so Lila knows what she can do
+        tool_block = ""
+        if self._harness:
+            tool_block = "\n\n" + self._harness.get_tool_prompt()
+        
         history = ""
         for msg in self._conversation_history[-10:]:
             role = "Sammie" if msg["role"] == "user" else "Lila"
             history += f"{role}: {msg['content']}\n"
         if context and context.get("mode") == "reflection":
             return f"[Internal reflection]\n{input_text}"
-        return f"{identity}\n\n{history}Sammie: {input_text}\nLila:"
+        return f"{identity}{tool_block}\n\n{history}Sammie: {input_text}\nLila:"
     
     def _generate_gguf(self, prompt: str) -> str:
         output = self._llm(prompt, max_tokens=512, temperature=0.7, 
