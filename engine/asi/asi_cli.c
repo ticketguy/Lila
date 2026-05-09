@@ -1,4 +1,5 @@
 #include "asi.h"
+#include "../runtime/model.h"
 #include "../runtime/tokenizer.h"
 #include <stdio.h>
 #include <string.h>
