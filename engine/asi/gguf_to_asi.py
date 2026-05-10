@@ -274,7 +274,23 @@ def extract_weights_from_gguf(reader, config):
     if embed_name:
         tensor = tensor_map[embed_name]
         embed = dequantize(tensor.data, tensor.tensor_type)
-        embed = embed.reshape(vocab_size, hidden).astype(np.float32)
+        # Infer shape from the tensor itself — don't trust metadata vocab_size
+        # GGUF stores shape reversed
+        if hasattr(tensor, 'shape') and len(tensor.shape) >= 2:
+            shape = list(reversed(tensor.shape.tolist()))
+        else:
+            # Fallback: infer from total elements
+            n_elements = embed.size
+            embed_vocab = n_elements // hidden
+            shape = [embed_vocab, hidden]
+        embed = embed.reshape(shape[0], shape[1]).astype(np.float32)
+        # Update vocab_size to match actual embedding dimension
+        actual_embed_vocab = shape[0]
+        if actual_embed_vocab != vocab_size:
+            print(f"  NOTE: Embedding vocab ({actual_embed_vocab}) differs from metadata ({vocab_size})")
+            print(f"        Using embedding dimension for weight layout")
+        vocab_size = actual_embed_vocab
+        config['vocab_size'] = vocab_size
         data.extend(embed.tobytes())
         print(f"  Embedding: {embed.shape} ({embed.nbytes/1e6:.1f} MB)")
     else:
@@ -313,8 +329,17 @@ def extract_weights_from_gguf(reader, config):
                     tensor = tensor_map[tname]
                     # Dequantize from GGUF format
                     w = dequantize(tensor.data, tensor.tensor_type)
-                    shape = list(reversed(tensor.shape.tolist()))  # GGUF is reversed
-                    w = w.reshape(shape).astype(np.float32)
+                    # Infer shape from tensor metadata
+                    if hasattr(tensor, 'shape') and len(tensor.shape) >= 2:
+                        shape = list(reversed(tensor.shape.tolist()))
+                    else:
+                        # 2D weight: guess square-ish or hidden×hidden
+                        n_el = w.size
+                        if n_el % hidden == 0:
+                            shape = [n_el // hidden, hidden]
+                        else:
+                            shape = [int(n_el**0.5), int(n_el**0.5)]
+                    w = w.reshape(shape[0], shape[1]).astype(np.float32)
                     rows, cols = w.shape
                     
                     # Re-quantize with FigQuant INT4
@@ -368,8 +393,14 @@ def extract_weights_from_gguf(reader, config):
         if name in tensor_map:
             tensor = tensor_map[name]
             w = dequantize(tensor.data, tensor.tensor_type)
-            shape = list(reversed(tensor.shape.tolist()))
-            w = w.reshape(shape).astype(np.float32)
+            # Infer shape from tensor metadata
+            if hasattr(tensor, 'shape') and len(tensor.shape) >= 2:
+                shape = list(reversed(tensor.shape.tolist()))
+            else:
+                # Fallback: assume [vocab_size, hidden]
+                lm_vocab = w.size // hidden
+                shape = [lm_vocab, hidden]
+            w = w.reshape(shape[0], shape[1]).astype(np.float32)
             data.extend(w.tobytes())
             found = True
             print(f"  LM Head: {shape}")
@@ -409,7 +440,11 @@ def gguf_to_asi(gguf_path: str, output_path: str):
     # Build sections
     print("\nBuilding ASI sections...")
     
-    print("[1/7] Model config...")
+    print("[1/7] Weights (dequant GGUF → FigQuant INT4)...")
+    weights_section = extract_weights_from_gguf(reader, config)
+    # NOTE: config['vocab_size'] may have been corrected by extract_weights_from_gguf
+    
+    print("[2/7] Model config...")
     config_section = struct.pack("IIIIIIIIffII",
         config['n_layers'], config['hidden_size'], config['intermediate_size'],
         config['n_heads'], config['n_kv_heads'], config['vocab_size'],
@@ -417,9 +452,6 @@ def gguf_to_asi(gguf_path: str, output_path: str):
         config['rope_theta'], config['rms_norm_eps'],
         3, config['group_size'],
     )
-    
-    print("[2/7] Weights (dequant GGUF → FigQuant INT4)...")
-    weights_section = extract_weights_from_gguf(reader, config)
     
     print("[3/7] Memory Fabric (empty, ready for training)...")
     fabric_section = build_memory_fabric_section(config)
