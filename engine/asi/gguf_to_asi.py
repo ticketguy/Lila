@@ -239,23 +239,21 @@ def extract_tokenizer_from_gguf(reader, config):
     return bytes(data)
 
 
-def extract_weights_from_gguf(reader, config):
+def extract_weights_from_gguf(reader, config, output_file):
     """
-    Extract weight tensors from GGUF and repackage for ASI.
+    Extract weight tensors from GGUF and write directly to file.
     
-    GGUF already stores quantized weights. We can either:
-    1. Re-dequantize and re-quantize with FigQuant (lossy but consistent)
-    2. Store the raw GGUF quant data and dequantize at runtime (faster to pack)
+    Streams to disk instead of building a giant bytearray in RAM.
+    This handles models that would otherwise OOM during conversion.
     
-    For now, approach 2: we store weights in a format compatible with
-    the ASI runtime, preserving the GGUF quantization where possible.
+    Returns: number of bytes written (for section size tracking)
     """
     from gguf import dequantize
     
-    data = bytearray()
     hidden = config['hidden_size']
     vocab_size = config['vocab_size']
     n_layers = config['n_layers']
+    bytes_written = 0
     
     # Find tensors by name
     tensor_map = {}
@@ -264,7 +262,7 @@ def extract_weights_from_gguf(reader, config):
     
     print(f"  Found {len(tensor_map)} tensors in GGUF")
     
-    # Token embedding
+    # Token embedding — process in chunks to save RAM
     embed_name = None
     for name in ['token_embd.weight', 'model.embed_tokens.weight']:
         if name in tensor_map:
@@ -273,30 +271,50 @@ def extract_weights_from_gguf(reader, config):
     
     if embed_name:
         tensor = tensor_map[embed_name]
-        embed = dequantize(tensor.data, tensor.tensor_type)
-        # Infer shape from the tensor itself — don't trust metadata vocab_size
-        # GGUF stores shape reversed
+        # Get shape without fully dequantizing
         if hasattr(tensor, 'shape') and len(tensor.shape) >= 2:
             shape = list(reversed(tensor.shape.tolist()))
         else:
-            # Fallback: infer from total elements
-            n_elements = embed.size
-            embed_vocab = n_elements // hidden
-            shape = [embed_vocab, hidden]
-        embed = embed.reshape(shape[0], shape[1]).astype(np.float32)
-        # Update vocab_size to match actual embedding dimension
+            # Peek at size by checking raw data
+            from gguf import GGML_QUANT_SIZES
+            qtype = tensor.tensor_type
+            block_size, type_size = GGML_QUANT_SIZES.get(qtype, (1, 4))
+            n_elements = (len(tensor.data) * block_size) // type_size
+            shape = [n_elements // hidden, hidden]
+        
         actual_embed_vocab = shape[0]
         if actual_embed_vocab != vocab_size:
             print(f"  NOTE: Embedding vocab ({actual_embed_vocab}) differs from metadata ({vocab_size})")
             print(f"        Using embedding dimension for weight layout")
         vocab_size = actual_embed_vocab
         config['vocab_size'] = vocab_size
-        data.extend(embed.tobytes())
-        print(f"  Embedding: {embed.shape} ({embed.nbytes/1e6:.1f} MB)")
+        
+        # Dequantize and write in row chunks to limit RAM
+        CHUNK_ROWS = 8192  # Process 8K rows at a time
+        total_rows = shape[0]
+        print(f"  Embedding: [{total_rows}, {hidden}] — streaming to disk...")
+        
+        # For quantized embeddings, we have to dequantize the whole thing
+        # but we write immediately and delete
+        embed = dequantize(tensor.data, tensor.tensor_type)
+        embed = embed.reshape(total_rows, hidden)
+        
+        for start in range(0, total_rows, CHUNK_ROWS):
+            end = min(start + CHUNK_ROWS, total_rows)
+            chunk = embed[start:end].astype(np.float32)
+            output_file.write(chunk.tobytes())
+            bytes_written += chunk.nbytes
+        
+        del embed  # Free immediately
+        print(f"  Embedding: [{total_rows}, {hidden}] ({bytes_written/1e6:.0f} MB written)")
     else:
-        # Zero embedding as placeholder
-        embed = np.zeros((vocab_size, hidden), dtype=np.float32)
-        data.extend(embed.tobytes())
+        # Write zero embedding in chunks
+        CHUNK_ROWS = 8192
+        for start in range(0, vocab_size, CHUNK_ROWS):
+            end = min(start + CHUNK_ROWS, vocab_size)
+            chunk = np.zeros((end - start, hidden), dtype=np.float32)
+            output_file.write(chunk.tobytes())
+            bytes_written += chunk.nbytes
         print(f"  Embedding: not found, using zeros")
     
     # Layer weights
@@ -333,7 +351,6 @@ def extract_weights_from_gguf(reader, config):
                     if hasattr(tensor, 'shape') and len(tensor.shape) >= 2:
                         shape = list(reversed(tensor.shape.tolist()))
                     else:
-                        # 2D weight: guess square-ish or hidden×hidden
                         n_el = w.size
                         if n_el % hidden == 0:
                             shape = [n_el // hidden, hidden]
@@ -346,15 +363,21 @@ def extract_weights_from_gguf(reader, config):
                     from pack_asi import quantize_int4
                     packed, codebook, scales = quantize_int4(w, GROUP_SIZE)
                     
-                    data.extend(struct.pack("ii", rows, cols))
-                    data.extend(codebook.tobytes())
-                    data.extend(scales.tobytes())
-                    data.extend(packed.tobytes())
+                    header = struct.pack("ii", rows, cols)
+                    output_file.write(header)
+                    output_file.write(codebook.tobytes())
+                    output_file.write(scales.tobytes())
+                    output_file.write(packed.tobytes())
+                    bytes_written += len(header) + codebook.nbytes + scales.nbytes + packed.nbytes
+                    
+                    del w, packed, codebook, scales  # Free per-tensor
                     found = True
                     break
             
             if not found:
-                data.extend(struct.pack("ii", 0, 0))
+                header = struct.pack("ii", 0, 0)
+                output_file.write(header)
+                bytes_written += len(header)
         
         # Layer norms (FP32)
         for norm_name, patterns in norm_patterns.items():
@@ -364,11 +387,14 @@ def extract_weights_from_gguf(reader, config):
                 if tname in tensor_map:
                     tensor = tensor_map[tname]
                     w = dequantize(tensor.data, tensor.tensor_type).astype(np.float32)
-                    data.extend(w.tobytes())
+                    output_file.write(w.tobytes())
+                    bytes_written += w.nbytes
                     found = True
                     break
             if not found:
-                data.extend(np.ones(hidden, dtype=np.float32).tobytes())
+                norm = np.ones(hidden, dtype=np.float32)
+                output_file.write(norm.tobytes())
+                bytes_written += norm.nbytes
         
         if (layer_idx + 1) % 4 == 0:
             print(f"  Layer {layer_idx+1}/{n_layers} done")
@@ -380,11 +406,14 @@ def extract_weights_from_gguf(reader, config):
         if name in tensor_map:
             tensor = tensor_map[name]
             w = dequantize(tensor.data, tensor.tensor_type).astype(np.float32)
-            data.extend(w.tobytes())
+            output_file.write(w.tobytes())
+            bytes_written += w.nbytes
             found = True
             break
     if not found:
-        data.extend(np.ones(hidden, dtype=np.float32).tobytes())
+        norm = np.ones(hidden, dtype=np.float32)
+        output_file.write(norm.tobytes())
+        bytes_written += norm.nbytes
     
     # LM head
     lm_head_names = ['output.weight', 'lm_head.weight']
@@ -393,23 +422,25 @@ def extract_weights_from_gguf(reader, config):
         if name in tensor_map:
             tensor = tensor_map[name]
             w = dequantize(tensor.data, tensor.tensor_type)
-            # Infer shape from tensor metadata
             if hasattr(tensor, 'shape') and len(tensor.shape) >= 2:
                 shape = list(reversed(tensor.shape.tolist()))
             else:
-                # Fallback: assume [vocab_size, hidden]
                 lm_vocab = w.size // hidden
                 shape = [lm_vocab, hidden]
             w = w.reshape(shape[0], shape[1]).astype(np.float32)
-            data.extend(w.tobytes())
+            output_file.write(w.tobytes())
+            bytes_written += w.nbytes
             found = True
             print(f"  LM Head: {shape}")
+            del w
             break
     if not found:
-        data.extend(struct.pack("I", 0xFFFFFFFF))  # Tied with embedding
+        flag = struct.pack("I", 0xFFFFFFFF)
+        output_file.write(flag)
+        bytes_written += len(flag)
         print(f"  LM Head: tied with embedding")
     
-    return bytes(data)
+    return bytes_written
 
 
 def gguf_to_asi(gguf_path: str, output_path: str):
@@ -440,9 +471,15 @@ def gguf_to_asi(gguf_path: str, output_path: str):
     # Build sections
     print("\nBuilding ASI sections...")
     
+    # Stream weights to a temp file (too large for RAM)
+    import tempfile
+    weights_tmp = output_path + ".weights.tmp"
+    
     print("[1/7] Weights (dequant GGUF → FigQuant INT4)...")
-    weights_section = extract_weights_from_gguf(reader, config)
+    with open(weights_tmp, 'wb') as wf:
+        weights_size = extract_weights_from_gguf(reader, config, wf)
     # NOTE: config['vocab_size'] may have been corrected by extract_weights_from_gguf
+    print(f"  Total weights: {weights_size/1e9:.2f} GB")
     
     print("[2/7] Model config...")
     config_section = struct.pack("IIIIIIIIffII",
@@ -470,10 +507,9 @@ def gguf_to_asi(gguf_path: str, output_path: str):
     base_name = config.get('name', os.path.basename(gguf_path))
     metadata_section = build_metadata_section(base_name, "GGUF→ASI Converter v1.0")
     
-    # Assemble
-    sections = {
+    # Assemble — weights come from temp file, everything else from RAM
+    small_sections = {
         ASI_SECTION_MODEL_CONFIG: config_section,
-        ASI_SECTION_WEIGHTS: weights_section,
         ASI_SECTION_MEMORY_FABRIC: fabric_section,
         ASI_SECTION_TOKENIZER: tokenizer_section,
         ASI_SECTION_BYTECODE: bytecode_section,
@@ -482,18 +518,25 @@ def gguf_to_asi(gguf_path: str, output_path: str):
         ASI_SECTION_METADATA: metadata_section,
     }
     
-    n_sections = len(sections)
+    # Build full section list (weights referenced by size, not content)
+    all_section_types = sorted([ASI_SECTION_WEIGHTS] + list(small_sections.keys()))
+    n_sections = len(all_section_types)
     header_size = 64
     section_table_size = n_sections * 32
     
-    section_list = sorted(sections.items())
+    # Compute offsets
     first_offset = page_align(header_size + section_table_size)
-    
-    offsets = []
+    offsets = {}
+    sizes = {}
     current = first_offset
-    for stype, sdata in section_list:
-        offsets.append(current)
-        current = page_align(current + len(sdata))
+    
+    for stype in all_section_types:
+        offsets[stype] = current
+        if stype == ASI_SECTION_WEIGHTS:
+            sizes[stype] = weights_size
+        else:
+            sizes[stype] = len(small_sections[stype])
+        current = page_align(current + sizes[stype])
     total_size = current
     
     flags = (ASI_FLAG_HAS_FABRIC | ASI_FLAG_HAS_BYTECODE | ASI_FLAG_HAS_HARNESS |
@@ -502,7 +545,7 @@ def gguf_to_asi(gguf_path: str, output_path: str):
     
     identity_hash = hashlib.sha256(personality_section).digest()
     
-    print(f"\nWriting {output_path}...")
+    print(f"\nWriting {output_path} ({total_size/1e9:.2f} GB)...")
     with open(output_path, 'wb') as f:
         # Header
         f.write(struct.pack("IIIIQq32s",
@@ -511,18 +554,40 @@ def gguf_to_asi(gguf_path: str, output_path: str):
         ))
         
         # Section table
-        for i, (stype, sdata) in enumerate(section_list):
+        for stype in all_section_types:
+            # Checksum: for weights use 0 (too large to hash in RAM), others hash normally
+            if stype == ASI_SECTION_WEIGHTS:
+                checksum = 0
+            else:
+                checksum = crc64(small_sections[stype])
             f.write(struct.pack("IIQQQ",
-                stype, 0, offsets[i], len(sdata), crc64(sdata)
+                stype, 0, offsets[stype], sizes[stype], checksum
             ))
         
-        # Section data
-        for i, (stype, sdata) in enumerate(section_list):
+        # Write sections (page-aligned)
+        for stype in all_section_types:
+            # Pad to alignment
             pos = f.tell()
             aligned = page_align(pos)
             if aligned > pos:
                 f.write(b'\x00' * (aligned - pos))
-            f.write(sdata)
+            
+            if stype == ASI_SECTION_WEIGHTS:
+                # Stream from temp file
+                with open(weights_tmp, 'rb') as wf:
+                    while True:
+                        chunk = wf.read(1024 * 1024)  # 1 MB chunks
+                        if not chunk:
+                            break
+                        f.write(chunk)
+            else:
+                f.write(small_sections[stype])
+    
+    # Clean up temp file
+    try:
+        os.remove(weights_tmp)
+    except OSError:
+        pass
     
     actual_size = os.path.getsize(output_path)
     print(f"\n✅ Conversion complete!")
