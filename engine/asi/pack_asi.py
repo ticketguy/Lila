@@ -95,7 +95,7 @@ def pad_to_page(f):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def quantize_int4(weight_np, group_size=128):
-    """FigQuant-style INT4 quantization."""
+    """FigQuant-style INT4 quantization. Memory-efficient chunked processing."""
     rows, cols = weight_np.shape
     flat = weight_np.reshape(-1).astype(np.float32)
     numel = flat.size
@@ -110,24 +110,44 @@ def quantize_int4(weight_np, group_size=128):
     scales = np.abs(grouped).max(axis=1).clip(min=1e-10).astype(np.float32)
     scaled = grouped / scales[:, None]
 
-    # NF4 codebook
+    # NF4 codebook (initial)
     codebook = np.array([-1.0, -0.6962, -0.5251, -0.3949, -0.2844, -0.1848, -0.0911, 0.0,
                           0.0796, 0.1609, 0.2461, 0.3379, 0.4407, 0.5626, 0.7230, 1.0], dtype=np.float32)
 
-    # K-means refinement
+    # K-means refinement — process in chunks to limit RAM
     all_vals = scaled.reshape(-1)
-    for _ in range(8):
-        dists = np.abs(all_vals[:, None] - codebook[None, :])
-        assignments = dists.argmin(axis=1)
+    CHUNK = 1_000_000  # 1M elements at a time for distance computation
+    
+    for _ in range(4):  # Reduced iterations (4 instead of 8) for speed
+        # Compute assignments in chunks
+        assignments = np.empty(len(all_vals), dtype=np.uint8)
+        for start in range(0, len(all_vals), CHUNK):
+            end = min(start + CHUNK, len(all_vals))
+            chunk = all_vals[start:end]
+            dists = np.abs(chunk[:, None] - codebook[None, :])
+            assignments[start:end] = dists.argmin(axis=1).astype(np.uint8)
+            del dists
+        
+        # Update centroids
         for i in range(16):
             mask = assignments == i
             if mask.sum() > 0:
                 codebook[i] = all_vals[mask].mean()
+        del assignments
+    
     codebook[np.abs(codebook).argmin()] = 0.0
 
-    # Final assignment
-    dists = np.abs(all_vals[:, None] - codebook[None, :])
-    indices = dists.argmin(axis=1).astype(np.uint8)
+    # Final assignment — chunked
+    indices = np.empty(len(all_vals), dtype=np.uint8)
+    for start in range(0, len(all_vals), CHUNK):
+        end = min(start + CHUNK, len(all_vals))
+        chunk = all_vals[start:end]
+        dists = np.abs(chunk[:, None] - codebook[None, :])
+        indices[start:end] = dists.argmin(axis=1).astype(np.uint8)
+        del dists
+
+    # Trim to original size (remove padding)
+    indices = indices[:numel + pad]
 
     # Pack 2 indices per byte
     packed = (indices[0::2] | (indices[1::2] << 4)).astype(np.uint8)

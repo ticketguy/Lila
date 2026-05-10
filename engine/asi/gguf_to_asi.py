@@ -283,6 +283,15 @@ def extract_weights_from_gguf(reader, config, output_file):
             shape = [n_elements // hidden, hidden]
         
         actual_embed_vocab = shape[0]
+        actual_hidden = shape[1]
+        
+        # Correct hidden_size from embedding if metadata was wrong
+        if actual_hidden != hidden:
+            print(f"  NOTE: Hidden size from embedding ({actual_hidden}) differs from metadata ({hidden})")
+            print(f"        Using embedding dimension as true hidden_size")
+            hidden = actual_hidden
+            config['hidden_size'] = hidden
+        
         if actual_embed_vocab != vocab_size:
             print(f"  NOTE: Embedding vocab ({actual_embed_vocab}) differs from metadata ({vocab_size})")
             print(f"        Using embedding dimension for weight layout")
