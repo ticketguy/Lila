@@ -1,7 +1,100 @@
 #include <stdio.h>
 #include <string.h>
+#include "detect.h"
 
-#ifdef __x86_64__
+/*
+ * CPU Feature Detection — Platform Independent
+ *
+ * On Windows: uses MSVC intrinsics or skips to LilaVM fallback
+ * On Linux/macOS x86: uses GCC __cpuid
+ * On ARM64: NEON always available
+ */
+
+#if defined(_WIN32) && defined(_MSC_VER)
+/* ── Windows (MSVC) ── */
+#include <intrin.h>
+
+typedef struct {
+    int has_avx2;
+    int has_fma;
+    int has_avx512f;
+    int has_avx512bw;
+    int has_avx512vnni;
+} LilaCPUFeatures;
+
+LilaCPUFeatures lila_detect_cpu(void) {
+    LilaCPUFeatures f = {0};
+    int cpuInfo[4];
+
+    /* Function 7, sub 0 for AVX2 */
+    __cpuidex(cpuInfo, 7, 0);
+    f.has_avx2 = (cpuInfo[1] >> 5) & 1;
+    f.has_avx512f = (cpuInfo[1] >> 16) & 1;
+    f.has_avx512bw = (cpuInfo[1] >> 30) & 1;
+    f.has_avx512vnni = (cpuInfo[2] >> 11) & 1;
+
+    /* Function 1 for FMA */
+    __cpuid(cpuInfo, 1);
+    f.has_fma = (cpuInfo[2] >> 12) & 1;
+
+    return f;
+}
+
+void lila_print_cpu_features(void) {
+    LilaCPUFeatures f = lila_detect_cpu();
+    printf("CPU Features (Windows):\n");
+    printf("  AVX2:       %s\n", f.has_avx2 ? "YES" : "no");
+    printf("  FMA:        %s\n", f.has_fma ? "YES" : "no");
+    printf("  AVX-512F:   %s\n", f.has_avx512f ? "YES" : "no");
+    printf("  AVX-512BW:  %s\n", f.has_avx512bw ? "YES" : "no");
+    printf("  AVX-512VNNI:%s\n", f.has_avx512vnni ? "YES" : "no");
+
+    if (f.has_avx2) {
+        printf("  >> Using LilaVM bytecode (native ASM kernels not linked on Windows)\n");
+    } else {
+        printf("  >> Using scalar fallback via LilaVM\n");
+    }
+}
+
+#elif defined(_WIN32) && !defined(_MSC_VER)
+/* ── Windows (MinGW/GCC) ── */
+#include <cpuid.h>
+
+typedef struct {
+    int has_avx2;
+    int has_fma;
+    int has_avx512f;
+    int has_avx512bw;
+    int has_avx512vnni;
+} LilaCPUFeatures;
+
+LilaCPUFeatures lila_detect_cpu(void) {
+    LilaCPUFeatures f = {0};
+    unsigned int eax, ebx, ecx, edx;
+
+    __cpuid_count(7, 0, eax, ebx, ecx, edx);
+    f.has_avx2 = (ebx >> 5) & 1;
+    f.has_avx512f = (ebx >> 16) & 1;
+    f.has_avx512bw = (ebx >> 30) & 1;
+    f.has_avx512vnni = (ecx >> 11) & 1;
+
+    __cpuid(1, eax, ebx, ecx, edx);
+    f.has_fma = (ecx >> 12) & 1;
+
+    return f;
+}
+
+void lila_print_cpu_features(void) {
+    LilaCPUFeatures f = lila_detect_cpu();
+    printf("CPU Features (Windows/MinGW):\n");
+    printf("  AVX2:       %s\n", f.has_avx2 ? "YES" : "no");
+    printf("  FMA:        %s\n", f.has_fma ? "YES" : "no");
+    printf("  AVX-512F:   %s\n", f.has_avx512f ? "YES" : "no");
+    printf("  >> Using LilaVM bytecode kernels\n");
+}
+
+#elif defined(__x86_64__) && !defined(_WIN32)
+/* ── Linux/macOS x86_64 ── */
 #include <cpuid.h>
 
 typedef struct {
@@ -52,6 +145,7 @@ void lila_print_cpu_features(void) {
 }
 
 #elif defined(__aarch64__)
+/* ── ARM64 (Linux, macOS M-series) ── */
 
 typedef struct {
     int has_neon;       /* Always on ARM64 */
@@ -80,7 +174,9 @@ void lila_print_cpu_features(void) {
 }
 
 #else
+/* ── Unknown architecture — use LilaVM bytecode ── */
 void lila_print_cpu_features(void) {
-    printf("Unknown architecture\n");
+    printf("CPU Features: Unknown architecture\n");
+    printf("  >> Using LilaVM bytecode kernels (universal fallback)\n");
 }
 #endif

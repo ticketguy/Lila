@@ -1,12 +1,66 @@
-#define _GNU_SOURCE
 #include "model.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/*  PLATFORM ABSTRACTION                                                     */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+#ifdef _WIN32
+#include <windows.h>
+
+static void *model_mmap(const char *path, size_t *out_size) {
+    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return NULL;
+
+    LARGE_INTEGER li;
+    GetFileSizeEx(hFile, &li);
+    *out_size = (size_t)li.QuadPart;
+
+    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMap) { CloseHandle(hFile); return NULL; }
+
+    void *mapped = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+    return mapped;
+}
+
+static void model_munmap(void *addr, size_t size) {
+    (void)size;
+    if (addr) UnmapViewOfFile(addr);
+}
+
+#else
+/* POSIX */
+#define _GNU_SOURCE
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+static void *model_mmap(const char *path, size_t *out_size) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+
+    struct stat st;
+    fstat(fd, &st);
+    *out_size = st.st_size;
+
+    void *mapped = mmap(NULL, *out_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+
+    if (mapped == MAP_FAILED) return NULL;
+    madvise(mapped, *out_size, MADV_SEQUENTIAL);
+    return mapped;
+}
+
+static void model_munmap(void *addr, size_t size) {
+    if (addr) munmap(addr, size);
+}
+#endif
 
 /*
  * Load model weights via mmap — zero copy from disk.
@@ -16,26 +70,13 @@
  */
 
 LilaModel *lila_load_model(const char *path) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "Failed to open model: %s\n", path);
+    size_t file_size = 0;
+    void *mapped = model_mmap(path, &file_size);
+
+    if (!mapped) {
+        fprintf(stderr, "Failed to open/map model: %s\n", path);
         return NULL;
     }
-    
-    struct stat st;
-    fstat(fd, &st);
-    size_t file_size = st.st_size;
-    
-    void *mapped = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    
-    if (mapped == MAP_FAILED) {
-        fprintf(stderr, "Failed to mmap model\n");
-        return NULL;
-    }
-    
-    /* Advise the kernel we'll read sequentially during inference */
-    madvise(mapped, file_size, MADV_SEQUENTIAL);
     
     LilaModel *model = calloc(1, sizeof(LilaModel));
     model->mmap_addr = mapped;
@@ -78,7 +119,7 @@ LilaModel *lila_load_model(const char *path) {
 void lila_free_model(LilaModel *model) {
     if (!model) return;
     if (model->mmap_addr) {
-        munmap(model->mmap_addr, model->mmap_size);
+        model_munmap(model->mmap_addr, model->mmap_size);
     }
     /* Free KV cache */
     free(model->kv_cache.key_cache);

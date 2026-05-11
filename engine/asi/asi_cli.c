@@ -4,22 +4,42 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <time.h>
 
 /*
  * lila-asi — Load and run Lila from a single .asi file.
  *
  * This is the end-user facing binary. One command:
- *   ./lila-asi lila.asi
+ *   lila-asi lila.asi
  *
  * And she's alive. Everything she needs is in that one file.
  *
  * Usage:
- *   ./lila-asi lila.asi                    # Interactive chat
- *   ./lila-asi lila.asi --info             # Print .asi contents
- *   ./lila-asi lila.asi --bench            # Benchmark inference
- *   ./lila-asi lila.asi --reload new.asi   # Hot-reload adapters
+ *   lila-asi lila.asi                    # Interactive chat
+ *   lila-asi lila.asi --info             # Print .asi contents
+ *   lila-asi lila.asi --bench            # Benchmark inference
+ *   lila-asi lila.asi --reload new.asi   # Hot-reload adapters
  */
+
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/*  PLATFORM TIMER                                                           */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+#ifdef _WIN32
+#include <windows.h>
+static double get_time_sec(void) {
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (double)count.QuadPart / (double)freq.QuadPart;
+}
+#else
+#include <time.h>
+static double get_time_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+#endif
 
 #define MAX_SEQ 4096
 #define MAX_INPUT 4096
@@ -30,10 +50,11 @@ extern void lila_init_kv_cache(LilaKVCache *cache, int n_layers, int max_seq,
 extern void lila_init_dispatch(void);
 
 static void print_info(AsiRuntime *rt) {
-    printf("\n🌸 ASI File Information\n");
-    printf("═══════════════════════════════════════\n");
+    printf("\n");
+    printf("  ASI File Information\n");
+    printf("  ====================\n");
     
-    printf("\nSections present:\n");
+    printf("\n  Sections present:\n");
     const char *section_names[] = {
         NULL, "MODEL_CONFIG", "WEIGHTS", "MEMORY_FABRIC",
         "TOKENIZER", "BYTECODE", "HARNESS", "PERSONALITY", "METADATA"
@@ -42,9 +63,13 @@ static void print_info(AsiRuntime *rt) {
     for (int i = 1; i <= 8; i++) {
         if (asi_has_section(rt, (AsiSectionType)i)) {
             uint64_t size = asi_section_size(rt, (AsiSectionType)i);
-            printf("  ✓ %-16s  %8.2f KB\n", section_names[i], size / 1024.0);
+            if (size > 1024*1024) {
+                printf("    [x] %-16s  %8.2f MB\n", section_names[i], size / (1024.0*1024.0));
+            } else {
+                printf("    [x] %-16s  %8.2f KB\n", section_names[i], size / 1024.0);
+            }
         } else {
-            printf("  ✗ %-16s  (missing)\n", section_names[i]);
+            printf("    [ ] %-16s  (missing)\n", section_names[i]);
         }
     }
     printf("\n");
@@ -56,8 +81,7 @@ static void run_bench(AsiRuntime *rt) {
     int tokens[MAX_SEQ];
     tokens[0] = 1;  /* BOS */
     
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    double start = get_time_sec();
     
     int n_generated = 0;
     for (int i = 0; i < 100; i++) {
@@ -67,8 +91,7 @@ static void run_bench(AsiRuntime *rt) {
         if (next <= 0) break;
     }
     
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    double elapsed = get_time_sec() - start;
     
     printf("  Generated: %d tokens\n", n_generated);
     printf("  Time: %.3f seconds\n", elapsed);
@@ -78,7 +101,7 @@ static void run_bench(AsiRuntime *rt) {
 }
 
 static void interactive(AsiRuntime *rt) {
-    printf("🌸 Lila is ready. Type to talk. 'quit' to exit.\n\n");
+    printf("\n  Lila is ready. Type to talk. 'quit' to exit.\n\n");
     
     char input[MAX_INPUT];
     int tokens[MAX_SEQ];
@@ -116,17 +139,17 @@ static void interactive(AsiRuntime *rt) {
         printf("\n\n");
     }
     
-    printf("\n🌸 Lila is resting. Goodbye.\n");
+    printf("\n  Lila is resting. Goodbye.\n");
 }
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        printf("🌸 lila-asi — Load Lila from an Active System Image\n\n");
-        printf("Usage:\n");
-        printf("  lila-asi <file.asi>              # Chat with Lila\n");
-        printf("  lila-asi <file.asi> --info       # Inspect .asi contents\n");
-        printf("  lila-asi <file.asi> --bench      # Benchmark inference\n");
-        printf("  lila-asi <file.asi> --reload <new.asi>  # Hot-reload adapters\n");
+        printf("\n  lila-asi -- Load Lila from an Active System Image\n\n");
+        printf("  Usage:\n");
+        printf("    lila-asi <file.asi>              # Chat with Lila\n");
+        printf("    lila-asi <file.asi> --info       # Inspect .asi contents\n");
+        printf("    lila-asi <file.asi> --bench      # Benchmark inference\n");
+        printf("    lila-asi <file.asi> --reload <new.asi>  # Hot-reload adapters\n");
         return 1;
     }
     
@@ -157,9 +180,9 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[2], "--reload") == 0 && argc >= 4) {
             int result = asi_reload_fabric(rt, argv[3]);
             if (result == 0) {
-                printf("✅ Hot-reload successful. New adapters active.\n");
+                printf("  Hot-reload successful. New adapters active.\n");
             } else {
-                printf("❌ Hot-reload failed.\n");
+                printf("  Hot-reload failed.\n");
             }
             /* Continue to interactive mode with new adapters */
         }

@@ -6,10 +6,85 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/*  PLATFORM ABSTRACTION — mmap on Linux/macOS, MapViewOfFile on Windows     */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+
+static void *platform_mmap(const char *path, size_t *out_size) {
+    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return NULL;
+
+    LARGE_INTEGER li;
+    GetFileSizeEx(hFile, &li);
+    *out_size = (size_t)li.QuadPart;
+
+    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMap) { CloseHandle(hFile); return NULL; }
+
+    void *mapped = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(hMap);
+    CloseHandle(hFile);
+    return mapped;  /* NULL on failure */
+}
+
+static void platform_munmap(void *addr, size_t size) {
+    (void)size;
+    if (addr) UnmapViewOfFile(addr);
+}
+
+static void platform_madvise_seq(void *addr, size_t size) { (void)addr; (void)size; }
+static void platform_madvise_rand(void *addr, size_t size) { (void)addr; (void)size; }
+
+/* Windows temp file for tokenizer extraction */
+static const char *platform_tmp_vocab(void) {
+    static char path[MAX_PATH];
+    GetTempPathA(MAX_PATH, path);
+    strcat(path, ".lila_asi_vocab.tmp");
+    return path;
+}
+static void platform_unlink(const char *path) { DeleteFileA(path); }
+
+#else
+/* POSIX (Linux, macOS, BSD, etc.) */
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+static void *platform_mmap(const char *path, size_t *out_size) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+
+    struct stat st;
+    fstat(fd, &st);
+    *out_size = st.st_size;
+
+    void *mapped = mmap(NULL, *out_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (mapped == MAP_FAILED) return NULL;
+    return mapped;
+}
+
+static void platform_munmap(void *addr, size_t size) {
+    if (addr) munmap(addr, size);
+}
+
+static void platform_madvise_seq(void *addr, size_t size) {
+    madvise(addr, size, MADV_SEQUENTIAL);
+}
+static void platform_madvise_rand(void *addr, size_t size) {
+    madvise(addr, size, MADV_RANDOM);
+}
+
+static const char *platform_tmp_vocab(void) { return "/tmp/.lila_asi_vocab.tmp"; }
+static void platform_unlink(const char *path) { unlink(path); }
+#endif
 
 /*
  * ASI Runtime — Loads and boots Lila from a single .asi file.
@@ -210,17 +285,10 @@ static int load_tokenizer(AsiRuntime *rt) {
     
     uint8_t *ptr = (uint8_t *)section_data(rt, sec);
     AsiTokenizerHeader *thdr = (AsiTokenizerHeader *)ptr;
-    
-    /*
-     * The tokenizer is embedded in the .asi file. We extract the vocab
-     * to a temp file and use the existing lila_load_tokenizer() which
-     * expects a file path. In a future revision, we'll add a
-     * lila_load_tokenizer_from_memory() to avoid the temp file.
-     */
     ptr += sizeof(AsiTokenizerHeader);
     
     /* Write embedded vocab to temp file for the existing tokenizer loader */
-    const char *tmp_vocab = "/tmp/.lila_asi_vocab.tmp";
+    const char *tmp_vocab = platform_tmp_vocab();
     FILE *vf = fopen(tmp_vocab, "w");
     if (vf) {
         for (uint32_t i = 0; i < thdr->vocab_size; i++) {
@@ -235,13 +303,11 @@ static int load_tokenizer(AsiRuntime *rt) {
         }
         fclose(vf);
         rt->tokenizer = lila_load_tokenizer(tmp_vocab);
-        /* Temp file can be removed after loading */
-        unlink(tmp_vocab);
+        platform_unlink(tmp_vocab);
     }
     
     if (!rt->tokenizer) {
         fprintf(stderr, "ASI: Tokenizer extraction failed (continuing without)\n");
-        /* Not fatal — we can still generate token IDs */
     }
     
     fprintf(stderr, "ASI: Tokenizer loaded (vocab=%u, merges=%u)\n",
@@ -308,8 +374,8 @@ static int load_personality(AsiRuntime *rt) {
     rt->interactions = phdr->interactions_count;
     
     fprintf(stderr, "ASI: Personality loaded\n");
-    fprintf(stderr, "     Interactions: %lu, State dim: %u\n",
-            (unsigned long)phdr->interactions_count, phdr->state_dim);
+    fprintf(stderr, "     Interactions: %llu, State dim: %u\n",
+            (unsigned long long)phdr->interactions_count, phdr->state_dim);
     
     return 0;
 }
@@ -321,34 +387,23 @@ static int load_personality(AsiRuntime *rt) {
 AsiRuntime *asi_load(const char *path) {
     fprintf(stderr, "\n🌸 Loading ASI: %s\n", path);
     
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "ASI: Cannot open file: %s\n", path);
+    size_t file_size = 0;
+    void *mapped = platform_mmap(path, &file_size);
+    
+    if (!mapped) {
+        fprintf(stderr, "ASI: Cannot open/map file: %s\n", path);
         return NULL;
     }
-    
-    struct stat st;
-    fstat(fd, &st);
-    size_t file_size = st.st_size;
     
     /* Verify minimum size */
     if (file_size < sizeof(AsiHeader)) {
         fprintf(stderr, "ASI: File too small (%zu bytes)\n", file_size);
-        close(fd);
-        return NULL;
-    }
-    
-    /* mmap the entire file */
-    void *mapped = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    
-    if (mapped == MAP_FAILED) {
-        fprintf(stderr, "ASI: mmap failed\n");
+        platform_munmap(mapped, file_size);
         return NULL;
     }
     
     /* Advise sequential access for initial load */
-    madvise(mapped, file_size, MADV_SEQUENTIAL);
+    platform_madvise_seq(mapped, file_size);
     
     /* Allocate runtime */
     AsiRuntime *rt = calloc(1, sizeof(AsiRuntime));
@@ -387,7 +442,7 @@ AsiRuntime *asi_load(const char *path) {
     load_personality(rt);    /* Optional */
     
     /* Switch to random access pattern for inference */
-    madvise(mapped, file_size, MADV_RANDOM);
+    platform_madvise_rand(mapped, file_size);
     
     rt->booted = 1;
     fprintf(stderr, "\n🌸 ASI loaded. Lila is awake.\n\n");
@@ -410,9 +465,7 @@ int asi_generate_token(AsiRuntime *rt, int *tokens, int n_tokens) {
     
     /* Verify layer weights are populated */
     if (rt->model->layers[0].q_proj.indices == NULL) {
-        /* Layer weight parsing not complete — this is expected when
-           load_weights() hasn't finished the TODO for per-layer parsing.
-           Return 0 (EOS) gracefully instead of crashing. */
+        /* Layer weight parsing not complete — return EOS gracefully */
         return 0;
     }
     
@@ -442,20 +495,15 @@ int asi_reload_fabric(AsiRuntime *rt, const char *new_asi_path) {
     
     fprintf(stderr, "ASI: Hot-reloading adapters from %s\n", new_asi_path);
     
-    /* Open and mmap the new file */
-    int fd = open(new_asi_path, O_RDONLY);
-    if (fd < 0) return -1;
-    
-    struct stat st;
-    fstat(fd, &st);
-    void *new_map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (new_map == MAP_FAILED) return -1;
+    /* Map the new file */
+    size_t new_size = 0;
+    void *new_map = platform_mmap(new_asi_path, &new_size);
+    if (!new_map) return -1;
     
     /* Verify it's a valid .asi */
     AsiHeader *new_hdr = (AsiHeader *)new_map;
     if (new_hdr->magic != ASI_MAGIC) {
-        munmap(new_map, st.st_size);
+        platform_munmap(new_map, new_size);
         return -1;
     }
     
@@ -472,7 +520,7 @@ int asi_reload_fabric(AsiRuntime *rt, const char *new_asi_path) {
     
     if (!fab_sec) {
         fprintf(stderr, "ASI: New file has no Memory Fabric section\n");
-        munmap(new_map, st.st_size);
+        platform_munmap(new_map, new_size);
         return -1;
     }
     
@@ -481,14 +529,14 @@ int asi_reload_fabric(AsiRuntime *rt, const char *new_asi_path) {
     size_t old_size = rt->mmap_size;
     
     rt->mmap_addr = new_map;
-    rt->mmap_size = st.st_size;
+    rt->mmap_size = new_size;
     rt->sections = new_sections;
     
     /* Reload fabric */
     load_memory_fabric(rt);
     
     /* Release old mapping */
-    munmap(old_map, old_size);
+    platform_munmap(old_map, old_size);
     
     fprintf(stderr, "ASI: Hot-reload complete. New adapters active.\n");
     return 0;
@@ -534,7 +582,7 @@ void asi_free(AsiRuntime *rt) {
     }
     
     if (rt->mmap_addr) {
-        munmap(rt->mmap_addr, rt->mmap_size);
+        platform_munmap(rt->mmap_addr, rt->mmap_size);
     }
     
     free(rt);
