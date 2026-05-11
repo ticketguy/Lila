@@ -14,13 +14,14 @@
  * On ARM64: NEON kernels (when available).
  */
 
-/* Assembly kernel declarations — only on platforms where we link .S files */
-#if defined(__x86_64__) && !defined(_WIN32)
+/* Assembly kernel declarations — only when native .S files are actually linked.
+ * Define LILA_NO_ASM to skip (e.g. no NASM available, or Windows build). */
+#if defined(__x86_64__) && !defined(_WIN32) && !defined(LILA_NO_ASM)
 extern void lila_matvec_avx2(float *out, const float *mat, const float *vec, int rows, int cols);
 extern void lila_rmsnorm_avx2(float *out, const float *x, const float *weight, int size, float eps);
 extern void lila_dequant_int4_avx2(float *out, const uint8_t *indices, const float *codebook,
                                     const float *scales, int n_elements, int group_size);
-#elif defined(__aarch64__) && !defined(_WIN32)
+#elif defined(__aarch64__) && !defined(_WIN32) && !defined(LILA_NO_ASM)
 extern void lila_dequant_int4_neon(float *out, const uint8_t *indices, const float *codebook,
                                     const float *scales, int n_elements, int group_size);
 #endif
@@ -50,15 +51,15 @@ static rmsnorm_fn _rmsnorm = rmsnorm_scalar;
 
 /* Initialize dispatch — call once at startup */
 void lila_init_dispatch(void) {
-#if defined(__x86_64__) && !defined(_WIN32)
+#if defined(__x86_64__) && !defined(_WIN32) && !defined(LILA_NO_ASM)
     /* Linux/macOS: use native AVX2 assembly kernels */
     _matvec = lila_matvec_avx2;
     _rmsnorm = lila_rmsnorm_avx2;
-#elif defined(__aarch64__) && !defined(_WIN32)
+#elif defined(__aarch64__) && !defined(_WIN32) && !defined(LILA_NO_ASM)
     /* ARM: NEON is always available */
     /* TODO: wire NEON matvec when written */
 #else
-    /* Windows or unknown: use C scalar fallbacks.
+    /* No native ASM: use C scalar fallbacks.
      * When running from a .asi file, the ASI runtime will use
      * LilaVM bytecode kernels instead of these scalar fallbacks
      * for better performance through vectorized bytecode ops. */
@@ -77,12 +78,14 @@ void lila_dispatch_rmsnorm(float *out, const float *x, const float *weight, int 
 }
 
 /*
- * On Windows, transformer.c references lila_rmsnorm_avx2 directly.
- * Provide a shim that routes to the dispatch function pointer.
+ * Provide lila_rmsnorm_avx2 shim when native ASM isn't linked.
+ * transformer.c calls this directly — route to scalar fallback.
  */
-#ifdef _WIN32
-#include <math.h>
+#if defined(_WIN32) || defined(LILA_NO_ASM)
 void lila_rmsnorm_avx2(float *out, const float *x, const float *weight, int size, float eps) {
     rmsnorm_scalar(out, x, weight, size, eps);
+}
+void lila_matvec_avx2(float *out, const float *mat, const float *vec, int rows, int cols) {
+    matvec_scalar(out, mat, vec, rows, cols);
 }
 #endif
