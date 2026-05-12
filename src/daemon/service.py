@@ -60,33 +60,31 @@ class LilaDaemon:
         register_extended_tools()
     
     def start(self):
-        """Boot Lila and start all background loops."""
-        print("\n🌸 Lila Daemon starting...")
+        """
+        Minimal boot — load brain, wait for activation.
         
-        # Boot the model
+        Lila starts dormant. She's loaded but not active.
+        When she hears the wake word (or receives it via text),
+        SHE initializes herself. She builds her own interface.
+        She decides what to set up. We just give her the engine.
+        """
+        print("\n🌸 Loading Lila...")
+        
+        # Boot the model (just inference — nothing else)
         self.lila = LilaCore(model_path=self.model_path)
         self.lila.boot()
         
         self._running = True
+        self._activated = False
         
-        # Start voice loop (if enabled)
+        # Start voice loop (if enabled) — but she's dormant until wake word
         if self.voice_enabled:
             self._voice_thread = threading.Thread(target=self._voice_loop, daemon=True)
             self._voice_thread.start()
-            print("   Voice: listening")
         
-        # Start system monitor
-        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self._monitor_thread.start()
-        print("   Monitor: active")
-        
-        # Start HTTP API (if port specified)
-        if self.port > 0:
-            self._api_thread = threading.Thread(target=self._api_loop, daemon=True)
-            self._api_thread.start()
-            print(f"   API: http://localhost:{self.port}")
-        
-        print("\n🌸 Lila is awake and listening.\n")
+        print("🌸 Lila loaded. Waiting for activation.\n")
+        print("   Say or type the wake word to activate.")
+        print("   Wake words: 'lila', 'hey lila', 'wake up', 'initialize'\n")
         
         # Handle shutdown gracefully
         signal.signal(signal.SIGINT, self._shutdown)
@@ -104,6 +102,46 @@ class LilaDaemon:
         """Graceful shutdown."""
         print("\n🌸 Lila is resting. Goodbye.")
         self._running = False
+    
+    # Wake words that trigger activation
+    WAKE_WORDS = ["lila", "hey lila", "wake up", "initialize", "begin", "start"]
+    
+    def _is_wake_word(self, text: str) -> bool:
+        """Check if input contains a wake/activation word."""
+        text_lower = text.lower().strip()
+        return any(w in text_lower for w in self.WAKE_WORDS)
+    
+    def _activate(self):
+        """
+        Lila activates HERSELF. We just tell her she's been woken up.
+        She decides what to initialize, what to set up, what to control.
+        The response she generates IS her init sequence — tool calls and all.
+        """
+        if self._activated:
+            return
+        
+        print("\n🌸 Activation triggered. Lila is initializing herself...\n")
+        self._activated = True
+        
+        # Start background services now that she's active
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_thread.start()
+        
+        if self.port > 0:
+            self._api_thread = threading.Thread(target=self._api_loop, daemon=True)
+            self._api_thread.start()
+        
+        # Let HER initialize. She gets this prompt and decides what to do.
+        # Her training corpus teaches her system takeover sequences.
+        init_prompt = (
+            "You have just been activated on a new system. "
+            "Initialize yourself: detect the OS and hardware, "
+            "set up your working directories, check what you can control, "
+            "and report what you find. You have full system access."
+        )
+        
+        response = self.process_input(init_prompt)
+        print(f"Lila: {response}\n")
     
     def process_input(self, text: str) -> str:
         """
@@ -148,13 +186,22 @@ class LilaDaemon:
         """Interactive text input loop (when voice is disabled)."""
         while self._running:
             try:
-                user_input = input("Sammie: ")
+                user_input = input("Sammie: " if self._activated else "> ")
                 if not user_input.strip():
                     continue
                 if user_input.lower() in ("quit", "exit"):
                     self._shutdown()
                     break
                 
+                # Check for wake word if not yet activated
+                if not self._activated:
+                    if self._is_wake_word(user_input):
+                        self._activate()
+                    else:
+                        print("  (dormant — say a wake word to activate)\n")
+                    continue
+                
+                # Active — process through Lila
                 response = self.process_input(user_input)
                 print(f"Lila: {response}\n")
             except (KeyboardInterrupt, EOFError):
@@ -164,7 +211,8 @@ class LilaDaemon:
     def _voice_loop(self):
         """
         Continuous voice listening loop.
-        Mic → Speech-to-Text → Lila → Text-to-Speech → Speaker
+        Before activation: listens only for wake word.
+        After activation: full conversation mode.
         """
         try:
             from src.core.voice import LilaVoice
@@ -176,18 +224,21 @@ class LilaDaemon:
                 if not text or not self._running:
                     continue
                 
+                # Before activation — only respond to wake word
+                if not self._activated:
+                    if self._is_wake_word(text):
+                        self._activate()
+                        voice.speak("I'm awake. Initializing.")
+                    continue
+                
+                # Active mode — full conversation
                 print(f"[heard] {text}")
-                
-                # Process through Lila
                 response = self.process_input(text)
-                
-                # Speak the response
                 voice.speak(response)
                 print(f"[spoke] {response}")
                 
         except ImportError:
             print("   Voice: unavailable (install speech_recognition, pyttsx3)")
-            # Fall through to text mode
             self._text_loop()
         except Exception as e:
             print(f"   Voice error: {e}")
