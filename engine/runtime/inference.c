@@ -62,7 +62,7 @@ void dequant_matvec(float *out, const LilaQuantWeight *w, const float *vec) {
                 : ((w->indices[byte_idx] >> 4) & 0x0F);
             
             /* Dequant: codebook[nibble] * scale */
-            float scale = (float)w->scales[group_idx]; /* TODO: FP16 decode */
+            float scale = w->scales[group_idx];
             float val = w->codebook[nibble] * scale;
             sum += val * vec[j];
         }

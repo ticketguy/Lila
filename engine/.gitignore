@@ -1,0 +1,5 @@
+-e *.o
+lila-asi
+lila-asi-dbg
+*.asi
+!ASI_FORMAT.md

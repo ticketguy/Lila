@@ -221,10 +221,100 @@ static int load_weights(AsiRuntime *rt) {
     rt->model->token_embedding = (float *)ptr;
     ptr += embed_size;
     
-    /* TODO: Parse per-layer quantized weights from ptr */
-    /* For now, structural foundation is in place */
+    /* ── Per-layer quantized weights ── */
+    uint8_t *weights_end = (uint8_t *)rt->model->mmap_addr + sec->size;
+    int group_size = rt->config.group_size > 0 ? rt->config.group_size : 128;
     
-    fprintf(stderr, "ASI: Weights mapped (%zu MB)\n", sec->size / (1024*1024));
+    for (int layer_idx = 0; layer_idx < rt->config.n_layers; layer_idx++) {
+        if (ptr >= weights_end) break;
+        
+        LilaLayer *layer = &rt->model->layers[layer_idx];
+        layer->hidden_size = rt->config.hidden_size;
+        layer->intermediate_size = rt->config.intermediate_size;
+        layer->n_heads = rt->config.n_heads;
+        layer->n_kv_heads = rt->config.n_kv_heads;
+        layer->head_dim = rt->config.hidden_size / rt->config.n_heads;
+        
+        /* Parse 7 quantized weight tensors:
+         * 0=q_proj, 1=k_proj, 2=v_proj, 3=o_proj,
+         * 4=gate_proj, 5=up_proj, 6=down_proj */
+        LilaQuantWeight *projs[7] = {
+            &layer->q_proj, &layer->k_proj, &layer->v_proj, &layer->o_proj,
+            &layer->gate_proj, &layer->up_proj, &layer->down_proj
+        };
+        
+        for (int p = 0; p < 7; p++) {
+            if (ptr + 8 > weights_end) break;
+            
+            int rows, cols;
+            memcpy(&rows, ptr, 4); ptr += 4;
+            memcpy(&cols, ptr, 4); ptr += 4;
+            
+            projs[p]->rows = rows;
+            projs[p]->cols = cols;
+            
+            if (rows == 0 || cols == 0) continue; /* Empty projection (skip) */
+            
+            /* Codebook: 16 floats = 64 bytes */
+            if (ptr + 64 > weights_end) break;
+            memcpy(projs[p]->codebook, ptr, 16 * sizeof(float));
+            ptr += 64;
+            
+            /* Scales: n_groups floats */
+            int n_elements = rows * cols;
+            int n_groups = (n_elements + group_size - 1) / group_size;
+            size_t scales_size = n_groups * sizeof(float);
+            if (ptr + scales_size > weights_end) break;
+            projs[p]->scales = (float *)ptr;
+            ptr += scales_size;
+            projs[p]->n_groups = n_groups;
+            
+            /* Packed INT4 indices: n_elements/2 bytes */
+            size_t packed_size = (n_elements + 1) / 2;
+            if (ptr + packed_size > weights_end) break;
+            projs[p]->indices = ptr;
+            ptr += packed_size;
+        }
+        
+        /* Layer norms: 2 × hidden_size floats (FP32) */
+        size_t norm_size = rt->config.hidden_size * sizeof(float);
+        if (ptr + norm_size <= weights_end) {
+            layer->input_layernorm = (float *)ptr;
+            ptr += norm_size;
+        }
+        if (ptr + norm_size <= weights_end) {
+            layer->post_attention_layernorm = (float *)ptr;
+            ptr += norm_size;
+        }
+    }
+    
+    /* Final norm (FP32) */
+    size_t norm_size = rt->config.hidden_size * sizeof(float);
+    if (ptr + norm_size <= weights_end) {
+        rt->model->final_norm = (float *)ptr;
+        ptr += norm_size;
+    }
+    
+    /* LM Head — check for tied flag (0xFFFFFFFF) or separate weights */
+    if (ptr + 4 <= weights_end) {
+        uint32_t flag;
+        memcpy(&flag, ptr, 4);
+        if (flag == 0xFFFFFFFF) {
+            /* Tied with token embedding */
+            rt->model->lm_head = rt->model->token_embedding;
+            ptr += 4;
+        } else {
+            /* Separate LM head weights */
+            size_t lm_size = (size_t)rt->config.vocab_size * rt->config.hidden_size * sizeof(float);
+            if (ptr + lm_size <= weights_end) {
+                rt->model->lm_head = (float *)ptr;
+                ptr += lm_size;
+            }
+        }
+    }
+    
+    fprintf(stderr, "ASI: Weights fully parsed (%zu MB, %d layers wired)\n",
+            sec->size / (1024*1024), rt->config.n_layers);
     return 0;
 }
 
@@ -440,6 +530,13 @@ AsiRuntime *asi_load(const char *path) {
     if (load_tokenizer(rt) < 0) { asi_free(rt); return NULL; }
     load_bytecode(rt);       /* Optional — native fallback */
     load_personality(rt);    /* Optional */
+    
+    /* Initialize KV cache for inference */
+    extern void lila_init_kv_cache(LilaKVCache *cache, int n_layers, int max_seq,
+                                    int n_kv_heads, int head_dim);
+    lila_init_kv_cache(&rt->model->kv_cache, rt->config.n_layers,
+                       rt->config.max_seq_len, rt->config.n_kv_heads,
+                       rt->config.hidden_size / rt->config.n_heads);
     
     /* Switch to random access pattern for inference */
     platform_madvise_rand(mapped, file_size);

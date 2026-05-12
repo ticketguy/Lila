@@ -29,7 +29,7 @@
 typedef struct {
     uint8_t *indices;       /* Packed 4-bit (2 per byte) */
     float codebook[LILA_CODEBOOK_SIZE];  /* 16 dequant values */
-    uint16_t *scales;       /* Per-group FP16 scales */
+    float *scales;          /* Per-group scales (FP32) */
     int rows;
     int cols;
     int n_groups;
