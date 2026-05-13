@@ -202,12 +202,12 @@ def build_weights_section(model, config):
                 w = layer_state[proj_name]
                 packed, codebook, scales = quantize_int4(w, GROUP_SIZE)
                 rows, cols = w.shape
-                data.extend(struct.pack("ii", rows, cols))
+                data.extend(struct.pack("iii", rows, cols, 1))  # 1 = QUANT_FIGQUANT
                 data.extend(codebook.tobytes())
                 data.extend(scales.tobytes())
                 data.extend(packed.tobytes())
             else:
-                data.extend(struct.pack("ii", 0, 0))
+                data.extend(struct.pack("iii", 0, 0, 0))
         
         # MLP projections
         for proj_name in ["mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"]:
@@ -215,12 +215,12 @@ def build_weights_section(model, config):
                 w = layer_state[proj_name]
                 packed, codebook, scales = quantize_int4(w, GROUP_SIZE)
                 rows, cols = w.shape
-                data.extend(struct.pack("ii", rows, cols))
+                data.extend(struct.pack("iii", rows, cols, 1))  # 1 = QUANT_FIGQUANT
                 data.extend(codebook.tobytes())
                 data.extend(scales.tobytes())
                 data.extend(packed.tobytes())
             else:
-                data.extend(struct.pack("ii", 0, 0))
+                data.extend(struct.pack("iii", 0, 0, 0))
         
         # Layer norms (FP32)
         for norm_name in ["input_layernorm.weight", "post_attention_layernorm.weight"]:

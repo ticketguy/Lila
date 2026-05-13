@@ -571,19 +571,16 @@ AsiRuntime *asi_load(const char *path) {
 int asi_generate_token(AsiRuntime *rt, int *tokens, int n_tokens) {
     if (!rt || !rt->booted || !rt->model) return -1;
     
-    /* Safety check: verify weight pointers are initialized */
     if (!rt->model->token_embedding) {
         fprintf(stderr, "ASI: Weights not fully parsed (embedding missing)\n");
         return -1;
     }
     
-    /* Verify layer weights are populated */
     if (rt->model->layers[0].q_proj.data == NULL && rt->model->layers[0].q_proj.indices == NULL) {
-        /* Layer weight parsing not complete — return EOS gracefully */
+        fprintf(stderr, "ASI: Layer 0 q_proj not loaded\n");
         return 0;
     }
     
-    /* Delegate to the existing inference engine */
     extern int lila_forward(LilaModel *model, int token, int position);
     return lila_forward(rt->model, tokens[n_tokens - 1], n_tokens - 1);
 }
