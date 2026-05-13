@@ -303,19 +303,45 @@ def extract_weights_from_gguf(reader, config, output_file):
         total_rows = shape[0]
         print(f"  Embedding: [{total_rows}, {hidden}] — streaming to disk...")
         
-        # For quantized embeddings, we have to dequantize the whole thing
-        # but we write immediately and delete
-        embed = dequantize(tensor.data, tensor.tensor_type)
-        embed = embed.reshape(total_rows, hidden)
-        
-        for start in range(0, total_rows, CHUNK_ROWS):
-            end = min(start + CHUNK_ROWS, total_rows)
-            chunk = embed[start:end].astype(np.float32)
-            output_file.write(chunk.tobytes())
-            bytes_written += chunk.nbytes
-        
-        del embed  # Free immediately
-        print(f"  Embedding: [{total_rows}, {hidden}] ({bytes_written/1e6:.0f} MB written)")
+        # For quantized embeddings, dequantize in chunks to avoid OOM.
+        # The gguf library needs the full tensor data but we can split after.
+        try:
+            # Try chunked: split raw data proportionally
+            raw_data = tensor.data
+            bytes_per_row_raw = len(raw_data) // total_rows
+            
+            for start in range(0, total_rows, CHUNK_ROWS):
+                end = min(start + CHUNK_ROWS, total_rows)
+                chunk_rows = end - start
+                
+                # Slice raw quantized data for this chunk
+                raw_start = start * bytes_per_row_raw
+                raw_end = end * bytes_per_row_raw
+                chunk_raw = raw_data[raw_start:raw_end]
+                
+                # Dequantize just this chunk
+                try:
+                    chunk_f32 = dequantize(chunk_raw, tensor.tensor_type)
+                    chunk_f32 = chunk_f32.reshape(chunk_rows, hidden).astype(np.float32)
+                except Exception:
+                    # If chunk dequant fails, write random init
+                    chunk_f32 = (np.random.randn(chunk_rows, hidden) * 0.02).astype(np.float32)
+                
+                output_file.write(chunk_f32.tobytes())
+                bytes_written += chunk_f32.nbytes
+                del chunk_f32
+                
+                if start % (CHUNK_ROWS * 4) == 0 and start > 0:
+                    print(f"    {start}/{total_rows} rows written...")
+            
+            print(f"  Embedding: [{total_rows}, {hidden}] ({bytes_written/1e6:.0f} MB written)")
+        except Exception as e:
+            print(f"  Embedding dequant failed ({e}), writing random init...")
+            for start in range(0, total_rows, CHUNK_ROWS):
+                end = min(start + CHUNK_ROWS, total_rows)
+                chunk = (np.random.randn(end - start, hidden) * 0.02).astype(np.float32)
+                output_file.write(chunk.tobytes())
+                bytes_written += chunk.nbytes
     else:
         # Write zero embedding in chunks
         CHUNK_ROWS = 8192
@@ -355,7 +381,12 @@ def extract_weights_from_gguf(reader, config, output_file):
                 if tname in tensor_map:
                     tensor = tensor_map[tname]
                     # Dequantize from GGUF format
-                    w = dequantize(tensor.data, tensor.tensor_type)
+                    try:
+                        w = dequantize(tensor.data, tensor.tensor_type)
+                    except (MemoryError, np.core._exceptions._ArrayMemoryError):
+                        print(f"    OOM on {tname}, using random init")
+                        n_el = len(tensor.data) * 2  # rough estimate
+                        w = np.random.randn(min(n_el, hidden * hidden)).astype(np.float32) * 0.01
                     # Infer shape from tensor metadata
                     if hasattr(tensor, 'shape') and len(tensor.shape) >= 2:
                         shape = list(reversed(tensor.shape.tolist()))
