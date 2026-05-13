@@ -616,8 +616,15 @@ int asi_generate_token(AsiRuntime *rt, int *tokens, int n_tokens)
         return 0;
     }
 
+    fprintf(stderr, "[DBG] generate_token: n_tokens=%d, last_token=%d\n",
+            n_tokens, tokens[n_tokens - 1]);
+
     extern int lila_forward(LilaModel * model, int token, int position);
-    return lila_forward(rt->model, tokens[n_tokens - 1], n_tokens - 1);
+    int result = lila_forward(rt->model, tokens[n_tokens - 1], n_tokens - 1);
+
+    fprintf(stderr, "[DBG] lila_forward returned: %d\n", result);
+
+    return result;
 }
 
 void asi_generate(AsiRuntime *rt, int *tokens, int n_tokens, int max_new,

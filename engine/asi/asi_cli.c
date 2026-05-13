@@ -138,6 +138,9 @@ static void interactive(AsiRuntime *rt)
 
         /* ── Tokenize input ── */
         int n_new = asi_tokenize(rt, input, tokens + n_tokens, MAX_SEQ - n_tokens);
+        fprintf(stderr, "[DBG] tokenized '%s' -> %d tokens\n", input, n_new);
+        for (int i = 0; i < n_new; i++)
+            fprintf(stderr, "[DBG]   token[%d] = %d\n", i, tokens[n_tokens + i]);
         if (n_new > 0)
         {
             n_tokens += n_new;
@@ -154,7 +157,7 @@ static void interactive(AsiRuntime *rt)
         double t_start = get_time_sec();
         int n_gen = 0;
 
-        for (int i = 0; i < 512; i++)
+        for (int i = 0; i < 1; i++)
         {
             if (n_tokens >= MAX_SEQ - 1)
                 break;

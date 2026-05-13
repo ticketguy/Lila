@@ -17,6 +17,7 @@
 
 #include <stdint.h>
 #include <math.h>
+#include <string.h>
 
 #define QK_K 256
 #define Q4_K_BLOCK_SIZE 144
