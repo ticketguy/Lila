@@ -7,31 +7,40 @@
 /*
  * Lila Model Format
  * 
- * Weights stored as FigQuant INT4:
- *   - 16-value codebook per layer (64 bytes)
- *   - Packed 4-bit indices (2 per byte)
- *   - Per-group FP16 scales
+ * Supports two weight storage modes:
+ *   1. FigQuant INT4: codebook + scales + packed indices (custom)
+ *   2. Q4_K: raw GGUF Q4_K blocks stored directly (native quality)
  *
- * Memory layout optimized for:
- *   - mmap loading (zero-copy from disk)
- *   - SIMD dequantization (codebook fits in one register)
- *   - Cache-friendly access patterns
+ * Q4_K mode stores GGUF blocks as-is — no re-quantization, no precision loss.
+ * The engine dequantizes on-the-fly during matmul (same as llama.cpp).
  */
 
 #define LILA_MAGIC 0x4C494C41  /* "LILA" */
 #define LILA_VERSION 1
 #define LILA_MAX_LAYERS 64
-#define LILA_MAX_VOCAB 128000
+#define LILA_MAX_VOCAB 524288
 #define LILA_GROUP_SIZE 128
 #define LILA_CODEBOOK_SIZE 16
 
+/* Quantization types for weight tensors */
+#define QUANT_NONE      0   /* FP32 raw */
+#define QUANT_FIGQUANT  1   /* FigQuant INT4 (codebook + scales + packed) */
+#define QUANT_Q4_K      2   /* GGUF Q4_K blocks stored raw */
+#define QUANT_Q6_K      3   /* GGUF Q6_K blocks stored raw */
+#define QUANT_F16       4   /* FP16 */
+
 /* Quantized weight tensor */
 typedef struct {
+    uint8_t *data;          /* Raw weight data pointer (into mmap) */
+    int quant_type;         /* QUANT_FIGQUANT, QUANT_Q4_K, etc. */
+    int rows;
+    int cols;
+    size_t data_size;       /* Total bytes of weight data */
+    
+    /* FigQuant-specific fields (only when quant_type == QUANT_FIGQUANT) */
     uint8_t *indices;       /* Packed 4-bit (2 per byte) */
     float codebook[LILA_CODEBOOK_SIZE];  /* 16 dequant values */
     float *scales;          /* Per-group scales (FP32) */
-    int rows;
-    int cols;
     int n_groups;
 } LilaQuantWeight;
 
@@ -49,7 +58,6 @@ typedef struct {
 #define LILA_N_NAMESPACES 5
 typedef struct {
     LilaLoRA adapters[LILA_N_NAMESPACES];
-    /* Namespace indices: 0=personal, 1=episodic, 2=wiki, 3=schedule, 4=contested */
 } LilaMemoryFabric;
 
 /* Transformer layer */
@@ -66,7 +74,7 @@ typedef struct {
     LilaQuantWeight down_proj;
     
     /* Norms */
-    float *input_layernorm;     /* RMSNorm weights */
+    float *input_layernorm;
     float *post_attention_layernorm;
     
     /* Memory Fabric for this layer */
@@ -81,7 +89,7 @@ typedef struct {
 
 /* KV Cache */
 typedef struct {
-    float *key_cache;       /* [n_layers, max_seq, n_kv_heads, head_dim] */
+    float *key_cache;
     float *value_cache;
     int max_seq_len;
     int current_pos;
@@ -104,11 +112,12 @@ typedef struct {
     int max_seq_len;
     float rope_theta;
     float rms_norm_eps;
+    int weight_quant_type;      /* Global quant type for this model */
     
     /* Weights */
-    float *token_embedding;     /* [vocab_size, hidden_size] */
+    float *token_embedding;     /* [vocab_size, hidden_size] FP32 */
     LilaLayer layers[LILA_MAX_LAYERS];
-    float *final_norm;          /* RMSNorm weights */
+    float *final_norm;
     float *lm_head;             /* [vocab_size, hidden_size] or tied */
     
     /* Runtime */
@@ -125,5 +134,8 @@ void lila_free_model(LilaModel *model);
 int lila_generate_token(LilaModel *model, int *tokens, int n_tokens);
 void lila_generate(LilaModel *model, int *tokens, int n_tokens, int max_new_tokens,
                    void (*callback)(int token, void *ctx), void *ctx);
+
+/* Weight compute dispatch — calls correct dequant based on quant_type */
+void weight_matvec(float *out, const LilaQuantWeight *w, const float *vec);
 
 #endif /* LILA_MODEL_H */

@@ -5,7 +5,7 @@
 extern void lila_rmsnorm_avx2(float *out, const float *x, const float *weight, int size, float eps);
 extern void lila_attention(float *output, const float *input, LilaLayer *layer,
                            LilaKVCache *cache, int layer_idx, int position);
-extern void dequant_matvec(float *out, const LilaQuantWeight *w, const float *vec);
+extern void weight_matvec(float *out, const LilaQuantWeight *w, const float *vec);
 
 #include <stdlib.h>
 #include <string.h>
@@ -39,8 +39,8 @@ static void lila_mlp(float *output, const float *input, LilaLayer *layer) {
     float *up = malloc(inter * sizeof(float));
     
     /* Gate and up projections */
-    dequant_matvec(gate, &layer->gate_proj, input);
-    dequant_matvec(up, &layer->up_proj, input);
+    weight_matvec(gate, &layer->gate_proj, input);
+    weight_matvec(up, &layer->up_proj, input);
     
     /* SiLU(gate) * up */
     for (int i = 0; i < inter; i++) {
@@ -48,7 +48,7 @@ static void lila_mlp(float *output, const float *input, LilaLayer *layer) {
     }
     
     /* Down projection */
-    dequant_matvec(output, &layer->down_proj, gate);
+    weight_matvec(output, &layer->down_proj, gate);
     
     free(gate);
     free(up);

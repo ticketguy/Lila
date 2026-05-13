@@ -1,7 +1,7 @@
 #include "model.h"
 
-/* From inference.c */
-extern void dequant_matvec(float *out, const LilaQuantWeight *w, const float *vec);
+/* Unified weight dispatch (handles Q4_K, FigQuant, FP32) */
+extern void weight_matvec(float *out, const LilaQuantWeight *w, const float *vec);
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,10 +62,10 @@ void lila_attention(
     float *attn_out = calloc(hidden, sizeof(float));
     
     /* Project Q, K, V using quantized weights */
-    /* TODO: replace with dequant_matvec from kernels */
-    dequant_matvec(q, &layer->q_proj, input);
-    dequant_matvec(k, &layer->k_proj, input);
-    dequant_matvec(v, &layer->v_proj, input);
+    /* TODO: replace with weight_matvec from kernels */
+    weight_matvec(q, &layer->q_proj, input);
+    weight_matvec(k, &layer->k_proj, input);
+    weight_matvec(v, &layer->v_proj, input);
     
     /* Apply RoPE to Q and K */
     for (int h = 0; h < n_heads; h++) {
@@ -126,7 +126,7 @@ void lila_attention(
     }
     
     /* Output projection */
-    dequant_matvec(output, &layer->o_proj, attn_out);
+    weight_matvec(output, &layer->o_proj, attn_out);
     
     free(q);
     free(k);
@@ -134,5 +134,5 @@ void lila_attention(
     free(attn_out);
 }
 
-/* Forward declaration for dequant_matvec (defined in inference.c) */
+/* Forward declaration for weight_matvec (defined in inference.c) */
 

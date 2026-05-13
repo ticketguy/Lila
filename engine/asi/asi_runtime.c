@@ -223,7 +223,10 @@ static int load_weights(AsiRuntime *rt) {
     
     /* ── Per-layer quantized weights ── */
     uint8_t *weights_end = (uint8_t *)rt->model->mmap_addr + sec->size;
+    int global_quant = rt->config.quant_type; /* 3=FigQuant, 2=Q4_K */
     int group_size = rt->config.group_size > 0 ? rt->config.group_size : 128;
+    
+    rt->model->weight_quant_type = global_quant;
     
     for (int layer_idx = 0; layer_idx < rt->config.n_layers; layer_idx++) {
         if (ptr >= weights_end) break;
@@ -235,45 +238,67 @@ static int load_weights(AsiRuntime *rt) {
         layer->n_kv_heads = rt->config.n_kv_heads;
         layer->head_dim = rt->config.hidden_size / rt->config.n_heads;
         
-        /* Parse 7 quantized weight tensors:
-         * 0=q_proj, 1=k_proj, 2=v_proj, 3=o_proj,
-         * 4=gate_proj, 5=up_proj, 6=down_proj */
+        /* Parse 7 quantized weight tensors */
         LilaQuantWeight *projs[7] = {
             &layer->q_proj, &layer->k_proj, &layer->v_proj, &layer->o_proj,
             &layer->gate_proj, &layer->up_proj, &layer->down_proj
         };
         
         for (int p = 0; p < 7; p++) {
-            if (ptr + 8 > weights_end) break;
+            if (ptr + 12 > weights_end) break;
             
-            int rows, cols;
+            int rows, cols, quant_type;
             memcpy(&rows, ptr, 4); ptr += 4;
             memcpy(&cols, ptr, 4); ptr += 4;
+            memcpy(&quant_type, ptr, 4); ptr += 4;
             
             projs[p]->rows = rows;
             projs[p]->cols = cols;
+            projs[p]->quant_type = quant_type;
             
-            if (rows == 0 || cols == 0) continue; /* Empty projection (skip) */
+            if (rows == 0 || cols == 0) continue;
             
-            /* Codebook: 16 floats = 64 bytes */
-            if (ptr + 64 > weights_end) break;
-            memcpy(projs[p]->codebook, ptr, 16 * sizeof(float));
-            ptr += 64;
-            
-            /* Scales: n_groups floats */
-            int n_elements = rows * cols;
-            int n_groups = (n_elements + group_size - 1) / group_size;
-            size_t scales_size = n_groups * sizeof(float);
-            if (ptr + scales_size > weights_end) break;
-            projs[p]->scales = (float *)ptr;
-            ptr += scales_size;
-            projs[p]->n_groups = n_groups;
-            
-            /* Packed INT4 indices: n_elements/2 bytes */
-            size_t packed_size = (n_elements + 1) / 2;
-            if (ptr + packed_size > weights_end) break;
-            projs[p]->indices = ptr;
-            ptr += packed_size;
+            if (quant_type == QUANT_Q4_K) {
+                /* Q4_K: raw GGUF blocks, 144 bytes per 256 values */
+                int n_elements = rows * cols;
+                int n_blocks = (n_elements + 255) / 256;
+                size_t data_size = (size_t)n_blocks * 144;
+                if (ptr + data_size > weights_end) break;
+                projs[p]->data = ptr;
+                projs[p]->data_size = data_size;
+                ptr += data_size;
+            } else if (quant_type == QUANT_Q6_K) {
+                /* Q6_K: raw GGUF blocks, 210 bytes per 256 values */
+                int n_elements = rows * cols;
+                int n_blocks = (n_elements + 255) / 256;
+                size_t data_size = (size_t)n_blocks * 210;
+                if (ptr + data_size > weights_end) break;
+                projs[p]->data = ptr;
+                projs[p]->data_size = data_size;
+                ptr += data_size;
+            } else if (quant_type == QUANT_FIGQUANT) {
+                /* FigQuant: codebook + scales + packed */
+                if (ptr + 64 > weights_end) break;
+                memcpy(projs[p]->codebook, ptr, 16 * sizeof(float));
+                ptr += 64;
+                
+                int n_elements = rows * cols;
+                int n_groups = (n_elements + group_size - 1) / group_size;
+                size_t scales_size = n_groups * sizeof(float);
+                if (ptr + scales_size > weights_end) break;
+                projs[p]->scales = (float *)ptr;
+                ptr += scales_size;
+                projs[p]->n_groups = n_groups;
+                
+                size_t packed_size = (n_elements + 1) / 2;
+                if (ptr + packed_size > weights_end) break;
+                projs[p]->indices = ptr;
+                projs[p]->data = ptr; /* Also set data ptr for unified access */
+                ptr += packed_size;
+            } else {
+                /* Unknown — skip based on data_size field if present */
+                break;
+            }
         }
         
         /* Layer norms: 2 × hidden_size floats (FP32) */
@@ -561,7 +586,7 @@ int asi_generate_token(AsiRuntime *rt, int *tokens, int n_tokens) {
     }
     
     /* Verify layer weights are populated */
-    if (rt->model->layers[0].q_proj.indices == NULL) {
+    if (rt->model->layers[0].q_proj.data == NULL && rt->model->layers[0].q_proj.indices == NULL) {
         /* Layer weight parsing not complete — return EOS gracefully */
         return 0;
     }
