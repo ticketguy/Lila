@@ -17,7 +17,7 @@
  * for testing the inference pipeline end-to-end.
  */
 
-#define MAX_VOCAB 256000
+#define MAX_VOCAB 524288
 #define MAX_TOKEN_LEN 256
 #define MAX_INPUT_LEN 65536
 
@@ -133,6 +133,54 @@ int lila_encode(LilaTokenizer *tok, const char *text, int *output_ids, int max_t
 int lila_get_bos(LilaTokenizer *tok) { return tok ? tok->bos_id : 1; }
 int lila_get_eos(LilaTokenizer *tok) { return tok ? tok->eos_id : 2; }
 int lila_get_vocab_size(LilaTokenizer *tok) { return tok ? tok->vocab_size : 0; }
+
+/*
+ * Load tokenizer directly from binary memory (no temp file).
+ * Data format: sequence of [uint16_t length][bytes...] entries.
+ * This avoids newline corruption that breaks the file-based loader.
+ */
+LilaTokenizer *lila_load_tokenizer_from_memory(const uint8_t *data, size_t data_size,
+                                                int vocab_size, int bos_id, int eos_id, int pad_id) {
+    LilaTokenizer *tok = calloc(1, sizeof(LilaTokenizer));
+    if (!tok) return NULL;
+    
+    int max_vocab = vocab_size < 512000 ? vocab_size : 512000;
+    tok->tokens = calloc(max_vocab, sizeof(char *));
+    tok->scores = calloc(max_vocab, sizeof(float));
+    tok->bos_id = bos_id;
+    tok->eos_id = eos_id;
+    tok->pad_id = pad_id;
+    
+    const uint8_t *ptr = data;
+    const uint8_t *end = data + data_size;
+    int i = 0;
+    
+    while (i < max_vocab && ptr + 2 <= end) {
+        uint16_t token_len;
+        memcpy(&token_len, ptr, 2);
+        ptr += 2;
+        
+        if (ptr + token_len > end) break;
+        
+        if (token_len > 0 && token_len < 4096) {
+            tok->tokens[i] = malloc(token_len + 1);
+            if (tok->tokens[i]) {
+                memcpy(tok->tokens[i], ptr, token_len);
+                tok->tokens[i][token_len] = '\0';
+            }
+        } else {
+            /* Empty or oversized token — store placeholder */
+            tok->tokens[i] = strdup("");
+        }
+        tok->scores[i] = (float)(max_vocab - i);
+        ptr += token_len;
+        i++;
+    }
+    
+    tok->vocab_size = i;
+    fprintf(stderr, "Tokenizer: %d tokens loaded (from memory)\n", tok->vocab_size);
+    return tok;
+}
 
 void lila_free_tokenizer(LilaTokenizer *tok) {
     if (!tok) return;

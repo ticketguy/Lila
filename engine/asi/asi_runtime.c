@@ -402,24 +402,16 @@ static int load_tokenizer(AsiRuntime *rt) {
     AsiTokenizerHeader *thdr = (AsiTokenizerHeader *)ptr;
     ptr += sizeof(AsiTokenizerHeader);
     
-    /* Write embedded vocab to temp file for the existing tokenizer loader */
-    const char *tmp_vocab = platform_tmp_vocab();
-    FILE *vf = fopen(tmp_vocab, "w");
-    if (vf) {
-        for (uint32_t i = 0; i < thdr->vocab_size; i++) {
-            uint16_t token_len;
-            memcpy(&token_len, ptr, 2);
-            ptr += 2;
-            if (token_len > 0 && token_len < 1024) {
-                fwrite(ptr, 1, token_len, vf);
-            }
-            ptr += token_len;
-            fputc('\n', vf);
-        }
-        fclose(vf);
-        rt->tokenizer = lila_load_tokenizer(tmp_vocab);
-        platform_unlink(tmp_vocab);
-    }
+    /* Parse tokenizer directly from mmap'd binary data.
+     * No temp file — avoids newline corruption with binary tokens. */
+    size_t remaining = sec->size - sizeof(AsiTokenizerHeader);
+    rt->tokenizer = lila_load_tokenizer_from_memory(
+        ptr, remaining,
+        thdr->vocab_size,
+        thdr->bos_id,
+        thdr->eos_id,
+        thdr->pad_id
+    );
     
     if (!rt->tokenizer) {
         fprintf(stderr, "ASI: Tokenizer extraction failed (continuing without)\n");
