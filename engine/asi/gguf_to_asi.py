@@ -403,7 +403,7 @@ def extract_weights_from_gguf(reader, config, output_file):
                     from pack_asi import quantize_int4
                     packed, codebook, scales = quantize_int4(w, GROUP_SIZE)
                     
-                    header = struct.pack("ii", rows, cols)
+                    header = struct.pack("iii", rows, cols, 1)  # 1 = QUANT_FIGQUANT
                     output_file.write(header)
                     output_file.write(codebook.tobytes())
                     output_file.write(scales.tobytes())
@@ -415,7 +415,7 @@ def extract_weights_from_gguf(reader, config, output_file):
                     break
             
             if not found:
-                header = struct.pack("ii", 0, 0)
+                header = struct.pack("iii", 0, 0, 0)
                 output_file.write(header)
                 bytes_written += len(header)
         
