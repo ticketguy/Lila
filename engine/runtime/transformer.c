@@ -48,12 +48,11 @@ static void lila_mlp(float *output, const float *input, LilaLayer *layer)
     if (down_cols > 0 && active > down_cols)
         active = down_cols;
 
-    fprintf(stderr, "[DBG] mlp: configured_inter=%d scratch=%d active=%d gate=%dx%d up=%dx%d down=%dx%d\n",
+    
             configured_inter, scratch, active,
             layer->gate_proj.rows, layer->gate_proj.cols,
             layer->up_proj.rows, layer->up_proj.cols,
             layer->down_proj.rows, layer->down_proj.cols);
-    fflush(stderr);
 
     float *gate = calloc((size_t)scratch, sizeof(float));
     float *up = calloc((size_t)scratch, sizeof(float));
@@ -65,27 +64,21 @@ static void lila_mlp(float *output, const float *input, LilaLayer *layer)
         return;
     }
 
-    fprintf(stderr, "[DBG] mlp calling gate weight_matvec...\n");
-    fflush(stderr);
+    
     weight_matvec(gate, &layer->gate_proj, input);
-    fprintf(stderr, "[DBG] mlp gate returned\n");
-    fflush(stderr);
-    fprintf(stderr, "[DBG] mlp calling up weight_matvec...\n");
-    fflush(stderr);
+    
+    
     weight_matvec(up, &layer->up_proj, input);
-    fprintf(stderr, "[DBG] mlp up returned\n");
-    fflush(stderr);
+    
 
     for (int i = 0; i < active; i++)
     {
         gate[i] = silu_f(gate[i]) * up[i];
     }
 
-    fprintf(stderr, "[DBG] mlp calling down weight_matvec...\n");
-    fflush(stderr);
+    
     weight_matvec(output, &layer->down_proj, gate);
-    fprintf(stderr, "[DBG] mlp down returned\n");
-    fflush(stderr);
+    
 
     free(gate);
     free(up);
@@ -139,11 +132,10 @@ void lila_transformer_block(
     int position)
 {
     int hidden = layer->hidden_size;
-    fprintf(stderr, "[DBG] block layer=%d hidden=%d inter=%d head_dim=%d\n",
+    
             layer_idx, hidden, layer->intermediate_size, layer->head_dim);
-    fprintf(stderr, "[DBG] input_layernorm=%p\n", (void *)layer->input_layernorm);
-    fprintf(stderr, "[DBG] calling rmsnorm...\n");
-    fflush(stderr);
+    
+    
 
     float *residual = malloc(hidden * sizeof(float));
     float *normed = malloc(hidden * sizeof(float));
@@ -153,20 +145,16 @@ void lila_transformer_block(
     /* Pre-attention norm */
     memcpy(residual, hidden_state, hidden * sizeof(float));
     lila_rmsnorm_avx2(normed, hidden_state, layer->input_layernorm, hidden, 1e-6f);
-    fprintf(stderr, "[DBG] rmsnorm returned\n");
-    fflush(stderr);
+    
 
     /* Attention */
-    fprintf(stderr, "[DBG] calling attention...\n");
-    fflush(stderr);
+    
     lila_attention(attn_out, normed, layer, cache, layer_idx, position);
-    fprintf(stderr, "[DBG] attention returned\n");
-    fflush(stderr);
+    
 
     /* Memory Fabric */
     lila_memory_fabric(attn_out, normed, &layer->fabric, hidden, hidden);
-    fprintf(stderr, "[DBG] memory_fabric returned\n");
-    fflush(stderr);
+    
 
     /* Residual */
     for (int i = 0; i < hidden; i++)
@@ -175,13 +163,11 @@ void lila_transformer_block(
     /* Pre-MLP norm */
     memcpy(residual, hidden_state, hidden * sizeof(float));
     lila_rmsnorm_avx2(normed, hidden_state, layer->post_attention_layernorm, hidden, 1e-6f);
-    fprintf(stderr, "[DBG] post_attn rmsnorm returned\n");
-    fflush(stderr);
+    
 
     /* MLP */
     lila_mlp(mlp_out, normed, layer);
-    fprintf(stderr, "[DBG] mlp returned\n");
-    fflush(stderr);
+    
 
     /* Residual */
     for (int i = 0; i < hidden; i++)
@@ -198,17 +184,17 @@ int lila_forward(LilaModel *model, int token, int position)
 {
     int hidden = model->hidden_size;
 
-    fprintf(stderr, "[DBG] lila_forward: token=%d pos=%d hidden=%d vocab=%d\n",
+    
             token, position, hidden, model->vocab_size);
-    fprintf(stderr, "[DBG] embedding ptr: %p\n", (void *)model->token_embedding);
-    fprintf(stderr, "[DBG] final_norm ptr: %p\n", (void *)model->final_norm);
-    fprintf(stderr, "[DBG] lm_head ptr: %p\n", (void *)model->lm_head);
-    fprintf(stderr, "[DBG] layer[0] q_proj: data=%p indices=%p rows=%d cols=%d\n",
+    
+    
+    
+    
             (void *)model->layers[0].q_proj.data,
             (void *)model->layers[0].q_proj.indices,
             model->layers[0].q_proj.rows,
             model->layers[0].q_proj.cols);
-    fprintf(stderr, "[DBG] layer[0] input_layernorm: %p\n",
+    
             (void *)model->layers[0].input_layernorm);
 
     /* Bounds check token */
@@ -223,6 +209,12 @@ int lila_forward(LilaModel *model, int token, int position)
     memcpy(hidden_state, model->token_embedding + (size_t)token * hidden,
            hidden * sizeof(float));
 
+    /* Gemma embedding scale: multiply by sqrt(hidden_size) */
+    float embed_scale = sqrtf((float)hidden);
+    for (int i = 0; i < hidden; i++) {
+        hidden_state[i] *= embed_scale;
+    }
+
     /* Transformer layers */
     for (int l = 0; l < model->n_layers; l++)
     {
@@ -230,25 +222,20 @@ int lila_forward(LilaModel *model, int token, int position)
                                &model->kv_cache, l, position);
     }
 
-    fprintf(stderr, "[DBG] all transformer layers returned\n");
-    fflush(stderr);
+    
 
     /* Final norm */
     float *normed = malloc(hidden * sizeof(float));
-    fprintf(stderr, "[DBG] calling final rmsnorm...\n");
-    fflush(stderr);
+    
     lila_rmsnorm_avx2(normed, hidden_state, model->final_norm, hidden, 1e-6f);
-    fprintf(stderr, "[DBG] final rmsnorm returned\n");
-    fflush(stderr);
+    
 
     /* LM head: [vocab_size, hidden] @ normed → logits
      * Use dispatch so AVX2 is used where available */
     float *logits = malloc(model->vocab_size * sizeof(float));
-    fprintf(stderr, "[DBG] calling lm_head matvec...\n");
-    fflush(stderr);
+    
     lila_dispatch_matvec(logits, model->lm_head, normed, model->vocab_size, hidden);
-    fprintf(stderr, "[DBG] lm_head matvec returned\n");
-    fflush(stderr);
+    
 
     /* Greedy argmax sampling */
     int next_token = 0;
@@ -262,8 +249,7 @@ int lila_forward(LilaModel *model, int token, int position)
         }
     }
 
-    fprintf(stderr, "[DBG] sampled next_token=%d max=%f\n", next_token, max_val);
-    fflush(stderr);
+    
 
     free(hidden_state);
     free(normed);

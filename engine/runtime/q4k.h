@@ -53,48 +53,59 @@ static inline float fp16_to_fp32(uint16_t h) {
 
 /*
  * Dequantize a Q4_K block (256 values).
- * 
- * This is the same algorithm as llama.cpp's dequantize_row_q4_K.
+ * Matches llama.cpp's dequantize_row_q4_K exactly.
+ *
+ * Layout: 4 iterations of 64 weights each.
+ * Per iteration: 32 bytes of qs encode 64 nibbles (low=sub-block A, high=sub-block B).
+ * Each pair of sub-blocks uses TWO scale/min values decoded via get_scale_min_k4.
  */
+
+static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
 static inline void dequant_q4k_block(float *out, const uint8_t *block) {
     uint16_t d_raw, dmin_raw;
     memcpy(&d_raw, block, 2);
     memcpy(&dmin_raw, block + 2, 2);
     
     float d = fp16_to_fp32(d_raw);
-    float dmin = fp16_to_fp32(dmin_raw);
+    float min = fp16_to_fp32(dmin_raw);
     
-    const uint8_t *scales = block + 4;      /* 12 bytes of packed scales */
-    const uint8_t *qs = block + 16;         /* 128 bytes of 4-bit values */
+    const uint8_t *scales_packed = block + 4;   /* 12 bytes */
+    const uint8_t *qs = block + 16;             /* 128 bytes */
     
-    /* Decode the 8 sub-block scales and mins from the packed 12 bytes */
-    /* Q4_K uses 6-bit scales packed into 12 bytes for 8 sub-blocks */
-    uint8_t sc[8], mn[8];
+    int is = 0;
+    float *y = out;
     
-    /* First 4 sub-blocks: lower 4 bits of scales[0..3] = scale, scales[4..7] = min */
-    for (int i = 0; i < 4; i++) {
-        sc[i] = scales[i] & 0x3F;
-        mn[i] = scales[i + 4] & 0x3F;
-    }
-    /* Last 4 sub-blocks: upper bits packed in scales[8..11] */
-    for (int i = 0; i < 4; i++) {
-        sc[i + 4] = (scales[8 + i] & 0xF) | ((scales[i] >> 6) << 4);
-        mn[i + 4] = (scales[8 + i] >> 4) | ((scales[i + 4] >> 6) << 4);
-    }
-    
-    /* Dequantize 8 sub-blocks of 32 values each */
-    for (int sb = 0; sb < 8; sb++) {
-        float scale = d * sc[sb];
-        float min_val = dmin * mn[sb];
+    for (int j = 0; j < 256; j += 64) {
+        uint8_t sc, m;
         
-        const uint8_t *q = qs + sb * 16;  /* 16 bytes = 32 nibbles */
-        float *o = out + sb * 32;
+        get_scale_min_k4(is + 0, scales_packed, &sc, &m);
+        float d1 = d * sc;
+        float m1 = min * m;
         
-        for (int j = 0; j < 16; j++) {
-            uint8_t byte = q[j];
-            o[j]      = scale * (byte & 0xF) - min_val;
-            o[j + 16] = scale * (byte >> 4) - min_val;
+        get_scale_min_k4(is + 1, scales_packed, &sc, &m);
+        float d2 = d * sc;
+        float m2 = min * m;
+        
+        /* Low nibbles → 32 elements with scale d1, min m1 */
+        for (int l = 0; l < 32; ++l) {
+            *y++ = d1 * (qs[l] & 0xF) - m1;
         }
+        /* High nibbles → 32 elements with scale d2, min m2 */
+        for (int l = 0; l < 32; ++l) {
+            *y++ = d2 * (qs[l] >> 4) - m2;
+        }
+        
+        qs += 32;
+        is += 2;
     }
 }
 
