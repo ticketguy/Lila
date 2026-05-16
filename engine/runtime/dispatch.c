@@ -28,6 +28,7 @@ extern void lila_dequant_int4_neon(float *out, const uint8_t *indices, const flo
 
 /* C scalar fallbacks — work everywhere including Windows */
 static void matvec_scalar(float *out, const float *mat, const float *vec, int rows, int cols) {
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < rows; i++) {
         float sum = 0.0f;
         for (int j = 0; j < cols; j++) sum += mat[i * cols + j] * vec[j];

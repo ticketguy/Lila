@@ -26,7 +26,7 @@ if %ERRORLEVEL% neq 0 (
 )
 
 set CC=gcc
-set CFLAGS=-O2 -Wall -std=c11 -D_WIN32 -DWIN32_LEAN_AND_MEAN
+set CFLAGS=-O2 -Wall -std=c11 -D_WIN32 -DWIN32_LEAN_AND_MEAN -fopenmp
 set INCLUDES=-I runtime/ -I asi/
 
 REM Compile runtime
@@ -68,7 +68,7 @@ echo   Linking...
     runtime/model.o runtime/inference.o runtime/attention.o ^
     runtime/transformer.o runtime/tokenizer.o runtime/detect.o ^
     runtime/dispatch.o asi/asi_runtime.o asi/lilavm.o asi/asi_cli.o ^
-    -lm
+    -lm -fopenmp
 
 if %ERRORLEVEL% neq 0 (
     echo.

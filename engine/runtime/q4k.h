@@ -111,6 +111,7 @@ static void q4k_matvec(float *out, const uint8_t *weight_data, const float *vec,
     /* Number of Q4_K blocks per row */
     int blocks_per_row = (cols + QK_K - 1) / QK_K;
     
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < rows; i++) {
         float sum = 0.0f;
         const uint8_t *row_blocks = weight_data + (size_t)i * blocks_per_row * Q4_K_BLOCK_SIZE;
