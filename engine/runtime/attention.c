@@ -67,7 +67,8 @@ void lila_attention(
     int hidden = layer->hidden_size;
     int n_heads = layer->n_heads;
     int n_kv_heads = layer->n_kv_heads;
-    int head_dim = layer->head_dim;
+    /* Derive head_dim from actual Q projection size (more reliable than config) */
+    int head_dim = layer->q_proj.rows > 0 ? layer->q_proj.rows / n_heads : layer->head_dim;
     int kv_group = n_heads / n_kv_heads; /* GQA group size */
     int kv_size = n_kv_heads * head_dim;
     int q_size = hidden;
@@ -87,29 +88,6 @@ void lila_attention(
     if (attn_out_size < layer->o_proj.cols)
         attn_out_size = layer->o_proj.cols;
 
-    fprintf(stderr, "[DBG] attention: hidden=%d n_heads=%d n_kv_heads=%d head_dim=%d\n",
-            hidden, n_heads, n_kv_heads, head_dim);
-    fflush(stderr);
-    fprintf(stderr, "[DBG] q_proj rows=%d cols=%d data=%p\n",
-            layer->q_proj.rows, layer->q_proj.cols,
-            (void *)layer->q_proj.data);
-    fflush(stderr);
-    fprintf(stderr, "[DBG] k_proj rows=%d cols=%d data=%p\n",
-            layer->k_proj.rows, layer->k_proj.cols,
-            (void *)layer->k_proj.data);
-    fflush(stderr);
-    fprintf(stderr, "[DBG] v_proj rows=%d cols=%d data=%p\n",
-            layer->v_proj.rows, layer->v_proj.cols,
-            (void *)layer->v_proj.data);
-    fflush(stderr);
-    fprintf(stderr, "[DBG] o_proj rows=%d cols=%d data=%p\n",
-            layer->o_proj.rows, layer->o_proj.cols,
-            (void *)layer->o_proj.data);
-    fflush(stderr);
-    fprintf(stderr, "[DBG] allocating q[%d] k[%d] v[%d] attn_out[%d] out[%d]\n",
-            q_size, k_size, v_size, attn_out_size, out_size);
-    fflush(stderr);
-
     /* Allocate scratch (TODO: pre-allocate in model struct) */
     float *q = calloc((size_t)q_size, sizeof(float));
     float *k = calloc((size_t)k_size, sizeof(float));
@@ -128,21 +106,9 @@ void lila_attention(
     }
 
     /* Project Q, K, V using quantized weights */
-    fprintf(stderr, "[DBG] calling q weight_matvec...\n");
-    fflush(stderr);
     weight_matvec(q, &layer->q_proj, input);
-    fprintf(stderr, "[DBG] q weight_matvec returned\n");
-    fflush(stderr);
-    fprintf(stderr, "[DBG] calling k weight_matvec...\n");
-    fflush(stderr);
     weight_matvec(k, &layer->k_proj, input);
-    fprintf(stderr, "[DBG] k weight_matvec returned\n");
-    fflush(stderr);
-    fprintf(stderr, "[DBG] calling v weight_matvec...\n");
-    fflush(stderr);
     weight_matvec(v, &layer->v_proj, input);
-    fprintf(stderr, "[DBG] v weight_matvec returned\n");
-    fflush(stderr);
 
     /* Apply RoPE to Q and K */
     for (int h = 0; h < n_heads; h++)
@@ -207,11 +173,7 @@ void lila_attention(
     }
 
     /* Output projection */
-    fprintf(stderr, "[DBG] calling o weight_matvec...\n");
-    fflush(stderr);
     weight_matvec(proj_out, &layer->o_proj, attn_out);
-    fprintf(stderr, "[DBG] o weight_matvec returned\n");
-    fflush(stderr);
 
     memset(output, 0, (size_t)hidden * sizeof(float));
     int copy = hidden < layer->o_proj.rows ? hidden : layer->o_proj.rows;

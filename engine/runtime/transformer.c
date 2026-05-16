@@ -217,14 +217,33 @@ int lila_forward(LilaModel *model, int token, int position)
     float *normed = malloc(hidden * sizeof(float));
     
     lila_rmsnorm_avx2(normed, hidden_state, model->final_norm, hidden, 1e-6f);
-    
 
-    /* LM head: [vocab_size, hidden] @ normed → logits
-     * Use dispatch so AVX2 is used where available */
+    /* LM head: [vocab_size, hidden] @ normed → logits */
     float *logits = malloc(model->vocab_size * sizeof(float));
     
-    lila_dispatch_matvec(logits, model->lm_head, normed, model->vocab_size, hidden);
-    
+    if (model->lm_head != NULL) {
+        /* FP32 LM head — direct matvec */
+        lila_dispatch_matvec(logits, model->lm_head, normed, model->vocab_size, hidden);
+    } else if (model->embed_data != NULL && model->embed_quant_type == 5) {
+        /* Weight-tied Q6_K embedding — dequant each vocab row and dot with normed.
+         * This is the bottleneck for Gemma (262144 rows) but it's correct. */
+        int bytes_per_row = model->embed_bytes_per_row;
+        float row_buf[2560]; /* stack buffer for one dequanted row (hidden <= 2560) */
+        
+        #pragma omp parallel for schedule(static) private(row_buf)
+        for (int i = 0; i < model->vocab_size; i++) {
+            const uint8_t *row_ptr = model->embed_data + (size_t)i * bytes_per_row;
+            dequant_q6k_row(row_buf, row_ptr, hidden);
+            float sum = 0.0f;
+            for (int j = 0; j < hidden; j++) {
+                sum += row_buf[j] * normed[j];
+            }
+            logits[i] = sum;
+        }
+    } else {
+        /* No LM head available — return EOS */
+        memset(logits, 0, model->vocab_size * sizeof(float));
+    }
 
     /* Greedy argmax sampling */
     int next_token = 0;
@@ -237,8 +256,6 @@ int lila_forward(LilaModel *model, int token, int position)
             next_token = i;
         }
     }
-
-    
 
     free(hidden_state);
     free(normed);

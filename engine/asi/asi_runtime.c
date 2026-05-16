@@ -368,7 +368,10 @@ static int load_weights(AsiRuntime *rt)
         memcpy(&flag, ptr, 4);
         if (flag == 0xFFFFFFFF)
         {
-            rt->model->lm_head = rt->model->token_embedding;
+            /* Tied with embedding. If embedding is FP32, point to it.
+             * If embedding is Q6_K, leave lm_head=NULL — transformer.c
+             * will use embed_data directly for the Q6_K dot product. */
+            rt->model->lm_head = rt->model->token_embedding; /* NULL if Q6_K */
             ptr += 4;
         }
         else
@@ -610,7 +613,7 @@ AsiRuntime *asi_load(const char *path)
                        rt->config.n_layers,
                        rt->config.max_seq_len,
                        rt->config.n_kv_heads,
-                       rt->config.hidden_size / rt->config.n_heads);
+                       rt->config.head_dim);
 
     platform_madvise_rand(mapped, file_size);
 
@@ -642,13 +645,9 @@ int asi_generate_token(AsiRuntime *rt, int *tokens, int n_tokens)
         return 0;
     }
 
-    fprintf(stderr, "[DBG] generate_token: n_tokens=%d, last_token=%d\n",
-            n_tokens, tokens[n_tokens - 1]);
-
     extern int lila_forward(LilaModel * model, int token, int position);
     int result = lila_forward(rt->model, tokens[n_tokens - 1], n_tokens - 1);
 
-    fprintf(stderr, "[DBG] lila_forward returned: %d\n", result);
 
     return result;
 }
