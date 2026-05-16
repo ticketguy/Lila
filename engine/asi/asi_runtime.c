@@ -223,10 +223,35 @@ static int load_weights(AsiRuntime *rt)
 
     rt->model->weight_quant_type = global_quant;
 
-    /* Token embedding (FP32) */
-    size_t embed_size = (size_t)rt->config.vocab_size * rt->config.hidden_size * sizeof(float);
-    rt->model->token_embedding = (float *)ptr;
-    ptr += embed_size;
+    /* Token embedding — check if it starts with a quant header (v3 format) */
+    if (ptr + 12 <= weights_end) {
+        uint32_t maybe_vocab, maybe_hidden, maybe_qtype;
+        memcpy(&maybe_vocab, ptr, 4);
+        memcpy(&maybe_hidden, ptr + 4, 4);
+        memcpy(&maybe_qtype, ptr + 8, 4);
+        
+        if (maybe_qtype == 5 && maybe_vocab == (uint32_t)rt->config.vocab_size 
+            && maybe_hidden == (uint32_t)rt->config.hidden_size) {
+            /* v3 format: quantized embedding with header */
+            ptr += 12;
+            rt->model->embed_quant_type = 5; /* Q6_K */
+            int blocks_per_row = rt->config.hidden_size / 256;
+            rt->model->embed_bytes_per_row = blocks_per_row * 210; /* Q6_K = 210 bytes/block */
+            size_t embed_data_size = (size_t)rt->config.vocab_size * rt->model->embed_bytes_per_row;
+            rt->model->embed_data = ptr;
+            rt->model->token_embedding = NULL; /* Not FP32 */
+            ptr += embed_data_size;
+            fprintf(stderr, "ASI: Embedding loaded (Q6_K, %zu MB, dequant-on-lookup)\n",
+                    embed_data_size / (1024*1024));
+        } else {
+            /* Legacy format: raw FP32 embedding */
+            size_t embed_size = (size_t)rt->config.vocab_size * rt->config.hidden_size * sizeof(float);
+            rt->model->token_embedding = (float *)ptr;
+            rt->model->embed_quant_type = 0;
+            rt->model->embed_data = NULL;
+            ptr += embed_size;
+        }
+    }
 
     for (int layer_idx = 0; layer_idx < rt->config.n_layers; layer_idx++)
     {
@@ -603,9 +628,10 @@ int asi_generate_token(AsiRuntime *rt, int *tokens, int n_tokens)
     if (!rt || !rt->booted || !rt->model)
         return -1;
 
-    if (!rt->model->token_embedding)
+    /* Check that we have SOME embedding (FP32 or quantized) */
+    if (!rt->model->token_embedding && !rt->model->embed_data)
     {
-        fprintf(stderr, "ASI: Weights not fully parsed (embedding missing)\n");
+        fprintf(stderr, "ASI: No embedding data available\n");
         return -1;
     }
 

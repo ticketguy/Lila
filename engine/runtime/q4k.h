@@ -146,3 +146,46 @@ static void q4k_matvec(float *out, const uint8_t *weight_data, const float *vec,
 }
 
 #endif /* LILA_Q4K_H */
+
+/* ═══════════════════════════════════════════════════════════════════════════ */
+/*  Q6_K Dequantization (for embedding lookup)                               */
+/*  Block: 210 bytes → 256 float values                                      */
+/*  Layout: ql[128] + qh[64] + scales[16] + d(fp16)                         */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+#define Q6_K_BLOCK_SIZE 210
+
+static inline void dequant_q6k_block(float *out, const uint8_t *block) {
+    const uint8_t *ql = block;           /* 128 bytes: low 4 bits */
+    const uint8_t *qh = block + 128;     /* 64 bytes: high 2 bits */
+    const int8_t *scales = (const int8_t *)(block + 192); /* 16 bytes: int8 scales */
+    uint16_t d_raw;
+    memcpy(&d_raw, block + 208, 2);      /* fp16 super-block scale */
+    float d = fp16_to_fp32(d_raw);
+    
+    for (int sb = 0; sb < 16; sb++) {
+        float scale = d * scales[sb];
+        int offset = sb * 16;
+        
+        for (int j = 0; j < 16; j++) {
+            int idx = offset + j;
+            /* Reconstruct 6-bit value from ql (4 bits) + qh (2 bits) */
+            uint8_t q4 = (ql[idx / 2] >> (4 * (idx % 2))) & 0xF;
+            uint8_t q2 = (qh[idx / 4] >> (2 * (idx % 4))) & 0x3;
+            int8_t q = (int8_t)((q4 | (q2 << 4)) - 32);
+            out[offset + j] = scale * q;
+        }
+    }
+}
+
+/*
+ * Dequantize a single embedding row from Q6_K format.
+ * Each row = hidden_size/256 blocks × 210 bytes/block.
+ */
+static inline void dequant_q6k_row(float *out, const uint8_t *row_data, int hidden_size) {
+    int n_blocks = hidden_size / 256;
+    for (int b = 0; b < n_blocks; b++) {
+        dequant_q6k_block(out + b * 256, row_data + b * Q6_K_BLOCK_SIZE);
+    }
+}
+

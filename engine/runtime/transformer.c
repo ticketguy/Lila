@@ -1,4 +1,5 @@
 #include "model.h"
+#include "q4k.h"
 #include <math.h>
 #include <stdio.h>
 
@@ -47,12 +48,6 @@ static void lila_mlp(float *output, const float *input, LilaLayer *layer)
     int active = gate_rows < up_rows ? gate_rows : up_rows;
     if (down_cols > 0 && active > down_cols)
         active = down_cols;
-
-    
-            configured_inter, scratch, active,
-            layer->gate_proj.rows, layer->gate_proj.cols,
-            layer->up_proj.rows, layer->up_proj.cols,
-            layer->down_proj.rows, layer->down_proj.cols);
 
     float *gate = calloc((size_t)scratch, sizeof(float));
     float *up = calloc((size_t)scratch, sizeof(float));
@@ -132,10 +127,6 @@ void lila_transformer_block(
     int position)
 {
     int hidden = layer->hidden_size;
-    
-            layer_idx, hidden, layer->intermediate_size, layer->head_dim);
-    
-    
 
     float *residual = malloc(hidden * sizeof(float));
     float *normed = malloc(hidden * sizeof(float));
@@ -184,19 +175,6 @@ int lila_forward(LilaModel *model, int token, int position)
 {
     int hidden = model->hidden_size;
 
-    
-            token, position, hidden, model->vocab_size);
-    
-    
-    
-    
-            (void *)model->layers[0].q_proj.data,
-            (void *)model->layers[0].q_proj.indices,
-            model->layers[0].q_proj.rows,
-            model->layers[0].q_proj.cols);
-    
-            (void *)model->layers[0].input_layernorm);
-
     /* Bounds check token */
     if (token < 0 || token >= model->vocab_size)
     {
@@ -204,10 +182,21 @@ int lila_forward(LilaModel *model, int token, int position)
         return 1; /* return BOS as safe fallback */
     }
 
-    /* Token embedding */
+    /* Token embedding — handle both FP32 and quantized (Q6_K) */
     float *hidden_state = malloc(hidden * sizeof(float));
-    memcpy(hidden_state, model->token_embedding + (size_t)token * hidden,
-           hidden * sizeof(float));
+    
+    if (model->embed_quant_type == 5 && model->embed_data != NULL) {
+        /* Q6_K quantized embedding — dequant one row on the fly */
+        const uint8_t *row_ptr = model->embed_data + (size_t)token * model->embed_bytes_per_row;
+        dequant_q6k_row(hidden_state, row_ptr, hidden);
+    } else if (model->token_embedding != NULL) {
+        /* FP32 embedding — direct copy */
+        memcpy(hidden_state, model->token_embedding + (size_t)token * hidden,
+               hidden * sizeof(float));
+    } else {
+        /* No embedding available */
+        memset(hidden_state, 0, hidden * sizeof(float));
+    }
 
     /* Gemma embedding scale: multiply by sqrt(hidden_size) */
     float embed_scale = sqrtf((float)hidden);

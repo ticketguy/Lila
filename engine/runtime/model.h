@@ -115,7 +115,10 @@ typedef struct {
     int weight_quant_type;      /* Global quant type for this model */
     
     /* Weights */
-    float *token_embedding;     /* [vocab_size, hidden_size] FP32 */
+    float *token_embedding;     /* [vocab_size, hidden_size] FP32 (NULL if quantized) */
+    uint8_t *embed_data;        /* Raw quantized embedding (Q6_K blocks) */
+    int embed_quant_type;       /* 0=FP32 in token_embedding, 5=Q6_K in embed_data */
+    int embed_bytes_per_row;    /* Bytes per vocab row in embed_data */
     LilaLayer layers[LILA_MAX_LAYERS];
     float *final_norm;
     float *lm_head;             /* [vocab_size, hidden_size] or tied */
