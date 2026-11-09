@@ -24,8 +24,10 @@ RT_SRC := runtime/model.c runtime/inference.c runtime/attention.c \
 RT_OBJ := $(RT_SRC:.c=.o)
 CLI_SRC := interface/cli.c
 CLI_OBJ := $(CLI_SRC:.c=.o)
+ASI_SRC := asi/asi_runtime.c asi/asi_cli.c asi/lilavm.c
+ASI_OBJ := $(ASI_SRC:.c=.o)
 
-.PHONY: all clean test
+.PHONY: all clean test lila-asi
 
 all: lila-engine
 
@@ -33,6 +35,13 @@ lila-engine: $(KERN_OBJ) $(RT_OBJ) $(CLI_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "\n✅ Built lila-engine for $(UNAME_M)"
 	@echo "   Run: ./lila-engine model.lila"
+
+lila-asi: $(KERN_OBJ) $(RT_OBJ) $(ASI_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "\n✅ Built lila-asi for $(UNAME_M)"
+
+asi/%.o: asi/%.c
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -c -o $@ $< -I runtime/ -I asi/
 
 kernels/$(ARCH_DIR)/%.o: kernels/$(ARCH_DIR)/%.S
 ifeq ($(UNAME_M),x86_64)
@@ -51,4 +60,4 @@ test: lila-engine
 	./lila-engine --test
 
 clean:
-	rm -f lila-engine $(KERN_OBJ) $(RT_OBJ) $(CLI_OBJ)
+	rm -f lila-engine lila-asi $(KERN_OBJ) $(RT_OBJ) $(CLI_OBJ) $(ASI_OBJ)

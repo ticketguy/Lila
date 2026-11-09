@@ -242,6 +242,8 @@ int asi_tokenize(AsiRuntime *rt, const char *text, int *out_ids, int max_ids);
  * Returns NULL if tokenizer not loaded or token out of range.
  * Returned pointer is valid for the lifetime of the runtime. */
 const char *asi_decode_token(AsiRuntime *rt, int token_id);
+int asi_get_bos_token(AsiRuntime *rt);
+int asi_get_eos_token(AsiRuntime *rt);
 
 /* Hot-reload adapters from another .asi */
 int asi_reload_fabric(AsiRuntime *rt, const char *new_asi_path);

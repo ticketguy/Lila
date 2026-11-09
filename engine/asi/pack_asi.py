@@ -11,8 +11,11 @@ Packs everything Lila needs into a single portable file:
   - Personality state
 
 Usage:
-    # From a HuggingFace model:
-    python pack_asi.py --model google/gemma-3-4b-it --output lila.asi
+    # From a local model directory:
+    python pack_asi.py --model /path/to/local-model --output lila.asi
+
+    # Explicitly permit downloading a HuggingFace model:
+    python pack_asi.py --model google/gemma-3-4b-it --allow-remote-model --output lila.asi
 
     # From existing .lila + adapters:
     python pack_asi.py --lila-weights model.lila --adapters ./adapters/ --output lila.asi
@@ -252,11 +255,33 @@ def build_weights_section(model, config):
     return bytes(data)
 
 
-def build_tokenizer_section(model_path):
+def _resolve_model_source(
+    model_path: str, allow_remote_model: bool
+) -> tuple[str, bool]:
+    """Require explicit opt-in before a Hub identifier can trigger downloads."""
+    local_path = Path(model_path).expanduser()
+    if local_path.is_dir():
+        return str(local_path), True
+    if local_path.exists():
+        raise ValueError(f"Local model path must be a directory: {local_path}")
+    if not allow_remote_model:
+        raise ValueError(
+            "Remote model identifiers are disabled. Provide a local directory "
+            "or pass --allow-remote-model with an explicit identifier."
+        )
+    return model_path, False
+
+
+def build_tokenizer_section(model_path, allow_remote_model=False):
     """Build TOKENIZER section from HF tokenizer."""
+    model_path, local_files_only = _resolve_model_source(
+        model_path, allow_remote_model
+    )
     from transformers import AutoTokenizer
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, local_files_only=local_files_only
+    )
     data = bytearray()
     
     vocab_size = tokenizer.vocab_size
@@ -576,9 +601,17 @@ def crc64(data):
 #  MAIN PACKER
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def pack_asi(model_path: str, output_path: str, adapter_path: str = None):
+def pack_asi(
+    model_path: str,
+    output_path: str,
+    adapter_path: str = None,
+    allow_remote_model: bool = False,
+):
     """Pack a complete .asi file from a HuggingFace model."""
-    
+
+    model_path, local_files_only = _resolve_model_source(
+        model_path, allow_remote_model
+    )
     print(f"\n🌸 ASI Packer — Creating Active System Image")
     print(f"   Model: {model_path}")
     print(f"   Output: {output_path}\n")
@@ -588,9 +621,14 @@ def pack_asi(model_path: str, output_path: str, adapter_path: str = None):
     from transformers import AutoModelForCausalLM, AutoConfig
     
     print("Loading model...")
-    hf_config = AutoConfig.from_pretrained(model_path)
+    hf_config = AutoConfig.from_pretrained(
+        model_path, local_files_only=local_files_only
+    )
     model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch.float32, low_cpu_mem_usage=True
+        model_path,
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=True,
+        local_files_only=local_files_only,
     )
     
     config = {
@@ -623,7 +661,9 @@ def pack_asi(model_path: str, output_path: str, adapter_path: str = None):
     sections_data[ASI_SECTION_MEMORY_FABRIC] = build_memory_fabric_section(config, adapter_path)
     
     print("[4/7] Tokenizer...")
-    sections_data[ASI_SECTION_TOKENIZER] = build_tokenizer_section(model_path)
+    sections_data[ASI_SECTION_TOKENIZER] = build_tokenizer_section(
+        model_path, allow_remote_model=allow_remote_model
+    )
     
     print("[5/7] Bytecode kernels...")
     sections_data[ASI_SECTION_BYTECODE] = build_bytecode_section()
@@ -731,6 +771,16 @@ if __name__ == "__main__":
     parser.add_argument("--model", required=True, help="HuggingFace model ID or path")
     parser.add_argument("--output", default="lila.asi", help="Output .asi file path")
     parser.add_argument("--adapters", default=None, help="Path to trained adapter weights")
+    parser.add_argument(
+        "--allow-remote-model",
+        action="store_true",
+        help="Permit downloading the explicitly configured model identifier",
+    )
     args = parser.parse_args()
     
-    pack_asi(args.model, args.output, args.adapters)
+    pack_asi(
+        args.model,
+        args.output,
+        args.adapters,
+        allow_remote_model=args.allow_remote_model,
+    )

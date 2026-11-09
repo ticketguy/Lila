@@ -1,3 +1,7 @@
+#ifndef _WIN32
+#define _GNU_SOURCE
+#endif
+
 #include "model.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,7 +39,6 @@ static void model_munmap(void *addr, size_t size) {
 
 #else
 /* POSIX */
-#define _GNU_SOURCE
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>

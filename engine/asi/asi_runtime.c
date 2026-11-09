@@ -628,7 +628,10 @@ AsiRuntime *asi_load(const char *path)
 
 int asi_generate_token(AsiRuntime *rt, int *tokens, int n_tokens)
 {
-    if (!rt || !rt->booted || !rt->model)
+    if (!rt || !rt->booted || !rt->model || !tokens || n_tokens <= 0)
+        return -1;
+    if (rt->config.max_seq_len == 0 ||
+        (uint32_t)n_tokens > rt->config.max_seq_len)
         return -1;
 
     /* Check that we have SOME embedding (FP32 or quantized) */
@@ -642,7 +645,7 @@ int asi_generate_token(AsiRuntime *rt, int *tokens, int n_tokens)
         rt->model->layers[0].q_proj.indices == NULL)
     {
         fprintf(stderr, "ASI: Layer 0 q_proj not loaded\n");
-        return 0;
+        return -1;
     }
 
     extern int lila_forward(LilaModel * model, int token, int position);
@@ -655,15 +658,27 @@ int asi_generate_token(AsiRuntime *rt, int *tokens, int n_tokens)
 void asi_generate(AsiRuntime *rt, int *tokens, int n_tokens, int max_new,
                   void (*on_token)(int token, void *ctx), void *ctx)
 {
-    if (!rt || !rt->booted)
+    if (!rt || !rt->booted || !tokens || n_tokens <= 0 || max_new <= 0)
         return;
+
+    int available = (int)rt->config.max_seq_len - n_tokens;
+    if (available <= 0)
+        return;
+    if (max_new > available)
+        max_new = available;
+
+    int eos_token = asi_get_eos_token(rt);
+
     for (int i = 0; i < max_new; i++)
     {
         int next = asi_generate_token(rt, tokens, n_tokens + i);
+        if (next < 0)
+            break;
+
         tokens[n_tokens + i] = next;
         if (on_token)
             on_token(next, ctx);
-        if (next == 0 || next == -1)
+        if (next == eos_token)
             break;
     }
 }
@@ -684,6 +699,16 @@ const char *asi_decode_token(AsiRuntime *rt, int token_id)
     if (!rt || !rt->tokenizer)
         return NULL;
     return lila_decode_token(rt->tokenizer, token_id);
+}
+
+int asi_get_bos_token(AsiRuntime *rt)
+{
+    return lila_get_bos(rt ? rt->tokenizer : NULL);
+}
+
+int asi_get_eos_token(AsiRuntime *rt)
+{
+    return lila_get_eos(rt ? rt->tokenizer : NULL);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
