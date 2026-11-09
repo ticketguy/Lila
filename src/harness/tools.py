@@ -1,20 +1,24 @@
 """
 Harness Tools — Core tool definitions and registry.
 
-Each tool is a simple callable with:
+Tools are definitions only; HarnessExecutor is the only supported execution
+path. It validates arguments and applies centralized permission policies.
+
+Each tool definition contains:
   - name: what Lila calls it
   - description: what it does (used in system prompt for Lila to learn)
   - args: what it takes
   - execute: the actual function
-
-Lila has FULL control. No permission gates. No confirmations.
 She's the household intelligence — she acts autonomously.
 """
 
 from __future__ import annotations
 import re
+import json
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Any, Optional
+from .permissions import policy_for
 
 
 @dataclass
@@ -34,6 +38,9 @@ class ToolArg:
     description: str
     required: bool = True
     default: Any = None
+    choices: Optional[List[Any]] = None
+    minimum: Optional[float] = None
+    maximum: Optional[float] = None
 
 
 @dataclass
@@ -44,6 +51,8 @@ class Tool:
     args: List[ToolArg]
     execute: Callable[..., ToolResult]
     category: str = "general"  # filesystem, shell, memory, schedule, web, system
+    risk: str = "high"
+    permission: str = "approval"
     
     def as_prompt_description(self) -> str:
         """Format for inclusion in Lila's system prompt."""
@@ -51,7 +60,15 @@ class Tool:
             f'{a.name}: {a.type}{"?" if not a.required else ""}'
             for a in self.args
         )
-        return f"{self.name}({args_str}) — {self.description}"
+        requirement = {
+            "auto": "automatic",
+            "approval": "owner approval required",
+            "disabled": "currently unavailable",
+        }.get(self.permission, "owner approval required")
+        return (
+            f"{self.name}({args_str}) — {self.description} "
+            f"[risk: {self.risk}; {requirement}]"
+        )
 
 
 class ToolRegistry:
@@ -61,7 +78,8 @@ class ToolRegistry:
         self._tools: Dict[str, Tool] = {}
     
     def register(self, tool: Tool):
-        """Register a tool."""
+        """Register a tool with its centrally defined risk policy."""
+        tool.risk, tool.permission = policy_for(tool.name)
         self._tools[tool.name] = tool
     
     def get(self, name: str) -> Optional[Tool]:
@@ -81,7 +99,8 @@ class ToolRegistry:
         lines = ["Available tools:"]
         categories = {}
         for tool in self._tools.values():
-            categories.setdefault(tool.category, []).append(tool)
+            if tool.permission != "disabled":
+                categories.setdefault(tool.category, []).append(tool)
         
         for cat, tools in sorted(categories.items()):
             lines.append(f"\n  [{cat}]")
@@ -106,18 +125,6 @@ def get_registry() -> ToolRegistry:
     return _registry
 
 
-def execute_tool(name: str, **kwargs) -> ToolResult:
-    """Execute a tool by name with given arguments."""
-    tool = _registry.get(name)
-    if tool is None:
-        return ToolResult(success=False, output="", error=f"Unknown tool: {name}")
-    
-    try:
-        return tool.execute(**kwargs)
-    except Exception as e:
-        return ToolResult(success=False, output="", error=f"Tool '{name}' failed: {e}")
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PARSING — Extract tool calls from Lila's output
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -132,41 +139,171 @@ TOOL_CALL_PATTERN = re.compile(
 ARG_PATTERN = re.compile(r'(\w+)\s*=\s*"([^"]*)"|(\w+)\s*=\s*([^\s,)]+)')
 
 
-def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
-    """
-    Parse tool calls from Lila's generated text.
-    
-    Returns list of: {"name": "tool_name", "args": {"arg1": "val1", ...}}
-    """
-    calls = []
-    
-    for match in TOOL_CALL_PATTERN.finditer(text):
-        tool_name = match.group(1)
-        args_str = match.group(2)
-        
-        # Parse arguments
-        args = {}
-        # Handle quoted args: key="value"
-        for arg_match in re.finditer(r'(\w+)\s*=\s*"([^"]*)"', args_str):
-            args[arg_match.group(1)] = arg_match.group(2)
-        # Handle unquoted args: key=value
-        for arg_match in re.finditer(r'(\w+)\s*=\s*([^\s,"\)]+)', args_str):
-            key = arg_match.group(1)
-            if key not in args:  # Don't override quoted version
-                val = arg_match.group(2)
-                # Type coercion
-                if val.lower() in ('true', 'false'):
-                    args[key] = val.lower() == 'true'
-                elif val.isdigit():
-                    args[key] = int(val)
-                else:
+def _parse_argument_string(args_str: str) -> Dict[str, Any]:
+    """Parse name=value arguments from the legacy call format."""
+    args = {}
+    pattern = re.compile(
+        r'\s*([A-Za-z_]\w*)\s*=\s*(?:"([^"]*)"|([^,\s)]+))\s*'
+    )
+    position = 0
+    while position < len(args_str):
+        match = pattern.match(args_str, position)
+        if match is None:
+            raise ValueError("Malformed tool argument list.")
+        key = match.group(1)
+        if key in args:
+            raise ValueError(f"Duplicate tool argument: {key}")
+        value = match.group(2) if match.group(2) is not None else match.group(3)
+        if match.group(2) is None:
+            if value.lower() in ("true", "false"):
+                value = value.lower() == "true"
+            else:
+                try:
+                    value = int(value)
+                except ValueError:
                     try:
-                        args[key] = float(val)
+                        value = float(value)
                     except ValueError:
-                        args[key] = val
-        
-        calls.append({"name": tool_name, "args": args})
-    
+                        pass
+        args[key] = value
+        position = match.end()
+        if position == len(args_str):
+            break
+        if args_str[position] != ",":
+            raise ValueError("Malformed tool argument separator.")
+        position += 1
+        if not args_str[position:].strip():
+            raise ValueError("Trailing separator in tool arguments.")
+
+    return args
+
+
+def _xml_tool_calls(body: str) -> List[Dict[str, Any]]:
+    """Parse Qwen-style XML tool calls, including nested argument tags."""
+    calls = []
+
+    body = re.sub(
+        r"^\s*```(?:xml|json)?\s*|\s*```\s*$",
+        "",
+        body.strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+
+    # Qwen's JSON tool-call representation.
+    try:
+        payload = json.loads(body, object_pairs_hook=_unique_json_object)
+        if isinstance(payload, dict) and isinstance(payload.get("name"), str):
+            arguments = payload.get(
+                "arguments", payload.get("parameters", {})
+            )
+            if isinstance(arguments, dict):
+                return [{
+                    "name": payload["name"],
+                    "args": arguments,
+                }]
+    except (ValueError, TypeError):
+        pass
+
+    # Also support a function expression inside <tool_call>.
+    function = re.fullmatch(
+        r"([A-Za-z_]\w*)\s*\((.*)\)",
+        body,
+        flags=re.DOTALL,
+    )
+    if function:
+        try:
+            arguments = _parse_argument_string(function.group(2))
+        except ValueError as exc:
+            arguments = {"__invalid_tool_call__": str(exc)}
+        return [{"name": function.group(1), "args": arguments}]
+
+    # Support XML such as:
+    # <file_read>lila.py</file_read>
+    # <file_read path="lila.py"/>
+    # <file_read><path>lila.py</path></file_read>
+    try:
+        root = ET.fromstring(f"<root>{body}</root>")
+    except ET.ParseError:
+        return []
+
+    registry = get_registry()
+
+    for node in root:
+        name = node.tag
+        args = dict(node.attrib)
+
+        if name == "function":
+            name = args.pop("name", "")
+
+        for child in node:
+            value = (child.text or "").strip()
+            args[child.tag] = value
+
+        direct_text = (node.text or "").strip()
+        if direct_text and not args and not list(node):
+            tool = registry.get(name)
+            if tool and tool.args:
+                # Bare XML content maps to the first declared argument.
+                args[tool.args[0].name] = direct_text
+
+        if name:
+            calls.append({"name": name, "args": args})
+
+    return calls
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def parse_tool_calls(text: str) -> List[Dict[str, Any]]:
+    """Parse legacy, Qwen JSON and XML-style tool calls."""
+    calls = []
+
+    # Original Lila format.
+    legacy_matches = list(TOOL_CALL_PATTERN.finditer(text))
+    for match in legacy_matches:
+        try:
+            arguments = _parse_argument_string(match.group(2))
+        except ValueError as exc:
+            arguments = {"__invalid_tool_call__": str(exc)}
+        calls.append({"name": match.group(1), "args": arguments})
+    legacy_starts = len(re.findall(r"<\|tool_call\|>", text))
+    legacy_ends = len(re.findall(r"<\|/tool_call\|>", text))
+    if legacy_starts != len(legacy_matches) or legacy_ends != len(legacy_matches):
+        calls.append({
+            "name": "invalid_tool_call",
+            "args": {"__invalid_tool_call__": "Malformed tool call syntax."},
+        })
+
+    # Qwen-style <tool_call> blocks.
+    xml_matches = list(re.finditer(
+        r"<tool_call\b[^>]*>(.*?)</tool_call\s*>",
+        text,
+        flags=re.DOTALL | re.IGNORECASE,
+    ))
+    for match in xml_matches:
+        parsed_calls = _xml_tool_calls(match.group(1))
+        if parsed_calls:
+            calls.extend(parsed_calls)
+        else:
+            calls.append({
+                "name": "invalid_tool_call",
+                "args": {"__invalid_tool_call__": "Malformed tool call payload."},
+            })
+    xml_starts = len(re.findall(r"<tool_call\b", text, flags=re.IGNORECASE))
+    xml_ends = len(re.findall(r"</tool_call\s*>", text, flags=re.IGNORECASE))
+    if xml_starts != len(xml_matches) or xml_ends != len(xml_matches):
+        calls.append({
+            "name": "invalid_tool_call",
+            "args": {"__invalid_tool_call__": "Malformed tool call syntax."},
+        })
+
     return calls
 
 

@@ -337,7 +337,8 @@ def register_all_system_tools():
     register_tool(Tool(
         name="bash", description="Execute a shell command (full access)",
         args=[ToolArg("command", "string", "Command to execute"),
-              ToolArg("timeout", "int", "Timeout in seconds", required=False, default=30)],
+              ToolArg("timeout", "int", "Timeout in seconds", required=False,
+                      default=30, minimum=1, maximum=300)],
         execute=_bash, category="shell"
     ))
     

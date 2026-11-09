@@ -1,1 +1,1 @@
-"""Lila Core — The Self. Loads Gemma 4B, runs inference, manages memory."""
+"""Lila Core: model-backed conversation orchestration and tool routing."""

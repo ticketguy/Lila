@@ -15,6 +15,7 @@ import subprocess
 import platform
 import time
 import json
+import re
 from typing import Optional
 from .tools import Tool, ToolArg, ToolResult, register_tool
 
@@ -129,10 +130,16 @@ def _dns_lookup(hostname: str, **kw) -> ToolResult:
 
 def _ping(host: str, count: int = 4, **kw) -> ToolResult:
     """Ping a host."""
+    if not re.fullmatch(r"[A-Za-z0-9._:%-]+", host) or host.startswith("-"):
+        return ToolResult(success=False, output="", error="Invalid host.")
     flag = "-n" if platform.system() == "Windows" else "-c"
-    cmd = f"ping {flag} {count} {host}"
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        r = subprocess.run(
+            ["ping", flag, str(count), host],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
         return ToolResult(success=r.returncode == 0, output=r.stdout)
     except Exception as e:
         return ToolResult(success=False, output="", error=str(e))
@@ -368,18 +375,23 @@ def register_extended_tools():
     
     # Network
     register_tool(Tool("tcp_connect", "Open TCP connection, send/receive data",
-        [ToolArg("host", "string", "Host"), ToolArg("port", "int", "Port"),
+        [ToolArg("host", "string", "Host"),
+         ToolArg("port", "int", "Port", minimum=1, maximum=65535),
          ToolArg("data", "string", "Data to send", required=False, default=""),
-         ToolArg("timeout", "int", "Timeout", required=False, default=5)],
+         ToolArg("timeout", "int", "Timeout", required=False, default=5,
+                 minimum=1, maximum=300)],
         _tcp_connect, "network"))
     
     register_tool(Tool("udp_send", "Send UDP datagram",
-        [ToolArg("host", "string", "Host"), ToolArg("port", "int", "Port"),
+        [ToolArg("host", "string", "Host"),
+         ToolArg("port", "int", "Port", minimum=1, maximum=65535),
          ToolArg("data", "string", "Data")],
         _udp_send, "network"))
     
     register_tool(Tool("tcp_listen", "Listen for TCP connection on port",
-        [ToolArg("port", "int", "Port"), ToolArg("timeout", "int", "Timeout", required=False, default=10)],
+        [ToolArg("port", "int", "Port", minimum=1, maximum=65535),
+         ToolArg("timeout", "int", "Timeout", required=False, default=10,
+                 minimum=1, maximum=300)],
         _tcp_listen, "network"))
     
     register_tool(Tool("ssh_exec", "Execute command on remote host via SSH",
@@ -397,23 +409,33 @@ def register_extended_tools():
     register_tool(Tool("dns_lookup", "Resolve hostname",
         [ToolArg("hostname", "string", "Hostname")], _dns_lookup, "network"))
     register_tool(Tool("ping", "Ping a host",
-        [ToolArg("host", "string", "Host"), ToolArg("count", "int", "Count", required=False, default=4)],
+        [ToolArg("host", "string", "Host"),
+         ToolArg("count", "int", "Count", required=False, default=4,
+                 minimum=1, maximum=10)],
         _ping, "network"))
     register_tool(Tool("http_request", "Make HTTP request",
-        [ToolArg("url", "string", "URL"), ToolArg("method", "string", "Method", required=False, default="GET"),
-         ToolArg("body", "string", "Body", required=False, default="")],
+        [ToolArg("url", "string", "URL"),
+         ToolArg("method", "string", "Method", required=False, default="GET",
+                 choices=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]),
+         ToolArg("body", "string", "Body", required=False, default=""),
+         ToolArg("headers", "string", "JSON request headers", required=False,
+                 default="{}")],
         _http_request, "network"))
     
     # Hardware
     register_tool(Tool("gpio_write", "Set GPIO pin output",
-        [ToolArg("pin", "int", "Pin number"), ToolArg("value", "int", "0 or 1")],
+        [ToolArg("pin", "int", "Pin number", minimum=0, maximum=1024),
+         ToolArg("value", "int", "0 or 1", choices=[0, 1])],
         _gpio_write, "hardware"))
     register_tool(Tool("gpio_read", "Read GPIO pin",
-        [ToolArg("pin", "int", "Pin number")], _gpio_read, "hardware"))
+        [ToolArg("pin", "int", "Pin number", minimum=0, maximum=1024)],
+        _gpio_read, "hardware"))
     register_tool(Tool("i2c_transfer", "I2C bus transfer",
-        [ToolArg("bus", "int", "Bus number"), ToolArg("addr", "int", "Device address"),
+        [ToolArg("bus", "int", "Bus number", minimum=0, maximum=255),
+         ToolArg("addr", "int", "Device address", minimum=0, maximum=127),
          ToolArg("write", "string", "Hex bytes to write", required=False, default=""),
-         ToolArg("read_len", "int", "Bytes to read", required=False, default=0)],
+         ToolArg("read_len", "int", "Bytes to read", required=False, default=0,
+                 minimum=0, maximum=4096)],
         _i2c_transfer, "hardware"))
     register_tool(Tool("spi_transfer", "SPI bus transfer",
         [ToolArg("device", "string", "SPI device", required=False, default="/dev/spidev0.0"),
@@ -421,18 +443,24 @@ def register_extended_tools():
         _spi_transfer, "hardware"))
     register_tool(Tool("serial_write", "Write to serial port",
         [ToolArg("port", "string", "Port"), ToolArg("data", "string", "Data"),
-         ToolArg("baud", "int", "Baud rate", required=False, default=9600)],
+         ToolArg("baud", "int", "Baud rate", required=False, default=9600,
+                 minimum=1, maximum=4000000)],
         _serial_write, "hardware"))
     register_tool(Tool("serial_read", "Read from serial port",
-        [ToolArg("port", "string", "Port"), ToolArg("baud", "int", "Baud rate", required=False, default=9600)],
+        [ToolArg("port", "string", "Port"),
+         ToolArg("baud", "int", "Baud rate", required=False, default=9600),
+         ToolArg("timeout", "int", "Timeout", required=False, default=2,
+                 minimum=1, maximum=30)],
         _serial_read, "hardware"))
     register_tool(Tool("usb_list", "List USB devices", [], _usb_list, "hardware"))
     
     # System Control
     register_tool(Tool("set_volume", "Set audio volume",
-        [ToolArg("level", "int", "Volume 0-100")], _set_volume, "system"))
+        [ToolArg("level", "int", "Volume 0-100", minimum=0, maximum=100)],
+        _set_volume, "system"))
     register_tool(Tool("power_action", "System power control",
-        [ToolArg("action", "string", "sleep/restart/shutdown/lock/status")],
+        [ToolArg("action", "string", "sleep/restart/shutdown/lock/status",
+                 choices=["sleep", "restart", "shutdown", "lock", "status"])],
         _power_action, "system"))
     register_tool(Tool("notify_user", "Show desktop notification",
         [ToolArg("title", "string", "Title"), ToolArg("message", "string", "Message")],
