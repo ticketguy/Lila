@@ -1769,14 +1769,13 @@ static inline void q6k_repacked_matmul_batch(float *out, const uint8_t *weight_d
                 __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
                 __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
                 float bias0 = 0.0f, bias1 = 0.0f, bias2 = 0.0f, bias3 = 0.0f;
-                const LilaQ8KBlock *q0 = qx_all + (size_t)(t + 0) * blocks_per_row;
-                const LilaQ8KBlock *q1 = qx_all + (size_t)(t + 1) * blocks_per_row;
-                const LilaQ8KBlock *q2 = qx_all + (size_t)(t + 2) * blocks_per_row;
-                const LilaQ8KBlock *q3 = qx_all + (size_t)(t + 3) * blocks_per_row;
                 for (int b = 0; b < blocks_per_row; b++) {
                     const LilaQ6KRepackedBlock *blk = (const LilaQ6KRepackedBlock *)(row_ptr + (size_t)b * sizeof(LilaQ6KRepackedBlock));
                     float d = blk->d;
-                    const LilaQ8KBlock *xb0 = &q0[b], *xb1 = &q1[b], *xb2 = &q2[b], *xb3 = &q3[b];
+                    const LilaQ8KBlock *xb0 = qx_all + (size_t)b * n_tokens + (t + 0);
+                    const LilaQ8KBlock *xb1 = qx_all + (size_t)b * n_tokens + (t + 1);
+                    const LilaQ8KBlock *xb2 = qx_all + (size_t)b * n_tokens + (t + 2);
+                    const LilaQ8KBlock *xb3 = qx_all + (size_t)b * n_tokens + (t + 3);
                     for (int sb = 0; sb < 8; sb++) {
                         __m256i uv = _mm256_loadu_si256((const __m256i *)(blk->u6 + sb * 32));
                         float dsc0 = d * (float)blk->scales[sb * 2 + 0];
@@ -1801,12 +1800,11 @@ static inline void q6k_repacked_matmul_batch(float *out, const uint8_t *weight_d
                 out[(size_t)(t + 3) * rows + i] = lila_hsum_f32_avx2(acc3) - bias3;
             }
             for (; t < n_tokens; t++) {
-                const LilaQ8KBlock *q_rem = qx_all + (size_t)t * blocks_per_row;
                 __m256 acc = _mm256_setzero_ps();
                 float bias = 0.0f;
                 for (int b = 0; b < blocks_per_row; b++) {
                     const LilaQ6KRepackedBlock *blk = (const LilaQ6KRepackedBlock *)(row_ptr + (size_t)b * sizeof(LilaQ6KRepackedBlock));
-                    const LilaQ8KBlock *xb = &q_rem[b];
+                    const LilaQ8KBlock *xb = qx_all + (size_t)b * n_tokens + t;
                     float d = blk->d;
                     for (int sb = 0; sb < 8; sb++) {
                         __m256i uv = _mm256_loadu_si256((const __m256i *)(blk->u6 + sb * 32));
