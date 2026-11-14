@@ -87,13 +87,44 @@ typedef struct {
     int head_dim;
 } LilaLayer;
 
-/* KV Cache */
+/* KV Cache (FP16 storage to halve memory bandwidth on CPU) */
 typedef struct {
-    float *key_cache;
-    float *value_cache;
+    uint16_t *key_cache;
+    uint16_t *value_cache;
     int max_seq_len;
     int current_pos;
 } LilaKVCache;
+
+/* Pre-allocated scratchpad arena (zero malloc/free during forward pass) */
+typedef struct {
+    int initialized;
+    float *hidden_state;
+    float *residual;
+    float *normed;
+    float *attn_out;
+    float *mlp_out;
+    float *gate;
+    float *up;
+    float *q;
+    float *k;
+    float *v;
+    float *attn_buf;
+    float *proj_out;
+    float *scores;
+    float *logits;
+    float *row_buf;
+    void  *qx_buf;          /* Q8 activation blocks for AVX2 quantized matvec */
+    size_t qx_buf_bytes;
+    float *rope_cos;        /* [max_seq_len * (head_dim / 2)] */
+    float *rope_sin;        /* [max_seq_len * (head_dim / 2)] */
+    int rope_seq_len;
+    int rope_head_dim;
+    int max_inter;
+    int max_q_size;
+    int max_kv_size;
+    int max_o_rows;
+    int max_o_cols;
+} LilaScratch;
 
 /* Full model */
 typedef struct {
@@ -112,6 +143,7 @@ typedef struct {
     int max_seq_len;
     float rope_theta;
     float rms_norm_eps;
+    float embed_scale;          /* 1.0f default; sqrt(hidden) only for Gemma */
     int weight_quant_type;      /* Global quant type for this model */
     
     /* Weights */
@@ -125,6 +157,7 @@ typedef struct {
     
     /* Runtime */
     LilaKVCache kv_cache;
+    LilaScratch scratch;
     
     /* Memory map */
     void *mmap_addr;

@@ -26,7 +26,9 @@ Load it. She runs. No Python. No frameworks. Any CPU with enough RAM.
 make asi
 
 # Pack a model into .asi format
-python asi/pack_asi.py --model google/gemma-3-4b-it --output lila.asi
+python asi/pack_asi.py --model /path/to/local-model --output lila.asi
+# Remote Hugging Face model identifiers require explicit opt-in:
+python asi/pack_asi.py --model google/gemma-3-4b-it --allow-remote-model --output lila.asi
 
 # Run her
 ./lila-asi lila.asi

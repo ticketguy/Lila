@@ -1,4 +1,5 @@
 #include "../runtime/model.h"
+#include "../runtime/attention.h"
 #include "../runtime/tokenizer.h"
 #include "../runtime/transformer.h"
 #include "../runtime/dispatch.h"
@@ -18,10 +19,10 @@ int main(int argc, char *argv[]) {
     }
     
     if (strcmp(argv[1], "--test") == 0) {
-        printf("Running tests...\n");
+        printf("Running dispatch smoke test...\n");
         lila_init_dispatch();
-        printf("CPU detection: OK\n");
-        printf("All structural tests passed.\n");
+        printf("Dispatch initialisation: OK\n");
+        printf("Full model and inference tests are not implemented yet.\n");
         return 0;
     }
     

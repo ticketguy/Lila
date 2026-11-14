@@ -86,7 +86,8 @@ static void run_bench(AsiRuntime *rt)
     printf("Running inference benchmark...\n");
 
     int tokens[MAX_SEQ];
-    tokens[0] = BOS_TOKEN;
+    const int eos_token = asi_get_eos_token(rt);
+    tokens[0] = asi_get_bos_token(rt);
     int n_tokens = 1;
 
     double start = get_time_sec();
@@ -95,7 +96,7 @@ static void run_bench(AsiRuntime *rt)
     for (int i = 0; i < 20; i++)
     {
         int next = asi_generate_token(rt, tokens, n_tokens);
-        if (next <= 0 || next == EOS_TOKEN)
+        if (next < 0 || next == eos_token)
             break;
         tokens[n_tokens++] = next;
         n_generated++;
@@ -120,7 +121,8 @@ static void interactive(AsiRuntime *rt)
     int tokens[MAX_SEQ];
     int n_tokens = 0;
 
-    tokens[0] = BOS_TOKEN;
+    const int eos_token = asi_get_eos_token(rt);
+    tokens[0] = asi_get_bos_token(rt);
     n_tokens = 1;
 
     while (1)
@@ -138,15 +140,12 @@ static void interactive(AsiRuntime *rt)
 
         /* ── Tokenize input ── */
         int n_new = asi_tokenize(rt, input, tokens + n_tokens, MAX_SEQ - n_tokens);
-        for (int i = 0; i < n_new; i++)
-        if (n_new > 0)
-        {
-            n_tokens += n_new;
-        }
-        else
+        if (n_new <= 0)
         {
             fprintf(stderr, "[warn] Tokenizer returned 0 tokens for input\n");
+            continue;
         }
+        n_tokens += n_new;
 
         /* ── Generate ── */
         printf("Lila: ");
@@ -155,14 +154,14 @@ static void interactive(AsiRuntime *rt)
         double t_start = get_time_sec();
         int n_gen = 0;
 
-        for (int i = 0; i < 1; i++)
+        for (int i = 0; i < 256; i++)
         {
             if (n_tokens >= MAX_SEQ - 1)
                 break;
 
             int next = asi_generate_token(rt, tokens, n_tokens);
 
-            if (next <= 0 || next == EOS_TOKEN)
+            if (next < 0 || next == eos_token)
                 break;
 
             tokens[n_tokens++] = next;

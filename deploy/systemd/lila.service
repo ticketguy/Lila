@@ -1,0 +1,23 @@
+[Unit]
+Description=Lila local assistant runtime
+After=default.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=@LILA_REPOSITORY_ROOT@
+EnvironmentFile=@LILA_SERVICE_ENV@
+EnvironmentFile=@LILA_OPTIONAL_VOICE_ENV@
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+ExecStart=@LILA_PYTHON@ -m src.daemon.service --headless --port 8765
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

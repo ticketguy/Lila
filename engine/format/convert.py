@@ -13,8 +13,8 @@ File layout:
   [LM Head: vocab_size * hidden_size * 4 bytes (FP32)]
 
 Usage:
-    python convert.py --model google/gemma-3-4b-it --output model.lila
-    python convert.py --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --output tinyllama.lila
+    python convert.py --model /path/to/local-model --output model.lila
+    python convert.py --model google/gemma-3-4b-it --allow-remote-model --output model.lila
 """
 
 import argparse
@@ -22,6 +22,7 @@ import struct
 import sys
 import os
 import numpy as np
+from pathlib import Path
 
 LILA_MAGIC = 0x4C494C41
 LILA_VERSION = 1
@@ -100,15 +101,45 @@ def write_fp32_tensor(f, tensor_np):
     return len(data)
 
 
-def convert(model_path: str, output_path: str, group_size: int = 128):
+def _resolve_model_source(
+    model_path: str, allow_remote_model: bool
+) -> tuple[str, bool]:
+    """Require explicit opt-in before a Hub identifier can trigger downloads."""
+    local_path = Path(model_path).expanduser()
+    if local_path.is_dir():
+        return str(local_path), True
+    if local_path.exists():
+        raise ValueError(f"Local model path must be a directory: {local_path}")
+    if not allow_remote_model:
+        raise ValueError(
+            "Remote model identifiers are disabled. Provide a local directory "
+            "or pass --allow-remote-model with an explicit identifier."
+        )
+    return model_path, False
+
+
+def convert(
+    model_path: str,
+    output_path: str,
+    group_size: int = 128,
+    allow_remote_model: bool = False,
+):
     """Convert HF model to Lila format."""
+    model_path, local_files_only = _resolve_model_source(
+        model_path, allow_remote_model
+    )
     import torch
     from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
-    
+
     print(f"Loading model: {model_path}")
-    config = AutoConfig.from_pretrained(model_path)
+    config = AutoConfig.from_pretrained(
+        model_path, local_files_only=local_files_only
+    )
     model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch.float32, low_cpu_mem_usage=True
+        model_path,
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=True,
+        local_files_only=local_files_only,
     )
     
     n_layers = config.num_hidden_layers
@@ -210,7 +241,9 @@ def convert(model_path: str, output_path: str, group_size: int = 128):
     # ── Export vocab ──
     vocab_path = output_path.replace(".lila", ".vocab")
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, local_files_only=local_files_only
+        )
         with open(vocab_path, "w", encoding="utf-8") as vf:
             for i in range(min(vocab_size, len(tokenizer))):
                 token = tokenizer.convert_ids_to_tokens(i)
@@ -234,5 +267,15 @@ if __name__ == "__main__":
     parser.add_argument("--model", required=True, help="HuggingFace model ID or path")
     parser.add_argument("--output", default="model.lila", help="Output file path")
     parser.add_argument("--group-size", type=int, default=128)
+    parser.add_argument(
+        "--allow-remote-model",
+        action="store_true",
+        help="Permit downloading the explicitly configured model identifier",
+    )
     args = parser.parse_args()
-    convert(args.model, args.output, args.group_size)
+    convert(
+        args.model,
+        args.output,
+        args.group_size,
+        allow_remote_model=args.allow_remote_model,
+    )

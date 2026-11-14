@@ -1,3 +1,7 @@
+#ifndef _WIN32
+#define _GNU_SOURCE
+#endif
+
 #include "model.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,7 +39,6 @@ static void model_munmap(void *addr, size_t size) {
 
 #else
 /* POSIX */
-#define _GNU_SOURCE
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -121,7 +124,9 @@ void lila_free_model(LilaModel *model) {
     if (model->mmap_addr) {
         model_munmap(model->mmap_addr, model->mmap_size);
     }
-    /* Free KV cache */
+    /* Free scratch + KV cache */
+    extern void lila_free_scratch(LilaModel *model);
+    lila_free_scratch(model);
     free(model->kv_cache.key_cache);
     free(model->kv_cache.value_cache);
     free(model);

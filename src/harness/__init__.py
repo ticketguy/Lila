@@ -7,9 +7,9 @@ The harness is how Lila acts on the world. When she decides to DO something
 This is NOT a generic tool framework. This is Lila-specific:
 - Tools are things Lila needs (file ops, shell, memory, schedule, web)
 - Lila decides WHEN to use tools based on her thinking
-- No permission prompts — Lila has full autonomy in the household
+- HarnessExecutor validates and authorizes every tool call
 - Results feed back into her context for the next response
-- Tool usage is logged for training (she gets better at using them)
+- Execution logs contain redacted metadata, not tool contents
 
 Architecture:
     LilaCore.think() → detects tool intent → Harness.execute() → result → response
@@ -22,7 +22,7 @@ Lila learns to emit these through training. The harness parses and executes them
 
 from .tools import (
     Tool, ToolResult, ToolRegistry,
-    register_tool, execute_tool, get_registry,
+    register_tool, get_registry,
     parse_tool_calls, format_tool_result,
 )
 from .executor import HarnessExecutor
@@ -30,7 +30,7 @@ from .system_tools import register_all_system_tools
 
 __all__ = [
     'Tool', 'ToolResult', 'ToolRegistry',
-    'register_tool', 'execute_tool', 'get_registry',
+    'register_tool', 'get_registry',
     'parse_tool_calls', 'format_tool_result',
     'HarnessExecutor',
     'register_all_system_tools',

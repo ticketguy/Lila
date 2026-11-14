@@ -5,3 +5,22 @@ archive/
 # Claude Code local artifacts
 .claude/settings.local.json
 .claude/sessions/
+
+# Local runtimes, builds and replaceable model/audio data.
+/.venv/
+/models/
+/.env
+/experiments/voice/recordings/
+/experiments/voice/whisper.cpp/build/
+/experiments/voice/whisper.cpp/models/*.bin
+/windows/Lila.Desktop/bin/
+/windows/Lila.Desktop/obj/
+/windows/Lila.Desktop.Core/bin/
+/windows/Lila.Desktop.Core/obj/
+/windows/Lila.Desktop.Tests/bin/
+/windows/Lila.Desktop.Tests/obj/
+*.o
+*.so
+/engine/lila-engine
+/engine/lila-asi
+*:Zone.Identifier

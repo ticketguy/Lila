@@ -79,8 +79,13 @@ void weight_matvec(float *out, const LilaQuantWeight *w, const float *vec) {
     
     switch (w->quant_type) {
     case QUANT_Q4_K:
-        /* Native GGUF Q4_K — best quality, no re-quantization */
+        /* Native GGUF Q4_K — AVX2 Q4_K x Q8_K */
         q4k_matvec(out, w->data, vec, w->rows, w->cols);
+        break;
+
+    case QUANT_Q6_K:
+        /* Native GGUF Q6_K — AVX2 Q6_K x Q8_K */
+        q6k_matvec(out, w->data, vec, w->rows, w->cols);
         break;
     
     case QUANT_FIGQUANT:
@@ -95,7 +100,7 @@ void weight_matvec(float *out, const LilaQuantWeight *w, const float *vec) {
     
     default:
         /* Unknown quant type — zero output */
-        memset(out, 0, w->rows * sizeof(float));
+        memset(out, 0, (size_t)w->rows * sizeof(float));
         break;
     }
 }
