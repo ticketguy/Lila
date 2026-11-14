@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""
+Strict, apples-to-apples benchmark harness: Lila ASI (liblila_asi.so C ABI)
+vs llama-cpp-python (Llama.eval + Llama.sample) on identical token IDs.
+
+Requirements enforced:
+1. Identical integer token IDs tokenized once and fed to both engines.
+2. Verified KV/prefix reuse on Turn 2 (only new Turn-2 tokens evaluated).
+3. Matched settings: n_ctx=2048, n_threads=2, n_threads_batch=2, n_batch=512,
+   use_mmap=True, flash_attn=False, greedy (temperature=0.0 / argmax).
+4. Page-cache warmup (1 discarded trial per engine) + N interleaved pairs.
+5. Primary metrics: t1_ttft, t1_dec, t2_ttft, t2_dec, long_prefill_tps, rss_mb.
+   Secondary metric: load_s.
+6. Pure-stdlib stats: median, [min..max], 95% bootstrap CI, Mann-Whitney U p-value,
+   and PASS/FAIL against non-overlapping [min..max] + median bar.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import json
+import math
+import random
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+
+DEFAULT_ASI_PATH = "/tmp/qwen35_0.8b.asi"
+DEFAULT_GGUF_PATH = "/home/ticket/workspaces/lila/models/Qwen3.5-0.8B-heretic-Q4_K_M-imatrix.gguf"
+DEFAULT_LIB_PATH = str(Path(__file__).resolve().parent.parent / "asi" / "liblila_asi.so")
+
+N_CTX = 2048
+N_THREADS = 2
+N_BATCH = 512
+N_GEN = 32
+
+T1_PROMPT = (
+    "<|im_start|>system\n"
+    "You are Lila, a concise local AI assistant. Answer clearly and thoroughly."
+    "<|im_end|>\n"
+    "<|im_start|>user\n"
+    "Explain in detail how CPU L1, L2, and L3 caches affect local LLM token generation speed."
+    "<|im_end|>\n"
+    "<|im_start|>assistant\n"
+)
+
+T2_DELTA = (
+    "<|im_end|>\n"
+    "<|im_start|>user\n"
+    "Now explain in detail why memory bandwidth is usually the main bottleneck during autoregressive decoding."
+    "<|im_end|>\n"
+    "<|im_start|>assistant\n"
+)
+
+# ~860-token prompt matching LilaCore system + tools length
+_TOOL_SPEC = (
+    '{"type":"function","function":{"name":"read_file","description":"Read file contents from workspace.",'
+    '"parameters":{"type":"object","properties":{"path":{"type":"string"},"start_line":{"type":"integer"},'
+    '"end_line":{"type":"integer"}},"required":["path"]}}}\n'
+    '{"type":"function","function":{"name":"write_file","description":"Write or overwrite a file in workspace.",'
+    '"parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},'
+    '"required":["path","content"]}}}\n'
+    '{"type":"function","function":{"name":"run_command","description":"Execute a shell command in workspace.",'
+    '"parameters":{"type":"object","properties":{"command":{"type":"string"},"timeout_s":{"type":"integer"}},'
+    '"required":["command"]}}}\n'
+    '{"type":"function","function":{"name":"search_code","description":"Search codebase with ripgrep.",'
+    '"parameters":{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"}},'
+    '"required":["pattern"]}}}\n'
+)
+
+LONG_PROMPT = (
+    "<|im_start|>system\n"
+    "You are LilaCore, a local-first AI agent running on the user's workstation. "
+    "Follow instructions carefully, verify file paths before editing, and prefer concise, accurate answers.\n\n"
+    "## Available Tools\n"
+    + (_TOOL_SPEC * 4)
+    + "\n## Memory & Context Rules\n"
+    "1. Always cite exact file paths and symbol names observed in tool output.\n"
+    "2. Never fabricate command results or test outcomes.\n"
+    "3. Keep responses structured and avoid unnecessary verbosity.\n"
+    "4. Respect workspace boundaries and never modify files outside the active repository.\n"
+    "<|im_end|>\n"
+    "<|im_start|>user\n"
+    "Summarize the available tools and confirm you are ready to assist.<|im_end|>\n"
+    "<|im_start|>assistant\n"
+)
+
+
+class _AsiV2ModelConfig(ctypes.Structure):
+    _fields_ = [
+        ("arch_id", ctypes.c_uint32),
+        ("n_layers", ctypes.c_uint32),
+        ("hidden_size", ctypes.c_uint32),
+        ("intermediate_size", ctypes.c_uint32),
+        ("n_heads", ctypes.c_uint32),
+        ("n_kv_heads", ctypes.c_uint32),
+        ("head_dim", ctypes.c_uint32),
+        ("vocab_size", ctypes.c_uint32),
+        ("max_seq_len", ctypes.c_uint32),
+        ("rope_dim", ctypes.c_uint32),
+        ("rope_theta", ctypes.c_float),
+        ("rms_norm_eps", ctypes.c_float),
+        ("embed_scale", ctypes.c_float),
+        ("full_attention_interval", ctypes.c_uint32),
+        ("ssm_conv_kernel", ctypes.c_uint32),
+        ("ssm_state_size", ctypes.c_uint32),
+        ("ssm_group_count", ctypes.c_uint32),
+        ("ssm_inner_size", ctypes.c_uint32),
+        ("ssm_time_step_rank", ctypes.c_uint32),
+        ("default_quant_type", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32 * 4),
+    ]
+
+
+def _get_rss_mb() -> float:
+    with open("/proc/self/status", "r", encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                kb = int(line.split()[1])
+                return kb / 1024.0
+    return 0.0
+
+
+def _bind_asi_lib(lib_path: str) -> ctypes.CDLL:
+    lib = ctypes.CDLL(lib_path)
+    lib.lila_asi_open.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
+    lib.lila_asi_open.restype = ctypes.c_void_p
+    lib.lila_asi_close.argtypes = [ctypes.c_void_p]
+    lib.lila_asi_model_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(_AsiV2ModelConfig)]
+    lib.lila_asi_model_info.restype = ctypes.c_int
+    lib.lila_asi_session_create.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.lila_asi_session_create.restype = ctypes.c_void_p
+    lib.lila_asi_session_free.argtypes = [ctypes.c_void_p]
+    lib.lila_asi_session_reset.argtypes = [ctypes.c_void_p]
+    lib.lila_asi_eval_token.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.lila_asi_eval_token.restype = ctypes.c_int
+    lib.lila_asi_eval_batch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    lib.lila_asi_eval_batch.restype = ctypes.c_int
+    lib.lila_asi_sample.argtypes = [
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_uint32,
+        ctypes.c_float,
+        ctypes.c_uint32,
+        ctypes.c_float,
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    lib.lila_asi_sample.restype = ctypes.c_int32
+    return lib
+
+
+def run_asi_trial(
+    asi_path: str,
+    lib_path: str,
+    t1_ids: List[int],
+    t2_ids: List[int],
+    long_ids: List[int],
+    n_ctx: int,
+    n_threads: int,
+    n_batch: int,
+    n_gen: int,
+) -> Dict:
+    lib = _bind_asi_lib(lib_path)
+    err = ctypes.create_string_buffer(256)
+
+    t_load0 = time.perf_counter()
+    model = lib.lila_asi_open(asi_path.encode("utf-8"), err, 256)
+    if not model:
+        raise RuntimeError(f"lila_asi_open failed: {err.value.decode('utf-8', 'replace')}")
+    cfg = _AsiV2ModelConfig()
+    if lib.lila_asi_model_info(model, ctypes.byref(cfg)) != 0:
+        raise RuntimeError("lila_asi_model_info failed")
+    sess = lib.lila_asi_session_create(model, n_ctx, n_threads, err, 256)
+    if not sess:
+        raise RuntimeError(f"lila_asi_session_create failed: {err.value.decode('utf-8', 'replace')}")
+    load_s = time.perf_counter() - t_load0
+
+    logits = (ctypes.c_float * cfg.vocab_size)()
+    rng = ctypes.c_uint64(42)
+
+    # --- Turn 1 ---
+    lib.lila_asi_session_reset(sess)
+    t1_arr = (ctypes.c_int32 * len(t1_ids))(*t1_ids)
+    t0 = time.perf_counter()
+    for off in range(0, len(t1_ids), n_batch):
+        chunk = t1_ids[off : min(len(t1_ids), off + n_batch)]
+        c_arr = (ctypes.c_int32 * len(chunk))(*chunk)
+        if lib.lila_asi_eval_batch(sess, c_arr, len(chunk), off, logits) != 0:
+            raise RuntimeError("ASI Turn 1 eval_batch failed")
+    tok = int(lib.lila_asi_sample(logits, cfg.vocab_size, 0.0, 1, 1.0, ctypes.byref(rng)))
+    t1_ttft = time.perf_counter() - t0
+
+    pos = len(t1_ids)
+    t1_gen = [tok]
+    t_dec0 = time.perf_counter()
+    for _ in range(n_gen):
+        if lib.lila_asi_eval_token(sess, tok, pos, logits) != 0:
+            raise RuntimeError("ASI Turn 1 eval_token failed")
+        pos += 1
+        tok = int(lib.lila_asi_sample(logits, cfg.vocab_size, 0.0, 1, 1.0, ctypes.byref(rng)))
+        t1_gen.append(tok)
+    t1_dec_s = time.perf_counter() - t_dec0
+    t1_dec = n_gen / t1_dec_s
+
+    # --- Turn 2 (reuse Turn 1 KV/DeltaNet state, NO reset) ---
+    pos_before_t2 = pos
+    assert pos_before_t2 == len(t1_ids) + n_gen, f"ASI pos mismatch: {pos_before_t2}"
+    t0 = time.perf_counter()
+    t2_eval_count = 0
+    for off in range(0, len(t2_ids), n_batch):
+        chunk = t2_ids[off : min(len(t2_ids), off + n_batch)]
+        c_arr = (ctypes.c_int32 * len(chunk))(*chunk)
+        if lib.lila_asi_eval_batch(sess, c_arr, len(chunk), pos_before_t2 + off, logits) != 0:
+            raise RuntimeError("ASI Turn 2 eval_batch failed")
+        t2_eval_count += len(chunk)
+    tok = int(lib.lila_asi_sample(logits, cfg.vocab_size, 0.0, 1, 1.0, ctypes.byref(rng)))
+    t2_ttft = time.perf_counter() - t0
+    assert t2_eval_count == len(t2_ids), f"ASI Turn 2 eval count {t2_eval_count} != {len(t2_ids)}"
+
+    pos = pos_before_t2 + t2_eval_count
+    t2_gen = [tok]
+    t_dec0 = time.perf_counter()
+    for _ in range(n_gen):
+        if lib.lila_asi_eval_token(sess, tok, pos, logits) != 0:
+            raise RuntimeError("ASI Turn 2 eval_token failed")
+        pos += 1
+        tok = int(lib.lila_asi_sample(logits, cfg.vocab_size, 0.0, 1, 1.0, ctypes.byref(rng)))
+        t2_gen.append(tok)
+    t2_dec_s = time.perf_counter() - t_dec0
+    t2_dec = n_gen / t2_dec_s
+
+    # --- Long Prefill (~860 tokens) ---
+    lib.lila_asi_session_reset(sess)
+    t0 = time.perf_counter()
+    for off in range(0, len(long_ids), n_batch):
+        chunk = long_ids[off : min(len(long_ids), off + n_batch)]
+        c_arr = (ctypes.c_int32 * len(chunk))(*chunk)
+        if lib.lila_asi_eval_batch(sess, c_arr, len(chunk), off, logits) != 0:
+            raise RuntimeError("ASI long prefill eval_batch failed")
+    long_s = time.perf_counter() - t0
+    long_prefill_tps = len(long_ids) / long_s
+
+    rss_mb = _get_rss_mb()
+
+    lib.lila_asi_session_free(sess)
+    lib.lila_asi_close(model)
+
+    return {
+        "engine": "asi",
+        "load_s": load_s,
+        "t1_ttft": t1_ttft,
+        "t1_dec": t1_dec,
+        "t2_ttft": t2_ttft,
+        "t2_dec": t2_dec,
+        "long_prefill_tps": long_prefill_tps,
+        "rss_mb": rss_mb,
+        "t2_eval_tokens": t2_eval_count,
+        "t2_pos_before": pos_before_t2,
+        "t1_first_tok": t1_gen[0],
+        "t2_first_tok": t2_gen[0],
+    }
+
+
+def run_llama_trial(
+    gguf_path: str,
+    t1_ids: List[int],
+    t2_ids: List[int],
+    long_ids: List[int],
+    n_ctx: int,
+    n_threads: int,
+    n_batch: int,
+    n_gen: int,
+) -> Dict:
+    from llama_cpp import Llama
+
+    t_load0 = time.perf_counter()
+    llm = Llama(
+        model_path=gguf_path,
+        n_ctx=n_ctx,
+        n_threads=n_threads,
+        n_threads_batch=n_threads,
+        n_batch=n_batch,
+        use_mmap=True,
+        flash_attn=False,
+        n_gpu_layers=0,
+        verbose=False,
+    )
+    load_s = time.perf_counter() - t_load0
+
+    def sample_greedy() -> int:
+        return int(llm.sample(temp=0.0, top_k=1, top_p=1.0, min_p=0.0, repeat_penalty=1.0))
+
+    # --- Turn 1 ---
+    llm.reset()
+    t0 = time.perf_counter()
+    llm.eval(t1_ids)
+    tok = sample_greedy()
+    t1_ttft = time.perf_counter() - t0
+
+    t1_gen = [tok]
+    t_dec0 = time.perf_counter()
+    for _ in range(n_gen):
+        llm.eval([tok])
+        tok = sample_greedy()
+        t1_gen.append(tok)
+    t1_dec_s = time.perf_counter() - t_dec0
+    t1_dec = n_gen / t1_dec_s
+
+    # --- Turn 2 (reuse Turn 1 KV/recurrent state, NO reset) ---
+    n_before_t2 = int(llm.n_tokens)
+    assert n_before_t2 == len(t1_ids) + n_gen, f"llama n_tokens mismatch: {n_before_t2}"
+    t0 = time.perf_counter()
+    llm.eval(t2_ids)
+    tok = sample_greedy()
+    t2_ttft = time.perf_counter() - t0
+    n_after_t2 = int(llm.n_tokens)
+    t2_eval_count = n_after_t2 - n_before_t2
+    assert t2_eval_count == len(t2_ids), f"llama Turn 2 eval count {t2_eval_count} != {len(t2_ids)}"
+
+    t2_gen = [tok]
+    t_dec0 = time.perf_counter()
+    for _ in range(n_gen):
+        llm.eval([tok])
+        tok = sample_greedy()
+        t2_gen.append(tok)
+    t2_dec_s = time.perf_counter() - t_dec0
+    t2_dec = n_gen / t2_dec_s
+
+    # --- Long Prefill (~860 tokens) ---
+    llm.reset()
+    t0 = time.perf_counter()
+    llm.eval(long_ids)
+    long_s = time.perf_counter() - t0
+    long_prefill_tps = len(long_ids) / long_s
+
+    rss_mb = _get_rss_mb()
+    llm.close()
+
+    return {
+        "engine": "llama",
+        "load_s": load_s,
+        "t1_ttft": t1_ttft,
+        "t1_dec": t1_dec,
+        "t2_ttft": t2_ttft,
+        "t2_dec": t2_dec,
+        "long_prefill_tps": long_prefill_tps,
+        "rss_mb": rss_mb,
+        "t2_eval_tokens": t2_eval_count,
+        "t2_pos_before": n_before_t2,
+        "t1_first_tok": t1_gen[0],
+        "t2_first_tok": t2_gen[0],
+    }
+
+
+def _bootstrap_median_ci(xs: Sequence[float], n_boot: int = 10000, seed: int = 42) -> Tuple[float, float]:
+    rng = random.Random(seed)
+    n = len(xs)
+    if n == 1:
+        return (xs[0], xs[0])
+    medians = sorted(statistics.median(rng.choices(xs, k=n)) for _ in range(n_boot))
+    lo = medians[int(0.025 * n_boot)]
+    hi = medians[min(n_boot - 1, int(0.975 * n_boot))]
+    return (lo, hi)
+
+
+def _mann_whitney_u_p(x: Sequence[float], y: Sequence[float]) -> float:
+    """Two-sided Mann-Whitney U p-value in pure Python stdlib."""
+    n1, n2 = len(x), len(y)
+    combined = [(v, 0) for v in x] + [(v, 1) for v in y]
+    combined.sort(key=lambda t: t[0])
+
+    n_tot = n1 + n2
+    ranks2 = [0] * n_tot  # doubled ranks (integers) to handle ties exactly
+    tie_groups: List[int] = []
+    i = 0
+    while i < n_tot:
+        j = i + 1
+        while j < n_tot and combined[j][0] == combined[i][0]:
+            j += 1
+        # 1-based average rank is (i+1 + j)/2, so doubled rank is (i + 1 + j)
+        avg_r2 = i + 1 + j
+        for k in range(i, j):
+            ranks2[k] = avg_r2
+        if j - i > 1:
+            tie_groups.append(j - i)
+        i = j
+
+    r1_2 = sum(ranks2[k] for k in range(n_tot) if combined[k][1] == 0)
+    u1 = r1_2 / 2.0 - n1 * (n1 + 1) / 2.0
+    u2 = n1 * n2 - u1
+    u_obs = min(u1, u2)
+
+    # Exact DP over doubled rank sums when n_tot <= 20
+    if n_tot <= 20:
+        dp: Dict[Tuple[int, int], int] = {(0, 0): 1}
+        for r2 in ranks2:
+            new_dp = dict(dp)
+            for (cnt, s), ways in dp.items():
+                if cnt < n1:
+                    key = (cnt + 1, s + r2)
+                    new_dp[key] = new_dp.get(key, 0) + ways
+            dp = new_dp
+
+        total_ways = math.comb(n_tot, n1)
+        target_max = min(u1, u2)
+        extreme = 0
+        for (cnt, s), ways in dp.items():
+            if cnt == n1:
+                cur_u1 = s / 2.0 - n1 * (n1 + 1) / 2.0
+                cur_u = min(cur_u1, n1 * n2 - cur_u1)
+                if cur_u <= target_max + 1e-9:
+                    extreme += ways
+        return min(1.0, extreme / total_ways)
+
+    # Normal approximation with tie correction + continuity correction
+    mean_u = n1 * n2 / 2.0
+    tie_term = sum(t**3 - t for t in tie_groups) / (n_tot * (n_tot - 1)) if n_tot > 1 else 0.0
+    var_u = (n1 * n2 / 12.0) * ((n_tot + 1) - tie_term)
+    if var_u <= 0.0:
+        return 1.0
+    z = (abs(u_obs - mean_u) - 0.5) / math.sqrt(var_u)
+    z = max(0.0, z)
+    return min(1.0, math.erfc(z / math.sqrt(2.0)))
+
+
+def _tokenize_once(gguf_path: str) -> Dict[str, List[int]]:
+    from llama_cpp import Llama
+
+    llm = Llama(model_path=gguf_path, vocab_only=True, verbose=False)
+    t1_ids = llm.tokenize(T1_PROMPT.encode("utf-8"), add_bos=False, special=True)
+    t2_ids = llm.tokenize(T2_DELTA.encode("utf-8"), add_bos=False, special=True)
+    long_ids = llm.tokenize(LONG_PROMPT.encode("utf-8"), add_bos=False, special=True)
+    llm.close()
+    return {"t1": list(t1_ids), "t2": list(t2_ids), "long": list(long_ids)}
+
+
+def _run_worker_subprocess(
+    engine: str,
+    asi_path: str,
+    gguf_path: str,
+    lib_path: str,
+    tokens_json: str,
+    n_ctx: int,
+    n_threads: int,
+    n_batch: int,
+    n_gen: int,
+) -> Dict:
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--worker",
+        engine,
+        "--asi",
+        asi_path,
+        "--gguf",
+        gguf_path,
+        "--lib",
+        lib_path,
+        "--tokens-json",
+        tokens_json,
+        "--n-ctx",
+        str(n_ctx),
+        "--n-threads",
+        str(n_threads),
+        "--n-batch",
+        str(n_batch),
+        "--n-gen",
+        str(n_gen),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    for line in reversed(proc.stdout.strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            return json.loads(line)
+    raise RuntimeError(f"Worker {engine} produced no JSON output:\n{proc.stdout}\n{proc.stderr}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Strict apples-to-apples ASI vs llama.cpp benchmark")
+    parser.add_argument("--n", type=int, default=15, help="Number of interleaved trial pairs (default: 15)")
+    parser.add_argument("--asi", default=DEFAULT_ASI_PATH)
+    parser.add_argument("--gguf", default=DEFAULT_GGUF_PATH)
+    parser.add_argument("--lib", default=DEFAULT_LIB_PATH)
+    parser.add_argument("--n-ctx", type=int, default=N_CTX)
+    parser.add_argument("--n-threads", type=int, default=N_THREADS)
+    parser.add_argument("--n-batch", type=int, default=N_BATCH)
+    parser.add_argument("--n-gen", type=int, default=N_GEN)
+    parser.add_argument("--worker", choices=["asi", "llama"], default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--tokens-json", default=None, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    if args.worker is not None:
+        toks = json.loads(args.tokens_json)
+        if args.worker == "asi":
+            res = run_asi_trial(
+                args.asi, args.lib, toks["t1"], toks["t2"], toks["long"],
+                args.n_ctx, args.n_threads, args.n_batch, args.n_gen,
+            )
+        else:
+            res = run_llama_trial(
+                args.gguf, toks["t1"], toks["t2"], toks["long"],
+                args.n_ctx, args.n_threads, args.n_batch, args.n_gen,
+            )
+        print(json.dumps(res))
+        return 0
+
+    toks = _tokenize_once(args.gguf)
+    tokens_json = json.dumps(toks)
+    print("=== Strict Apples-to-Apples Benchmark: Lila ASI vs llama.cpp ===")
+    print(f"ASI model   : {args.asi}")
+    print(f"GGUF model  : {args.gguf}")
+    print(
+        f"Settings    : n_ctx={args.n_ctx}, n_threads={args.n_threads}, "
+        f"n_threads_batch={args.n_threads}, n_batch={args.n_batch}, "
+        f"use_mmap=True, flash_attn=False, temp=0.0 (greedy), n_gen={args.n_gen}, N={args.n}"
+    )
+    print(
+        f"Token counts: T1={len(toks['t1'])} toks, T2_delta={len(toks['t2'])} toks, "
+        f"Long={len(toks['long'])} toks (identical int IDs fed to both)"
+    )
+
+    # 1 warmup trial per engine (discarded) to page-cache weights
+    print("\n[Warmup] Running 1 discarded warmup trial per engine...")
+    w_asi = _run_worker_subprocess(
+        "asi", args.asi, args.gguf, args.lib, tokens_json,
+        args.n_ctx, args.n_threads, args.n_batch, args.n_gen,
+    )
+    w_llama = _run_worker_subprocess(
+        "llama", args.asi, args.gguf, args.lib, tokens_json,
+        args.n_ctx, args.n_threads, args.n_batch, args.n_gen,
+    )
+    print(
+        f"[KV/Prefix Reuse Verified] "
+        f"ASI T2 evaluated={w_asi['t2_eval_tokens']} toks (pos_before={w_asi['t2_pos_before']}), "
+        f"llama.cpp T2 evaluated={w_llama['t2_eval_tokens']} toks (n_tokens_before={w_llama['t2_pos_before']})"
+    )
+
+    asi_runs: List[Dict] = []
+    llama_runs: List[Dict] = []
+    print(f"\n[Trials] Running {args.n} interleaved (ASI, llama.cpp) pairs...")
+    for idx in range(1, args.n + 1):
+        r_asi = _run_worker_subprocess(
+            "asi", args.asi, args.gguf, args.lib, tokens_json,
+            args.n_ctx, args.n_threads, args.n_batch, args.n_gen,
+        )
+        r_llama = _run_worker_subprocess(
+            "llama", args.asi, args.gguf, args.lib, tokens_json,
+            args.n_ctx, args.n_threads, args.n_batch, args.n_gen,
+        )
+        assert r_asi["t2_eval_tokens"] == len(toks["t2"])
+        assert r_llama["t2_eval_tokens"] == len(toks["t2"])
+        asi_runs.append(r_asi)
+        llama_runs.append(r_llama)
+        print(
+            f"  pair {idx:2d}/{args.n}: "
+            f"ASI(t1_ttft={r_asi['t1_ttft']:.3f}s, t1_dec={r_asi['t1_dec']:.2f}, "
+            f"t2_ttft={r_asi['t2_ttft']:.3f}s, t2_dec={r_asi['t2_dec']:.2f}, "
+            f"long={r_asi['long_prefill_tps']:.2f}, rss={r_asi['rss_mb']:.1f}MB) | "
+            f"llama(t1_ttft={r_llama['t1_ttft']:.3f}s, t1_dec={r_llama['t1_dec']:.2f}, "
+            f"t2_ttft={r_llama['t2_ttft']:.3f}s, t2_dec={r_llama['t2_dec']:.2f}, "
+            f"long={r_llama['long_prefill_tps']:.2f}, rss={r_llama['rss_mb']:.1f}MB)"
+        )
+
+    metrics = [
+        ("t1_ttft", "s", "lower", True),
+        ("t1_dec", "tok/s", "higher", True),
+        ("t2_ttft", "s", "lower", True),
+        ("t2_dec", "tok/s", "higher", True),
+        ("long_prefill_tps", "tok/s", "higher", True),
+        ("rss_mb", "MiB", "lower", True),
+        ("load_s", "s", "lower", False),
+    ]
+
+    print("\n=== Statistical Summary & Strict Bar Verdict ===")
+    header = (
+        f"{'Metric':<18} {'Unit':<6} {'Dir':<7} "
+        f"{'ASI med [min..max] (95% CI)':<38} "
+        f"{'llama med [min..max] (95% CI)':<38} "
+        f"{'MWU p':<9} {'Bar'}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    all_primary_pass = True
+    for key, unit, direction, is_primary in metrics:
+        ax = [r[key] for r in asi_runs]
+        lx = [r[key] for r in llama_runs]
+        a_med, a_min, a_max = statistics.median(ax), min(ax), max(ax)
+        l_med, l_min, l_max = statistics.median(lx), min(lx), max(lx)
+        a_ci = _bootstrap_median_ci(ax)
+        l_ci = _bootstrap_median_ci(lx)
+        pval = _mann_whitney_u_p(ax, lx)
+
+        if direction == "higher":
+            passed = (a_med > l_med) and (a_min > l_max)
+        else:
+            passed = (a_med < l_med) and (a_max < l_min)
+
+        if is_primary and not passed:
+            all_primary_pass = False
+
+        bar_str = ("PASS" if passed else "FAIL") + ("" if is_primary else " (sec)")
+        a_str = f"{a_med:.3f} [{a_min:.3f}..{a_max:.3f}] ({a_ci[0]:.3f}..{a_ci[1]:.3f})"
+        l_str = f"{l_med:.3f} [{l_min:.3f}..{l_max:.3f}] ({l_ci[0]:.3f}..{l_ci[1]:.3f})"
+        print(f"{key:<18} {unit:<6} {direction:<7} {a_str:<38} {l_str:<38} {pval:<9.4g} {bar_str}")
+
+    print(f"\nOVERALL PRIMARY BAR: {'PASS' if all_primary_pass else 'FAIL'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
