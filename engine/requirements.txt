@@ -1,0 +1,2 @@
+# Python dependency for the ASI packer and its model-loading tests.
+numpy>=1.26,<3

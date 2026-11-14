@@ -85,22 +85,25 @@ class ExecutionAuthorityTests(unittest.TestCase):
             json_tool_call("bash", {"command": "sensitive"})
         )[0]
         self.assertFalse(denied["result"].success)
-        self.assertEqual(denied["record"].permission_decision, "denied")
+        self.assertEqual(denied["record"].permission_decision, "approval_unavailable")
+        self.assertEqual(denied["approval"].status.value, "unavailable")
 
         approval = Mock(return_value=True)
         allowed = self.executor(approval).process(
             json_tool_call("bash", {"command": "sensitive"})
         )[0]
-        self.assertTrue(allowed["result"].success)
-        self.assertEqual(allowed["record"].permission_decision, "approved")
-        approval.assert_called_once()
+        self.assertFalse(allowed["result"].success)
+        self.assertEqual(allowed["record"].permission_decision, "approval_unavailable")
+        self.assertEqual(allowed["approval"].status.value, "unavailable")
+        approval.assert_not_called()
 
     def test_explicit_denial_blocks_operation(self) -> None:
         result = self.executor(Mock(return_value=False)).process(
             json_tool_call("bash", {"command": "sensitive"})
         )[0]
         self.assertFalse(result["result"].success)
-        self.assertEqual(result["record"].permission_decision, "denied")
+        self.assertEqual(result["record"].permission_decision, "approval_unavailable")
+        self.assertEqual(result["approval"].status.value, "unavailable")
         self.assertEqual(self.calls, [])
 
     def test_missing_approval_callback_fails_closed(self) -> None:
@@ -108,7 +111,8 @@ class ExecutionAuthorityTests(unittest.TestCase):
             json_tool_call("bash", {"command": "sensitive"})
         )[0]
         self.assertFalse(result["result"].success)
-        self.assertIn("no approval handler", result["result"].error)
+        self.assertIn("Approval is unavailable", result["result"].error)
+        self.assertEqual(result["approval"].reason_code, "approval.lifecycle_unavailable")
         self.assertEqual(self.calls, [])
 
     def test_invalid_arguments_are_rejected_before_execution(self) -> None:
@@ -133,6 +137,7 @@ class ExecutionAuthorityTests(unittest.TestCase):
     def test_bash_timeout_must_be_within_registered_range(self) -> None:
         from src.harness.system_tools import register_all_system_tools
 
+        self.registry._tools.clear()
         register_all_system_tools()
         result = self.executor(Mock(return_value=True)).process(
             json_tool_call("bash", {"command": "echo safe", "timeout": 0})
@@ -164,9 +169,10 @@ class ExecutionAuthorityTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
     def test_optional_defaults_are_applied(self) -> None:
-        result = self.executor(Mock(return_value=True)).process(
-            json_tool_call("test_schema", {"count": 1, "mode": "SAFE"})
-        )[0]
+        with patch("src.harness.permissions.policy_for", return_value=("low", "auto")):
+            result = self.executor(Mock(return_value=True)).process(
+                json_tool_call("test_schema", {"count": 1, "mode": "SAFE"})
+            )[0]
         self.assertTrue(result["result"].success)
         self.assertEqual(self.calls[0][1]["optional"], False)
         self.assertEqual(self.calls[0][1]["mode"], "safe")
@@ -232,8 +238,9 @@ class ExecutionAuthorityTests(unittest.TestCase):
         entries = [json.loads(line) for line in logged.splitlines()]
         entry = entries[0]
         self.assertEqual(entry["tool"], "clipboard_get")
-        self.assertIn(entry["permission_decision"], {"approved", "automatic"})
-        self.assertEqual(entry["output"], "[REDACTED]")
+        self.assertEqual(entry["permission_decision"], "approval_unavailable")
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entry["output"], "")
         self.assertEqual(entries[1]["tool"], "clipboard_set")
         self.assertEqual(entries[1]["args"]["content"], "[REDACTED]")
 
@@ -304,7 +311,9 @@ class ExecutionAuthorityTests(unittest.TestCase):
 
         response = core.think("check status")
 
-        self.assertEqual(response.text, "final answer")
+        self.assertTrue(response.text.startswith("final answer"))
+        self.assertIn("Tool reported success", response.text)
+        self.assertIn("Output: ok", response.text)
         self.assertEqual(response.actions[0]["tool"], "self_status")
         self.assertTrue(response.actions[0]["success"])
         self.assertEqual(len(self.calls), 1)
@@ -368,7 +377,15 @@ class ExecutionAuthorityTests(unittest.TestCase):
     def test_authenticated_api_routes_through_daemon_core(self) -> None:
         token = "t" * 32
         daemon = LilaDaemon(voice=False, api_token=token)
-        daemon.process_input = Mock(return_value="central result")
+        core = SimpleNamespace(
+            think=Mock(return_value=LilaResponse(
+                text="central result",
+                memory_ops=[],
+                actions=[],
+                confidence=1.0,
+            ))
+        )
+        daemon.lila = core
         server = HTTPServer(
             ("127.0.0.1", 0), _make_api_handler(daemon, token)
         )
@@ -390,7 +407,7 @@ class ExecutionAuthorityTests(unittest.TestCase):
         with urlopen(request, timeout=3) as response:
             payload = json.loads(response.read())
         self.assertEqual(payload["response"], "central result")
-        daemon.process_input.assert_called_once_with("hello")
+        core.think.assert_called_once_with("hello")
 
 
 if __name__ == "__main__":

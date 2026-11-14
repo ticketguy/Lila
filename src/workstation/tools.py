@@ -31,7 +31,7 @@ def _encode_result(
         payload["returned_count"] = len(payload[collection_key])
         payload["truncated"] = truncated
 
-    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     while (
         len(encoded) > MAX_OUTPUT_CHARS
         and collection_key
@@ -40,7 +40,7 @@ def _encode_result(
         payload[collection_key].pop()
         payload["returned_count"] = len(payload[collection_key])
         payload["truncated"] = True
-        encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
     if len(encoded) > MAX_OUTPUT_CHARS:
         return ToolResult(
@@ -244,8 +244,14 @@ def _workstation_software_overview() -> ToolResult:
     )
 
 
-def register_workstation_tools() -> None:
-    """Register registry-backed metadata queries with the central harness."""
+def register_workstation_tools(registry=None) -> None:
+    """Register metadata tools globally by default, or into an explicit registry."""
+    if registry is None:
+        register = register_tool
+    else:
+        register = getattr(registry, "register", None)
+        if not callable(register):
+            raise TypeError("registry must provide a callable register(tool) method")
     definitions = (
         Tool(
             name="workstation_overview",
@@ -315,4 +321,4 @@ def register_workstation_tools() -> None:
         ),
     )
     for tool in definitions:
-        register_tool(tool)
+        register(tool)

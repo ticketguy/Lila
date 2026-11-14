@@ -21,7 +21,11 @@ public enum PushToTalkMode
 
 public sealed record VoiceInteractionSnapshot(VoiceInteractionState State,
     string? SessionId = null, string? Transcript = null, string? Response = null,
-    string? Error = null);
+    string? Error = null)
+{
+    public IReadOnlyList<ToolResultView> ToolResults { get; init; } = Array.Empty<ToolResultView>();
+    public int ToolResultsOmitted { get; init; }
+}
 
 public sealed class VoiceSessionController(IVoiceSessionApi api,
     TimeSpan? missedReleaseSafetyLimit = null, TimeSpan? responseDisplayDuration = null)
@@ -30,6 +34,7 @@ public sealed class VoiceSessionController(IVoiceSessionApi api,
     private readonly TimeSpan _safetyLimit = missedReleaseSafetyLimit ?? TimeSpan.FromSeconds(115);
     private readonly TimeSpan _responseDuration = responseDisplayDuration ?? TimeSpan.FromSeconds(1.5);
     private VoiceInteractionSnapshot _snapshot = new(VoiceInteractionState.Idle);
+    private VoiceSessionStatus? _remoteStatus;
     private bool _keyHeld;
     private bool _releaseWhenStarted;
     private bool _toggleStopWhenStarted;
@@ -43,6 +48,53 @@ public sealed class VoiceSessionController(IVoiceSessionApi api,
     public VoiceInteractionSnapshot Snapshot
     {
         get { lock (_sync) return _snapshot; }
+    }
+
+    public VoiceSessionStatus? RemoteStatus
+    {
+        get { lock (_sync) return _remoteStatus; }
+    }
+
+    public bool IsRemoteVoiceDisabled
+    {
+        get
+        {
+            lock (_sync)
+                return string.Equals(_remoteStatus?.State, "disabled", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    public bool CanStartNewSession
+    {
+        get
+        {
+            lock (_sync)
+                return CanStartNewSessionLocked();
+        }
+    }
+
+    public void ObserveRemoteStatus(VoiceSessionStatus? status)
+    {
+        lock (_sync)
+        {
+            _remoteStatus = status;
+        }
+    }
+
+    private bool CanStartNewSessionLocked()
+    {
+        if (string.Equals(_remoteStatus?.State, "disabled", StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (_snapshot.State is not (VoiceInteractionState.Idle or VoiceInteractionState.Response))
+            return false;
+        if (_remoteStatus?.State is "recording" or "transcribing" or "cancelling" or "timed_out")
+        {
+            if (!string.IsNullOrWhiteSpace(_snapshot.SessionId) &&
+                string.Equals(_remoteStatus.SessionId, _snapshot.SessionId, StringComparison.Ordinal))
+                return true;
+            return false;
+        }
+        return true;
     }
 
     public PushToTalkMode Mode { get; set; } = PushToTalkMode.HoldToTalk;
@@ -100,6 +152,8 @@ public sealed class VoiceSessionController(IVoiceSessionApi api,
         {
             if (_snapshot.State is VoiceInteractionState.Idle or VoiceInteractionState.Response)
             {
+                if (!CanStartNewSessionLocked())
+                    return;
                 _sessionMode = PushToTalkMode.HoldToTalk;
                 _keyHeld = true;
                 _releaseWhenStarted = false;
@@ -162,6 +216,8 @@ public sealed class VoiceSessionController(IVoiceSessionApi api,
         {
             if (_snapshot.State == VoiceInteractionState.Idle)
             {
+                if (!CanStartNewSessionLocked())
+                    return;
                 _activeShortcutKey = identity;
                 _sessionMode = Mode;
                 _keyHeld = true;
@@ -172,6 +228,8 @@ public sealed class VoiceSessionController(IVoiceSessionApi api,
             }
             else if (_snapshot.State == VoiceInteractionState.Response)
             {
+                if (!CanStartNewSessionLocked())
+                    return;
                 _activeShortcutKey = identity;
                 _sessionMode = Mode;
                 _snapshot = new VoiceInteractionSnapshot(VoiceInteractionState.Idle);
@@ -321,7 +379,9 @@ public sealed class VoiceSessionController(IVoiceSessionApi api,
                 if (_snapshot.State == VoiceInteractionState.Cancelling)
                     return;
                 changed = SetStateLocked(VoiceInteractionState.Response, sessionId,
-                    result.Transcript, result.Response);
+                    result.Transcript, result.Response,
+                    toolResults: result.ToolResults,
+                    toolResultsOmitted: result.ToolResultsOmitted);
             }
             Publish(changed);
             await Task.Delay(_responseDuration).ConfigureAwait(false);
@@ -404,9 +464,14 @@ public sealed class VoiceSessionController(IVoiceSessionApi api,
 
     private VoiceInteractionSnapshot SetStateLocked(VoiceInteractionState state,
         string? sessionId = null, string? transcript = null, string? response = null,
-        string? error = null)
+        string? error = null, IReadOnlyList<ToolResultView>? toolResults = null,
+        int toolResultsOmitted = 0)
     {
-        _snapshot = new VoiceInteractionSnapshot(state, sessionId, transcript, response, error);
+        _snapshot = new VoiceInteractionSnapshot(state, sessionId, transcript, response, error)
+        {
+            ToolResults = toolResults ?? Array.Empty<ToolResultView>(),
+            ToolResultsOmitted = toolResultsOmitted
+        };
         return _snapshot;
     }
 

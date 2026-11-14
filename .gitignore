@@ -19,3 +19,8 @@ archive/
 /windows/Lila.Desktop.Core/obj/
 /windows/Lila.Desktop.Tests/bin/
 /windows/Lila.Desktop.Tests/obj/
+*.o
+*.so
+/engine/lila-engine
+/engine/lila-asi
+*:Zone.Identifier

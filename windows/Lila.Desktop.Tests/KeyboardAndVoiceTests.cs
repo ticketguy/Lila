@@ -197,6 +197,36 @@ public sealed class KeyboardAndVoiceTests
     }
 
     [Fact]
+    public async Task VoiceSnapshotCarriesTheAuthoritativeToolEvidence()
+    {
+        var evidence = new ToolResultView
+        {
+            Tool = "file_read",
+            Label = "Read project file",
+            Success = true,
+            Status = "success",
+            VerificationStatus = "verified"
+        };
+        var api = new FakeVoiceApi { ToolResults = [evidence], ToolResultsOmitted = 2 };
+        var controller = new VoiceSessionController(api, responseDisplayDuration: TimeSpan.Zero);
+        var response = new TaskCompletionSource<VoiceInteractionSnapshot>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        controller.StateChanged += snapshot =>
+        {
+            if (snapshot.State == VoiceInteractionState.Response)
+                response.TrySetResult(snapshot);
+        };
+
+        controller.ToggleFromUi();
+        await WaitForAsync(() => controller.Snapshot.State == VoiceInteractionState.Recording);
+        controller.ToggleFromUi();
+        var snapshot = await response.Task.WaitAsync(TimeSpan.FromSeconds(3));
+
+        Assert.Same(evidence, Assert.Single(snapshot.ToolResults));
+        Assert.Equal(2, snapshot.ToolResultsOmitted);
+    }
+
+    [Fact]
     public async Task ServerVoiceErrorIsShownWithoutAnUncertainOutcomeMessage()
     {
         var api = new FakeVoiceApi
@@ -256,6 +286,8 @@ public sealed class KeyboardAndVoiceTests
         private readonly object _lock = new();
         public TaskCompletionSource<VoiceStartResult>? StartGate { get; init; }
         public Exception? StopError { get; init; }
+        public IReadOnlyList<ToolResultView> ToolResults { get; init; } = [];
+        public int ToolResultsOmitted { get; init; }
         public List<string> Calls { get; } = [];
         public int StartCount { get; private set; }
         public int StopCount { get; private set; }
@@ -282,7 +314,11 @@ public sealed class KeyboardAndVoiceTests
             if (StopError is not null)
                 return Task.FromException<VoiceStopResult>(StopError);
             return Task.FromResult(new VoiceStopResult(sessionId, "raw transcript", "response",
-                new VoiceSessionStatus("completed", sessionId, null, null)));
+                new VoiceSessionStatus("completed", sessionId, null, null))
+            {
+                ToolResults = ToolResults,
+                ToolResultsOmitted = ToolResultsOmitted
+            });
         }
 
         public Task<VoiceCancelResult> CancelVoiceAsync(string sessionId,

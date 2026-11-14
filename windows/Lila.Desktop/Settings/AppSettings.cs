@@ -14,6 +14,11 @@ public sealed class AppSettings
     public bool ToggleToTalkEnabled { get; set; } = true;
     public int RightControlArmingDelayMilliseconds { get; set; } = 180;
     public bool AutoStart { get; set; } = false;
+    public bool SentinelOptIn { get; set; } = false;
+    public int IslandLeft { get; set; } = int.MinValue;
+    public int IslandTop { get; set; } = int.MinValue;
+    public string? IslandMonitorDeviceName { get; set; }
+    public bool IslandExpanded { get; set; }
 
     public static string SettingsPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),

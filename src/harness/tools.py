@@ -79,6 +79,10 @@ class ToolRegistry:
     
     def register(self, tool: Tool):
         """Register a tool with its centrally defined risk policy."""
+        if tool.name in self._tools:
+            raise DuplicateToolRegistrationError(
+                f"Tool '{tool.name}' is already registered."
+            )
         tool.risk, tool.permission = policy_for(tool.name)
         self._tools[tool.name] = tool
     
@@ -107,8 +111,17 @@ class ToolRegistry:
             for tool in tools:
                 lines.append(f"    {tool.as_prompt_description()}")
         
-        lines.append("\nTo use a tool, output: <|tool_call|>name(arg=\"value\")<|/tool_call|>")
+        lines.extend([
+            "\nTool calls must use this JSON format:",
+            "<tool_call>",
+            '{"name": "file_read", "arguments": {"path": "lila.py"}}',
+            "</tool_call>",
+        ])
         return "\n".join(lines)
+
+
+class DuplicateToolRegistrationError(ValueError):
+    """Raised when registration would replace an existing tool identity."""
 
 
 # Global registry

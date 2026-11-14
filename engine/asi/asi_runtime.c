@@ -206,11 +206,14 @@ static int load_weights(AsiRuntime *rt)
     rt->model->intermediate_size = rt->config.intermediate_size;
     rt->model->n_heads = rt->config.n_heads;
     rt->model->n_kv_heads = rt->config.n_kv_heads;
-    rt->model->head_dim = rt->config.hidden_size / rt->config.n_heads;
+    rt->model->head_dim = rt->config.head_dim > 0
+                              ? (int)rt->config.head_dim
+                              : (int)(rt->config.hidden_size / rt->config.n_heads);
     rt->model->vocab_size = rt->config.vocab_size;
     rt->model->max_seq_len = rt->config.max_seq_len;
     rt->model->rope_theta = rt->config.rope_theta;
     rt->model->rms_norm_eps = rt->config.rms_norm_eps;
+    rt->model->embed_scale = 1.0f;
 
     rt->model->mmap_addr = section_data(rt, sec);
     rt->model->mmap_size = sec->size;
@@ -253,7 +256,7 @@ static int load_weights(AsiRuntime *rt)
         }
     }
 
-    for (int layer_idx = 0; layer_idx < rt->config.n_layers; layer_idx++)
+    for (uint32_t layer_idx = 0; layer_idx < rt->config.n_layers; layer_idx++)
     {
         if (ptr >= weights_end)
             break;
@@ -263,7 +266,7 @@ static int load_weights(AsiRuntime *rt)
         layer->intermediate_size = rt->config.intermediate_size;
         layer->n_heads = rt->config.n_heads;
         layer->n_kv_heads = rt->config.n_kv_heads;
-        layer->head_dim = rt->config.hidden_size / rt->config.n_heads;
+        layer->head_dim = rt->model->head_dim;
 
         LilaQuantWeight *projs[7] = {
             &layer->q_proj, &layer->k_proj, &layer->v_proj, &layer->o_proj,
@@ -291,9 +294,9 @@ static int load_weights(AsiRuntime *rt)
 
             if (quant_type == QUANT_Q4_K)
             {
-                int n_elements = rows * cols;
-                int n_blocks = (n_elements + 255) / 256;
-                size_t data_size = (size_t)n_blocks * 144;
+                int blocks_per_row = (cols + 255) / 256;
+                size_t n_blocks = (size_t)rows * (size_t)blocks_per_row;
+                size_t data_size = n_blocks * 144;
                 if (ptr + data_size > weights_end)
                     break;
                 projs[p]->data = ptr;
@@ -302,9 +305,9 @@ static int load_weights(AsiRuntime *rt)
             }
             else if (quant_type == QUANT_Q6_K)
             {
-                int n_elements = rows * cols;
-                int n_blocks = (n_elements + 255) / 256;
-                size_t data_size = (size_t)n_blocks * 210;
+                int blocks_per_row = (cols + 255) / 256;
+                size_t n_blocks = (size_t)rows * (size_t)blocks_per_row;
+                size_t data_size = n_blocks * 210;
                 if (ptr + data_size > weights_end)
                     break;
                 projs[p]->data = ptr;
@@ -613,7 +616,7 @@ AsiRuntime *asi_load(const char *path)
                        rt->config.n_layers,
                        rt->config.max_seq_len,
                        rt->config.n_kv_heads,
-                       rt->config.head_dim);
+                       rt->model->head_dim);
 
     platform_madvise_rand(mapped, file_size);
 
@@ -802,6 +805,8 @@ void asi_free(AsiRuntime *rt)
 
     if (rt->model)
     {
+        extern void lila_free_scratch(LilaModel * model);
+        lila_free_scratch(rt->model);
         free(rt->model->kv_cache.key_cache);
         free(rt->model->kv_cache.value_cache);
         free(rt->model);

@@ -1,0 +1,3 @@
+# Required for Owner Phrase credential enrollment and verification.
+argon2-cffi>=23.1,<26
+cryptography>=42,<48

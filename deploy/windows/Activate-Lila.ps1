@@ -5,7 +5,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$repoRoot = (Get-Item -LiteralPath (Join-Path $PSScriptRoot '..\..')).FullName
 $project = Join-Path $repoRoot 'windows\Lila.Desktop\Lila.Desktop.csproj'
 $installRoot = Join-Path $env:LOCALAPPDATA 'LilaDesktop\VoiceInput\app'
 $markerPath = Join-Path $installRoot '.lila-voice-input-install.json'
@@ -93,5 +93,5 @@ try {
 
 Write-Output "Installed Lila Desktop to '$installRoot'."
 Write-Output 'Windows startup registration was not changed. Enable it explicitly in Lila Settings if desired.'
-Write-Output 'Run the Linux activation script from the WSL checkout to install the user service.'
+Write-Output 'For complete first-time setup, run .\deploy\windows\Setup-Lila.ps1 from the repository root.'
 Write-Output "To remove this deployment only: .\deploy\windows\Activate-Lila.ps1 -Deactivate"

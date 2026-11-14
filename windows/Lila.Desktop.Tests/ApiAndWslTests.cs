@@ -2,6 +2,8 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using Lila.Desktop.Core.Api;
 using Lila.Desktop.Core.Security;
 using Lila.Desktop.Core.Wsl;
@@ -11,6 +13,26 @@ namespace Lila.Desktop.Tests;
 
 public sealed class ApiAndWslTests
 {
+    [Fact]
+    public void PinnedDaemonIdentityAcceptsOnlyCurrentCertificateWithExactSha256Pin()
+    {
+        using var rsa = RSA.Create(2048);
+        var request = new CertificateRequest("CN=Lila test daemon", rsa,
+            HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        using var certificate = request.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow.AddMinutes(5));
+        var pin = Convert.ToHexString(SHA256.HashData(certificate.RawData));
+
+        Assert.True(LilaMutualTlsHandler.IsPinnedServerCertificate(certificate, pin));
+        Assert.False(LilaMutualTlsHandler.IsPinnedServerCertificate(certificate, new string('0', 64)));
+        Assert.False(LilaMutualTlsHandler.IsPinnedServerCertificate(null, pin));
+
+        using var expired = request.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddMinutes(-10), DateTimeOffset.UtcNow.AddMinutes(-5));
+        var expiredPin = Convert.ToHexString(SHA256.HashData(expired.RawData));
+        Assert.False(LilaMutualTlsHandler.IsPinnedServerCertificate(expired, expiredPin));
+    }
+
     [Fact]
     public void JsonContentHasUnknownLengthAndWouldBeChunkedByHttp11()
     {
@@ -47,7 +69,7 @@ public sealed class ApiAndWslTests
 
         Assert.Equal("Bearer", captured!.Headers.Authorization!.Scheme);
         Assert.Equal(secret, captured.Headers.Authorization.Parameter);
-        Assert.Equal(new Uri("http://127.0.0.1:8765/health"), captured.RequestUri);
+        Assert.Equal(new Uri("https://127.0.0.1:8765/health"), captured.RequestUri);
         Assert.DoesNotContain(secret, captured.RequestUri!.ToString());
         Assert.True(health.VoiceEnabled);
     }
@@ -82,6 +104,80 @@ public sealed class ApiAndWslTests
         Assert.Null(transferEncoding);
         Assert.Equal("{\"text\":\"hey\"}", body);
         Assert.Equal(Encoding.UTF8.GetByteCount(body!), contentLength);
+    }
+
+    [Fact]
+    public async Task IslandLoadsPendingApprovalFromAuthoritativeDaemonState()
+    {
+        var handler = new StubHandler((_, _) => Task.FromResult(JsonResponse(
+            "{\"requests\":[{\"invocation_id\":\"inv-1\",\"status\":\"pending\",\"capability_id\":\"files.write\",\"contract_version\":\"1\",\"operation_digest\":\"" + new string('a', 64) + "\",\"challenge_id\":\"ch-1\",\"key_id\":\"owner-key\",\"target\":{\"path\":\"/tmp/out.txt\"},\"arguments\":{\"path\":\"/tmp/out.txt\",\"token\":\"[REDACTED]\"},\"policy_reason\":\"policy.approval_required\",\"policy_detail\":\"Review this operation\",\"risk\":\"high\",\"expires_in_seconds\":12.5}]}")));
+        using var http = NewHttpClient(handler);
+        var api = new LilaApiClient(http, new FakeCredentialStore("daemon-bearer"));
+
+        var result = await api.GetPendingApprovalsAsync();
+
+        Assert.Single(result.Requests);
+        Assert.Equal("inv-1", result.Requests[0].InvocationId);
+        Assert.Equal(12.5, result.Requests[0].ExpiresInSeconds);
+        Assert.Equal("/approvals", handler.LastUri!.AbsolutePath);
+    }
+
+    [Fact]
+    public async Task IslandDecisionSubmitsExactIdsWithoutOwnerProofAndDoesNotAssumeApproval()
+    {
+        string? body = null;
+        var handler = new StubHandler(async (request, token) =>
+        {
+            body = await request.Content!.ReadAsStringAsync(token);
+            return new HttpResponseMessage(HttpStatusCode.Forbidden)
+            {
+                Content = new StringContent("{\"error\":\"A separate owner decision proof is required.\",\"code\":\"approval.owner_authentication_required\"}", Encoding.UTF8, "application/json")
+            };
+        });
+        using var http = NewHttpClient(handler);
+        var api = new LilaApiClient(http, new FakeCredentialStore("daemon-bearer"));
+        var view = new ApprovalRequestView("inv-2", "pending", "files.write", "1",
+            new string('b', 64), "challenge-2", "123456", "owner-key", "file", "test.path", null,
+            JsonDocument.Parse("{\"path\":\"/tmp/out.txt\"}").RootElement,
+            "policy.approval_required", "Review", "high", 10);
+
+        var error = await Assert.ThrowsAsync<LilaApiException>(() => api.SubmitApprovalDecisionAsync(view, "approve"));
+
+        Assert.Equal(LilaApiFailureKind.Service, error.Kind);
+        Assert.Equal(new Uri("https://127.0.0.1:8765/approvals/inv-2/decision"), handler.LastUri);
+        using var payload = JsonDocument.Parse(body!);
+        Assert.Equal("challenge-2", payload.RootElement.GetProperty("challenge_id").GetString());
+        Assert.Equal(new string('b', 64), payload.RootElement.GetProperty("operation_digest").GetString());
+        Assert.Equal("approve", payload.RootElement.GetProperty("decision").GetString());
+        Assert.False(payload.RootElement.TryGetProperty("proof", out _));
+    }
+
+    [Fact]
+    public async Task TypedOwnerDecisionUsesDedicatedOiaRouteAndDoesNotManufactureProof()
+    {
+        string? body = null;
+        var handler = new StubHandler(async (request, token) =>
+        {
+            body = await request.Content!.ReadAsStringAsync(token);
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{\"invocation_id\":\"inv-2\",\"status\":\"approved\",\"reason_code\":\"approval.approved\"}", Encoding.UTF8, "application/json")
+            };
+        });
+        using var http = NewHttpClient(handler);
+        var api = new LilaApiClient(http, new FakeCredentialStore("daemon-bearer"));
+        var view = new ApprovalRequestView("inv-2", "pending", "files.write", "1",
+            new string('b', 64), "challenge-2", "123456", "owner-key", "file", "test.path", null,
+            JsonDocument.Parse("{\"path\":\"/tmp/out.txt\"}").RootElement,
+            "policy.approval_required", "Review", "high", 10);
+
+        await api.SubmitOwnerDecisionAsync(view, "approve", "private phrase");
+
+        Assert.Equal(new Uri("https://127.0.0.1:8765/owner/approvals/inv-2/decision"), handler.LastUri);
+        using var payload = JsonDocument.Parse(body!);
+        Assert.Equal("private phrase", payload.RootElement.GetProperty("phrase").GetString());
+        Assert.Equal("approve", payload.RootElement.GetProperty("decision").GetString());
+        Assert.False(payload.RootElement.TryGetProperty("proof", out _));
     }
 
     [Fact]

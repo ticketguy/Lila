@@ -4,7 +4,7 @@ set -Eeuo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  bash deploy/linux/activate-voice-input.sh [--python PATH]
+  bash deploy/linux/activate-voice-input.sh [--python PATH] [--adopt-existing] [--check-only]
   bash deploy/linux/activate-voice-input.sh --deactivate
 
 Install/remove the current user's Lila systemd voice service. No sudo is used.
@@ -16,11 +16,15 @@ EOF
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 python_path="${LILA_PYTHON:-}"
 deactivate=0
+adopt_existing=0
+check_only=0
 while (($#)); do
   case "$1" in
     --python)
       (($# >= 2)) || { echo "Missing value for --python." >&2; exit 2; }
       python_path="$2"; shift 2 ;;
+    --adopt-existing) adopt_existing=1; shift ;;
+    --check-only) check_only=1; shift ;;
     --deactivate|--uninstall) deactivate=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -78,7 +82,9 @@ if [[ -z "$python_path" || ! -x "$python_path" ]]; then
   echo "Python environment not found. Create a Linux venv or pass --python PATH." >&2
   exit 1
 fi
-python_path="$(realpath "$python_path")"
+python_dir="$(cd "$(dirname "$python_path")" && pwd -P)"
+python_path="$python_dir/$(basename "$python_path")"
+cd "$repo_root"
 
 for command_name in python3 systemctl parecord; do
   command -v "$command_name" >/dev/null || {
@@ -108,6 +114,10 @@ asr_model="${LILA_VOICE_ASR_MODEL:-$voice_home/whisper.cpp/models/ggml-parakeet-
   echo "Python dependencies are incomplete in $python_path." >&2
   exit 1
 }
+if ((check_only)); then
+  echo "Lila Linux setup prerequisites are available."
+  exit 0
+fi
 
 mkdir -p -m 700 "$lila_config" "$unit_dir"
 chmod 700 "$lila_config"
@@ -133,6 +143,28 @@ PY
   exit 1
 fi
 if [[ -e "$unit_path" ]]; then
+  if ((adopt_existing)); then
+    actual_fragment="$(systemctl --user show --property=FragmentPath --value lila.service)"
+    actual_working="$(systemctl --user show --property=WorkingDirectory --value lila.service)"
+    actual_environment="$(systemctl --user show --property=EnvironmentFiles --value lila.service)"
+    actual_exec="$(systemctl --user show --property=ExecStart --value lila.service)"
+    if [[ "$actual_fragment" != "$unit_path" ||
+          "$actual_working" != "$repo_root" ||
+          "$actual_environment" != *"$service_env"* ||
+          "$actual_exec" != *"$python_path"* ||
+          "$actual_exec" != *"src.daemon.service"* ]]; then
+      echo "The existing lila.service does not match this repository and service.env; it was left unchanged." >&2
+      exit 1
+    fi
+    systemctl --user daemon-reload
+    systemctl --user restart lila.service
+    systemctl --user is-active --quiet lila.service || {
+      echo "The matching lila.service did not become active; inspect its journal." >&2
+      exit 1
+    }
+    echo "Restarted the matching existing Lila service without replacing its unit."
+    exit 0
+  fi
   echo "A user lila.service already exists; it will not be overwritten. Inspect it and deactivate only if it was created by this script." >&2
   exit 1
 fi

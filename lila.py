@@ -5,6 +5,7 @@ import argparse
 import json
 from src.core.lilacore import LilaCore
 from src.core.runtime_lock import acquire_runtime_lock, release_runtime_lock
+from src.core.utf8 import configure_standard_streams
 
 
 def _show_activity(message):
@@ -44,6 +45,7 @@ def _approve_tool(tool, args, risk):
 
 
 def main():
+    configure_standard_streams()
     parser = argparse.ArgumentParser(description="Lila — Private Family AI")
     parser.add_argument(
         "--voice",
@@ -51,6 +53,11 @@ def main():
         help="Enable push-to-talk microphone input",
     )
     parser.add_argument("--gguf", default=None, help="Path to a GGUF model")
+    parser.add_argument(
+        "--mmproj",
+        default=None,
+        help="Path to a multimodal projector (mmproj) GGUF file",
+    )
     parser.add_argument(
         "--model",
         default=None,
@@ -69,6 +76,7 @@ def main():
         lila = LilaCore(
             model_path=args.model,
             gguf_path=args.gguf,
+            mmproj_path=args.mmproj,
             allow_remote_model=args.allow_remote_model,
             approval_callback=_approve_tool,
             activity_callback=_show_activity,
@@ -89,7 +97,7 @@ def main():
             return
 
         if args.voice:
-            from src.core.voice import LilaVoice, VoiceInputError
+            from src.vtalks import LilaVoice, VoiceInputError
             voice = LilaVoice()
             try:
                 voice.start_listening(

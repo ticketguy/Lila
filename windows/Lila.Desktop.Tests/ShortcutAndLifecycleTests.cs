@@ -86,6 +86,33 @@ public sealed class ShortcutAndLifecycleTests
     }
 
     [Fact]
+    public async Task MutingCancelsActiveCaptureAndBlocksBothVoiceShortcuts()
+    {
+        var api = new FakeVoiceApi();
+        var voice = new VoiceSessionController(api);
+        using var gate = NewGate(voice, armingDelay: TimeSpan.FromMilliseconds(20),
+            toggleDebounce: TimeSpan.Zero);
+        var keys = Interpreter();
+
+        gate.SetMuted(true);
+        gate.Handle(keys.Interpret(0x13, 0x45, 0x04, false, (nint)2)!);
+        gate.Handle(keys.Interpret(0x13, 0x45, 0x05, true, (nint)2)!);
+        gate.Handle(keys.Interpret(0xA3, 0x1D, 0x02, false, (nint)1)!);
+        await Task.Delay(50);
+        gate.Handle(keys.Interpret(0xA3, 0x1D, 0x03, true, (nint)1)!);
+        Assert.Equal(0, api.StartCount);
+
+        gate.SetMuted(false);
+        gate.Handle(keys.Interpret(0x13, 0x45, 0x04, false, (nint)2)!);
+        await WaitForAsync(() => voice.Snapshot.State == VoiceInteractionState.Recording);
+        gate.SetMuted(true);
+        await WaitForAsync(() => voice.Snapshot.State == VoiceInteractionState.Idle);
+
+        Assert.Equal(1, api.StartCount);
+        Assert.Equal(1, api.CancelCount);
+    }
+
+    [Fact]
     public async Task PauseToggleIgnoresKeyUpAndStopsOnlyOnSecondPress()
     {
         var api = new FakeVoiceApi();
@@ -177,6 +204,93 @@ public sealed class ShortcutAndLifecycleTests
         gate.NotifyDeviceRemoved((nint)1);
         await WaitForAsync(() => voice.Snapshot.State == VoiceInteractionState.Idle);
         Assert.Equal(1, api.StopCount);
+    }
+
+    [Fact]
+    public async Task RightControlSubmitsOnceAndNeverCancelsWhenRecordingIsCachedRemotely()
+    {
+        var api = new FakeVoiceApi();
+        var voice = new VoiceSessionController(api, responseDisplayDuration: TimeSpan.Zero);
+        using var gate = NewGate(voice, armingDelay: TimeSpan.FromMilliseconds(25));
+        var keys = Interpreter();
+
+        // Physical-style RawInput key-down on Right Ctrl (0xA3, scan 0x1D, E0 flag 0x02)
+        gate.Handle(keys.Interpret(0xA3, 0x1D, 0x02, false, (nint)1)!);
+        await WaitForAsync(() => voice.Snapshot.State == VoiceInteractionState.Recording);
+
+        // Simulate RefreshVoiceStatusAsync + ApplyAvailability polling while recording is cached remotely
+        var cachedRemote = new VoiceSessionStatus("recording", "test-session", 1.2, null);
+        gate.ApplyRuntimeState(serviceReady: true, cachedRemote);
+        gate.ApplyRuntimeState(serviceReady: true, cachedRemote);
+        Assert.Equal(VoiceInteractionState.Recording, voice.Snapshot.State);
+        Assert.Equal(0, api.CancelCount);
+
+        // Physical-style RawInput key-up on Right Ctrl submits once with zero cancels
+        gate.Handle(keys.Interpret(0xA3, 0x1D, 0x03, true, (nint)1)!);
+        await WaitForAsync(() => voice.Snapshot.State == VoiceInteractionState.Idle);
+        Assert.Equal(1, api.StartCount);
+        Assert.Equal(1, api.StopCount);
+        Assert.Equal(0, api.CancelCount);
+    }
+
+    [Fact]
+    public async Task FnPauseToggleSubmitsOnceAndNeverCancelsWhenRecordingIsCachedRemotely()
+    {
+        var api = new FakeVoiceApi();
+        var voice = new VoiceSessionController(api, responseDisplayDuration: TimeSpan.Zero);
+        using var gate = NewGate(voice, toggleDebounce: TimeSpan.Zero);
+        var keys = Interpreter();
+
+        // First Fn+P / Pause pulse (down + immediate up) starts ToggleToTalk recording
+        gate.Handle(keys.Interpret(0x13, 0x45, 0x04, false, (nint)2)!);
+        gate.Handle(keys.Interpret(0x13, 0x45, 0x05, true, (nint)2)!);
+        await WaitForAsync(() => voice.Snapshot.State == VoiceInteractionState.Recording);
+
+        // Simulate RefreshVoiceStatusAsync + ApplyAvailability polling while recording is cached remotely
+        var cachedRemote = new VoiceSessionStatus("recording", "test-session", 2.4, null);
+        gate.ApplyRuntimeState(serviceReady: true, cachedRemote);
+        gate.ApplyRuntimeState(serviceReady: true, cachedRemote);
+        Assert.Equal(VoiceInteractionState.Recording, voice.Snapshot.State);
+        Assert.Equal(0, api.CancelCount);
+
+        // Second Fn+P / Pause pulse stops and submits the recording once with zero cancels
+        gate.Handle(keys.Interpret(0x13, 0x45, 0x04, false, (nint)2)!);
+        gate.Handle(keys.Interpret(0x13, 0x45, 0x05, true, (nint)2)!);
+        await WaitForAsync(() => voice.Snapshot.State == VoiceInteractionState.Idle);
+        Assert.Equal(1, api.StartCount);
+        Assert.Equal(1, api.StopCount);
+        Assert.Equal(0, api.CancelCount);
+    }
+
+    [Fact]
+    public async Task UnownedRemoteRecordingBlocksNewStartWithoutCallingCancel()
+    {
+        var api = new FakeVoiceApi();
+        var voice = new VoiceSessionController(api, responseDisplayDuration: TimeSpan.Zero);
+        using var gate = NewGate(voice, armingDelay: TimeSpan.FromMilliseconds(20), toggleDebounce: TimeSpan.Zero);
+        var keys = Interpreter();
+
+        // An external session is active remotely while local controller is Idle
+        gate.ApplyRuntimeState(serviceReady: true, new VoiceSessionStatus("recording", "foreign-session", 0.5, null));
+        gate.Handle(keys.Interpret(0x13, 0x45, 0x04, false, (nint)2)!);
+        gate.Handle(keys.Interpret(0x13, 0x45, 0x05, true, (nint)2)!);
+        gate.Handle(keys.Interpret(0xA3, 0x1D, 0x02, false, (nint)1)!);
+        await Task.Delay(40);
+        gate.Handle(keys.Interpret(0xA3, 0x1D, 0x03, true, (nint)1)!);
+        Assert.Equal(0, api.StartCount);
+        Assert.Equal(0, api.CancelCount);
+
+        // Once remote status returns to idle, shortcuts start and submit normally
+        gate.ApplyRuntimeState(serviceReady: true, new VoiceSessionStatus("idle", null, null, null));
+        gate.Handle(keys.Interpret(0x13, 0x45, 0x04, false, (nint)2)!);
+        gate.Handle(keys.Interpret(0x13, 0x45, 0x05, true, (nint)2)!);
+        await WaitForAsync(() => voice.Snapshot.State == VoiceInteractionState.Recording);
+        gate.Handle(keys.Interpret(0x13, 0x45, 0x04, false, (nint)2)!);
+        gate.Handle(keys.Interpret(0x13, 0x45, 0x05, true, (nint)2)!);
+        await WaitForAsync(() => voice.Snapshot.State == VoiceInteractionState.Idle);
+        Assert.Equal(1, api.StartCount);
+        Assert.Equal(1, api.StopCount);
+        Assert.Equal(0, api.CancelCount);
     }
 
     [Fact]

@@ -9,8 +9,9 @@ import unittest
 from http.server import ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
+from src.core.lilacore import LilaResponse
 from src.daemon.service import LilaDaemon, _make_api_handler
 from src.core.voice import MicrophoneError
 
@@ -55,9 +56,17 @@ class ServiceVoiceApiTests(unittest.TestCase):
         self.daemon = LilaDaemon(voice=True, api_token=TOKEN)
         self.daemon._service_state = "running"
         self.daemon._running = True
-        self.daemon.lila = SimpleNamespace(gguf_path="mock-model")
+        self.core = SimpleNamespace(
+            gguf_path="mock-model",
+            think=Mock(return_value=LilaResponse(
+                text="Lila response",
+                memory_ops=[],
+                actions=[],
+                confidence=1.0,
+            )),
+        )
+        self.daemon.lila = self.core
         self.daemon._voice = FakeVoice()
-        self.daemon.process_input = Mock(return_value="Lila response")
         self.server = ThreadingHTTPServer(
             ("127.0.0.1", 0), _make_api_handler(self.daemon, TOKEN)
         )
@@ -119,7 +128,7 @@ class ServiceVoiceApiTests(unittest.TestCase):
         self.assertEqual(response.status, 400)
         self.assertEqual(payload["code"], "chunked_body_unsupported")
         self.assertIn("Content-Length", payload["error"])
-        self.daemon.process_input.assert_not_called()
+        self.core.think.assert_not_called()
 
     def test_invalid_json_has_a_specific_error(self):
         status, payload = self.request_raw("/chat", b"{")
@@ -143,7 +152,7 @@ class ServiceVoiceApiTests(unittest.TestCase):
         status, empty = self.request_raw("/chat", b'{"text":"  "}')
         self.assertEqual(status, 400)
         self.assertEqual(empty["code"], "empty_field_value")
-        self.daemon.process_input.assert_not_called()
+        self.core.think.assert_not_called()
 
     def test_voice_start_requires_an_empty_json_object(self):
         status, payload = self.request_raw("/voice/start", b'{"unexpected":true}')
@@ -160,7 +169,7 @@ class ServiceVoiceApiTests(unittest.TestCase):
         self.assertEqual(status, 502)
         self.assertEqual(payload["code"], "empty_or_invalid_recording")
         self.assertNotIn("/private/path.wav", payload["error"])
-        self.daemon.process_input.assert_not_called()
+        self.core.think.assert_not_called()
 
     def test_invalid_voice_transition_has_a_safe_conflict_error(self):
         status, payload = self.request_raw(
@@ -174,7 +183,7 @@ class ServiceVoiceApiTests(unittest.TestCase):
         status, payload = self.request_raw("/chat", b'{"text":"hey"}', "text/plain")
         self.assertEqual(status, 415)
         self.assertEqual(payload["code"], "unsupported_media_type")
-        self.daemon.process_input.assert_not_called()
+        self.core.think.assert_not_called()
 
     def test_authenticated_health_reports_readiness(self):
         status, payload = self.request("/health")
@@ -187,23 +196,29 @@ class ServiceVoiceApiTests(unittest.TestCase):
         self.assertEqual(started["session_id"], "session-1")
         _, completed = self.request("/voice/stop", {"session_id": "session-1"})
         self.assertEqual(completed["transcript"], TRANSCRIPT)
-        self.daemon.process_input.assert_called_once_with(TRANSCRIPT)
+        self.core.think.assert_called_once_with(TRANSCRIPT)
         self.assertEqual(completed["response"], "Lila response")
+
+        status, replay = self.request_raw(
+            "/voice/stop", json.dumps({"session_id": "session-1"}).encode()
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(replay["code"], "voice_session_conflict")
+        self.core.think.assert_called_once_with(TRANSCRIPT)
 
     def test_voice_cancel_does_not_deliver_transcript(self):
         self.request("/voice/start", {})
         _, result = self.request("/voice/cancel", {"session_id": "session-1"})
         self.assertEqual(result["state"], "cancelled")
-        self.daemon.process_input.assert_not_called()
+        self.core.think.assert_not_called()
 
     def test_stop_requires_session_id(self):
         with self.assertRaises(HTTPError) as raised:
             self.request("/voice/stop", {})
         self.assertEqual(raised.exception.code, 400)
-        self.daemon.process_input.assert_not_called()
+        self.core.think.assert_not_called()
 
     def test_concurrent_text_calls_are_serialized_through_one_core(self):
-        del self.daemon.process_input
         state_lock = threading.Lock()
         active = 0
         maximum_active = 0
@@ -259,7 +274,8 @@ class ServiceVoiceApiTests(unittest.TestCase):
                         daemon.start()
 
         factory.assert_called_once_with(
-            gguf_path=model, approval_callback=None, allow_remote_model=False
+            gguf_path=model, approval_callback=None, allow_remote_model=False,
+            approval_service_factory=ANY,
         )
         core.boot.assert_called_once()
 

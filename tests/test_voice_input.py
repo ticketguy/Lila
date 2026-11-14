@@ -439,6 +439,27 @@ class VoiceInputTests(unittest.TestCase):
         core.think.assert_called_once_with(RAW_TRANSCRIPT)
         voice.speak.assert_called_once_with("Lila response")
 
+    def test_private_auth_transcription_uses_existing_asr_and_deletes_auth_audio(self):
+        audio_path = self.root / "private-auth.wav"
+        write_wav(audio_path)
+        transcript = "private phrase must not persist"
+        transcriber = Mock(transcribe=Mock(return_value=transcript))
+        voice = self.voice(transcriber)
+        process = Mock()
+        voice._session_id = "private-session"
+        voice._session_state = "recording"
+        voice._session_private = True
+        voice._session_audio_path = audio_path
+        voice._capture_process = process
+        with patch.object(voice, "_stop_capture_process"), patch.object(voice, "_validate_audio_file"):
+            result = voice.stop_private_session("private-session")
+
+        self.assertEqual(result, transcript)
+        transcriber.transcribe.assert_called_once_with(audio_path)
+        self.assertFalse(audio_path.exists())
+        self.assertFalse(audio_path.with_name("private-auth.transcript.txt").exists())
+        self.assertEqual(voice.get_session_status()["state"], "completed")
+
     def test_default_voice_assets_and_recordings_stay_outside_git_checkout(self):
         config = VoiceConfig()
         repo_root = Path(__file__).resolve().parents[1]
@@ -464,6 +485,75 @@ class VoiceInputTests(unittest.TestCase):
         self.assertEqual(config.asr_model, self.root / "models" / "custom.bin")
         self.assertEqual(config.capture_device, "custom.source")
         self.assertEqual(config.recordings_dir, self.root / "private-recordings")
+
+    def test_live_voice_stream_chunks_speech_emits_callbacks_and_writes_wav(self):
+        import io
+        import wave
+        import numpy as np
+        from src.vtalks.session import _LiveVoiceStream
+
+        sr = 16_000
+        t = np.linspace(0, 0.5, int(sr * 0.5), endpoint=False)
+        speech = (0.25 * np.sin(2 * np.pi * 440.0 * t) * 32767.0).astype(np.int16)
+        silence = np.zeros(int(sr * 0.7), dtype=np.int16)
+        pcm_stream = io.BytesIO(speech.tobytes() + silence.tobytes())
+
+        fake_proc = Mock()
+        fake_proc.stdout = pcm_stream
+
+        class PcmTranscriber:
+            def __init__(self):
+                self.chunks = []
+
+            def transcribe(self, audio_path):
+                raise AssertionError("full-file transcribe should not be needed")
+
+            def transcribe_pcm(self, samples):
+                self.chunks.append(len(samples))
+                return "hello lila"
+
+        transcriber = PcmTranscriber()
+        events = []
+        audio_path = self.root / "streamed.wav"
+        stream = _LiveVoiceStream(
+            process=fake_proc,
+            audio_path=audio_path,
+            transcriber=transcriber,
+            sample_rate=sr,
+            chunk_seconds=4.0,
+            silence_seconds=0.6,
+            rms_threshold=0.015,
+            on_transcript=lambda chunk, acc, final: events.append((chunk, acc, final)),
+        )
+        stream.start()
+        combined = stream.finish(timeout_seconds=5.0)
+
+        self.assertEqual(combined, "hello lila")
+        self.assertEqual(len(transcriber.chunks), 1)
+        self.assertEqual(events, [("hello lila", "hello lila", False)])
+        with wave.open(str(audio_path), "rb") as wav:
+            self.assertEqual(wav.getnchannels(), 1)
+            self.assertEqual(wav.getsampwidth(), 2)
+            self.assertEqual(wav.getframerate(), sr)
+            self.assertGreater(wav.getnframes(), 0)
+
+    def test_private_session_never_streams_live_transcripts(self):
+        class DualTranscriber:
+            def transcribe(self, audio_path):
+                return "secret passphrase"
+
+            def transcribe_pcm(self, samples):
+                raise AssertionError("private session must never call transcribe_pcm")
+
+        voice = self.voice(transcriber=DualTranscriber())
+        voice.config.live_transcription = True
+        with patch.object(voice._capture, "start_raw", side_effect=AssertionError("must not stream raw")):
+            with patch("src.core.voice.subprocess.Popen", side_effect=FakeCaptureProcess):
+                with patch("src.core.voice.time.sleep"):
+                    started = voice.start_private_session()
+                    result = voice.stop_private_session(started["session_id"])
+
+        self.assertEqual(result, "secret passphrase")
 
 
 if __name__ == "__main__":

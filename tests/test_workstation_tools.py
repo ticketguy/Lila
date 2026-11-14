@@ -109,6 +109,7 @@ class WorkstationToolsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tool_registry = get_registry()
         self.previous_tools = dict(self.tool_registry._tools)
+        self.tool_registry._tools.clear()
         register_workstation_tools()
 
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -321,10 +322,12 @@ class WorkstationToolsTests(unittest.TestCase):
         )[0]
 
         self.assertFalse(result["result"].success)
-        self.assertEqual(result["record"].permission_decision, "denied")
+        self.assertEqual(result["record"].permission_decision, "approval_unavailable")
+        self.assertEqual(result["approval"].status.value, "unavailable")
         self.assertFalse(target.exists())
 
     def test_lilacore_registers_tools_and_includes_awareness_guidance(self) -> None:
+        self.tool_registry._tools.clear()
         core = LilaCore.__new__(LilaCore)
         core.workspace_root = Path(self.temp_dir.name)
         core.log_dir = Path(self.temp_dir.name) / "logs"
@@ -349,8 +352,7 @@ class WorkstationToolsTests(unittest.TestCase):
         ):
             core = LilaCore(api_mode=True)
         self.assertFalse(core.workstation_enabled)
-        for name in WORKSTATION_TOOL_NAMES:
-            self.tool_registry._tools.pop(name, None)
+        self.tool_registry._tools.clear()
         core._harness = None
         core._conversation_history = []
         core._boot_harness()

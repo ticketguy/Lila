@@ -1,0 +1,13 @@
+# Canonical Python runtime and test dependencies for Lila & Harness (M2 Area F).
+# Install in a fresh virtual environment with:
+#   python3 -m venv ../environment/.venv
+#   ../environment/.venv/bin/pip install -r requirements.txt
+
+-r requirements-oia.txt
+
+# Local GGUF inference & prompt templating
+llama-cpp-python>=0.3.0,<0.4.0
+numpy>=2.0.0,<3.0.0
+Jinja2>=3.1.0,<4.0.0
+PyYAML>=6.0.0,<7.0.0
+huggingface_hub>=2.0.0,<3.0.0

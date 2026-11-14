@@ -124,7 +124,9 @@ void lila_free_model(LilaModel *model) {
     if (model->mmap_addr) {
         model_munmap(model->mmap_addr, model->mmap_size);
     }
-    /* Free KV cache */
+    /* Free scratch + KV cache */
+    extern void lila_free_scratch(LilaModel *model);
+    lila_free_scratch(model);
     free(model->kv_cache.key_cache);
     free(model->kv_cache.value_cache);
     free(model);

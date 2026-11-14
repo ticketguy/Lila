@@ -1,3 +1,4 @@
+using Lila.Desktop.Core.Api;
 using Lila.Desktop.Core.Voice;
 
 namespace Lila.Desktop.Core.Keyboard;
@@ -31,6 +32,7 @@ public sealed class GlobalVoiceShortcutController : IDisposable
     private long _lastToggleTimestamp;
     private bool _armingSuppressed;
     private bool _rightControlStarted;
+    private bool _muted;
     private bool _ready;
     private bool _disposed;
 
@@ -71,6 +73,25 @@ public sealed class GlobalVoiceShortcutController : IDisposable
         private set => _activeSource = value;
     }
     public TimeSpan ArmingDelay => _armingDelay;
+    public event Action? MutedShortcutAttempted;
+    public bool IsMuted
+    {
+        get { lock (_sync) return _muted; }
+    }
+
+    public void SetMuted(bool muted)
+    {
+        lock (_sync)
+        {
+            if (_muted == muted)
+                return;
+            _muted = muted;
+            if (muted)
+                ResetArmingLocked();
+        }
+        if (muted)
+            _voice.CancelActive();
+    }
 
     public void SetReady(bool ready)
     {
@@ -82,6 +103,12 @@ public sealed class GlobalVoiceShortcutController : IDisposable
         }
         if (!ready)
             _voice.OnServiceUnavailable();
+    }
+
+    public void ApplyRuntimeState(bool serviceReady, VoiceSessionStatus? remoteStatus)
+    {
+        _voice.ObserveRemoteStatus(remoteStatus);
+        SetReady(serviceReady && !_voice.IsRemoteVoiceDisabled);
     }
 
     public void Handle(InterpretedKeyEvent input)
@@ -96,8 +123,19 @@ public sealed class GlobalVoiceShortcutController : IDisposable
                 _voice.CancelActive();
                 return;
             }
-            if (!_ready)
+            if (!_ready || _muted)
+            {
+                if (_muted && input.Kind == ShortcutEventKind.ShortcutDown && !input.RawEvent.IsRepeat)
+                {
+                    var pressedKey = input.RawEvent.VirtualKey;
+                    if ((_holdEnabled && pressedKey == _holdBinding.VirtualKey) ||
+                        (_toggleEnabled && pressedKey == _toggleBinding.VirtualKey))
+                    {
+                        Task.Run(() => MutedShortcutAttempted?.Invoke());
+                    }
+                }
                 return;
+            }
 
             var key = input.RawEvent.VirtualKey;
             if (_holdEnabled && key == _holdBinding.VirtualKey)
@@ -141,10 +179,14 @@ public sealed class GlobalVoiceShortcutController : IDisposable
     {
         lock (_sync)
         {
-            if (!_ready || _disposed)
+            if (!_ready || _muted || _disposed)
                 return;
             if (ActiveSource is null)
+            {
+                if (!_voice.CanStartNewSession)
+                    return;
                 ActiveSource = VoiceShortcutSource.StartButton;
+            }
         }
         _voice.ToggleFromUi();
     }
@@ -159,7 +201,8 @@ public sealed class GlobalVoiceShortcutController : IDisposable
     {
         if (input.Kind == ShortcutEventKind.ShortcutDown)
         {
-            if (input.RawEvent.IsRepeat || _rightControlIdentity is not null || ActiveSource is not null)
+            if (input.RawEvent.IsRepeat || _rightControlIdentity is not null || ActiveSource is not null ||
+                !_voice.CanStartNewSession)
                 return;
             _rightControlIdentity = input.RawEvent.Identity;
             _rightControlDown = input;
@@ -200,6 +243,8 @@ public sealed class GlobalVoiceShortcutController : IDisposable
 
         if (ActiveSource is null)
         {
+            if (!_voice.CanStartNewSession)
+                return;
             ActiveSource = VoiceShortcutSource.FnPAndPauseToggle;
             _voice.Mode = PushToTalkMode.ToggleToTalk;
             _voice.Handle(input);
@@ -220,7 +265,7 @@ public sealed class GlobalVoiceShortcutController : IDisposable
             {
                 if (_disposed || !_ready || token.IsCancellationRequested ||
                     _armingSuppressed || _rightControlIdentity != down.RawEvent.Identity ||
-                    ActiveSource is not null)
+                    ActiveSource is not null || !_voice.CanStartNewSession)
                     return;
                 _rightControlStarted = true;
                 ActiveSource = VoiceShortcutSource.HoldToTalk;

@@ -40,7 +40,7 @@ public sealed class ManagedWslKeepAlive : IWslKeepAlive
             };
             foreach (var argument in new[]
                      {
-                         "--distribution", distribution, "--exec", "/bin/sh", "-c",
+                         "--distribution", distribution, "/bin/sh", "-c",
                          "IFS= read -r _ || :"
                      })
                 start.ArgumentList.Add(argument);
