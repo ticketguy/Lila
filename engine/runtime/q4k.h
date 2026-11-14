@@ -982,36 +982,58 @@ static inline void q6k_dot2_q8k_avx2(const uint8_t *r0, const uint8_t *r1,
             __m256i ql01 = _mm256_loadu_si256((const __m256i *)(ql0_h + 32));
             __m256i qh00 = _mm256_loadu_si256((const __m256i *)qh0_h);
 
+            __m256i u0 = _mm256_or_si256(_mm256_and_si256(ql00, mask_0f), _mm256_slli_epi16(_mm256_and_si256(qh00, mask_03), 4));
+            __m256i xv0 = _mm256_loadu_si256((const __m256i *)(xb->qs + (sb_base + 0) * 32));
+            __m256i sv0 = _mm256_set_m128i(_mm_set1_epi16((int16_t)sc0_h[1]), _mm_set1_epi16((int16_t)sc0_h[0]));
+            sumi0 = _mm256_add_epi32(sumi0, _mm256_madd_epi16(_mm256_maddubs_epi16(u0, xv0), sv0));
+
+            u0 = _mm256_or_si256(_mm256_and_si256(ql01, mask_0f), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh00, 2), mask_03), 4));
+            __m256i xv1 = _mm256_loadu_si256((const __m256i *)(xb->qs + (sb_base + 1) * 32));
+            sv0 = _mm256_set_m128i(_mm_set1_epi16((int16_t)sc0_h[3]), _mm_set1_epi16((int16_t)sc0_h[2]));
+            sumi0 = _mm256_add_epi32(sumi0, _mm256_madd_epi16(_mm256_maddubs_epi16(u0, xv1), sv0));
+
+            u0 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql00, 4), mask_0f), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh00, 4), mask_03), 4));
+            __m256i xv2 = _mm256_loadu_si256((const __m256i *)(xb->qs + (sb_base + 2) * 32));
+            sv0 = _mm256_set_m128i(_mm_set1_epi16((int16_t)sc0_h[5]), _mm_set1_epi16((int16_t)sc0_h[4]));
+            sumi0 = _mm256_add_epi32(sumi0, _mm256_madd_epi16(_mm256_maddubs_epi16(u0, xv2), sv0));
+
+            u0 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql01, 4), mask_0f), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh00, 6), mask_03), 4));
+            __m256i xv3 = _mm256_loadu_si256((const __m256i *)(xb->qs + (sb_base + 3) * 32));
+            sv0 = _mm256_set_m128i(_mm_set1_epi16((int16_t)sc0_h[7]), _mm_set1_epi16((int16_t)sc0_h[6]));
+            sumi0 = _mm256_add_epi32(sumi0, _mm256_madd_epi16(_mm256_maddubs_epi16(u0, xv3), sv0));
+
+            __m128i sc8_0 = _mm_cvtepi8_epi16(_mm_loadl_epi64((const __m128i *)sc0_h));
+            __m128i bs128 = _mm_loadu_si128((const __m128i *)(xb->bsums + sb_base * 2));
+            __m128i bp0 = _mm_madd_epi16(sc8_0, bs128);
+            __m128i bp0_hi = _mm_unpackhi_epi64(bp0, bp0);
+            __m128i bp0_64 = _mm_add_epi32(bp0, bp0_hi);
+            sbias0 += _mm_cvtsi128_si32(_mm_add_epi32(bp0_64, _mm_shuffle_epi32(bp0_64, _MM_SHUFFLE(1, 1, 1, 1))));
+
             __m256i ql10 = _mm256_loadu_si256((const __m256i *)(ql1_h + 0));
             __m256i ql11 = _mm256_loadu_si256((const __m256i *)(ql1_h + 32));
             __m256i qh10 = _mm256_loadu_si256((const __m256i *)qh1_h);
 
-            __m256i u0[4], u1[4];
-            u0[0] = _mm256_or_si256(_mm256_and_si256(ql00, mask_0f), _mm256_slli_epi16(_mm256_and_si256(qh00, mask_03), 4));
-            u0[1] = _mm256_or_si256(_mm256_and_si256(ql01, mask_0f), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh00, 2), mask_03), 4));
-            u0[2] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql00, 4), mask_0f), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh00, 4), mask_03), 4));
-            u0[3] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql01, 4), mask_0f), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh00, 6), mask_03), 4));
+            __m256i u1 = _mm256_or_si256(_mm256_and_si256(ql10, mask_0f), _mm256_slli_epi16(_mm256_and_si256(qh10, mask_03), 4));
+            __m256i sv1 = _mm256_set_m128i(_mm_set1_epi16((int16_t)sc1_h[1]), _mm_set1_epi16((int16_t)sc1_h[0]));
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(_mm256_maddubs_epi16(u1, xv0), sv1));
 
-            u1[0] = _mm256_or_si256(_mm256_and_si256(ql10, mask_0f), _mm256_slli_epi16(_mm256_and_si256(qh10, mask_03), 4));
-            u1[1] = _mm256_or_si256(_mm256_and_si256(ql11, mask_0f), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh10, 2), mask_03), 4));
-            u1[2] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql10, 4), mask_0f), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh10, 4), mask_03), 4));
-            u1[3] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql11, 4), mask_0f), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh10, 6), mask_03), 4));
+            u1 = _mm256_or_si256(_mm256_and_si256(ql11, mask_0f), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh10, 2), mask_03), 4));
+            sv1 = _mm256_set_m128i(_mm_set1_epi16((int16_t)sc1_h[3]), _mm_set1_epi16((int16_t)sc1_h[2]));
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(_mm256_maddubs_epi16(u1, xv1), sv1));
 
-            for (int q = 0; q < 4; q++) {
-                int sb = sb_base + q;
-                __m256i xv = _mm256_loadu_si256((const __m256i *)(xb->qs + sb * 32));
-                int16_t b0_s = xb->bsums[sb * 2 + 0], b1_s = xb->bsums[sb * 2 + 1];
+            u1 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql10, 4), mask_0f), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh10, 4), mask_03), 4));
+            sv1 = _mm256_set_m128i(_mm_set1_epi16((int16_t)sc1_h[5]), _mm_set1_epi16((int16_t)sc1_h[4]));
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(_mm256_maddubs_epi16(u1, xv2), sv1));
 
-                int16_t s00 = (int16_t)sc0_h[q * 2 + 0], s01 = (int16_t)sc0_h[q * 2 + 1];
-                __m256i sv0 = _mm256_set_epi16(s01,s01,s01,s01,s01,s01,s01,s01, s00,s00,s00,s00,s00,s00,s00,s00);
-                sumi0 = _mm256_add_epi32(sumi0, _mm256_madd_epi16(_mm256_maddubs_epi16(u0[q], xv), sv0));
-                sbias0 += (int32_t)s00 * b0_s + (int32_t)s01 * b1_s;
+            u1 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql11, 4), mask_0f), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh10, 6), mask_03), 4));
+            sv1 = _mm256_set_m128i(_mm_set1_epi16((int16_t)sc1_h[7]), _mm_set1_epi16((int16_t)sc1_h[6]));
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(_mm256_maddubs_epi16(u1, xv3), sv1));
 
-                int16_t s10 = (int16_t)sc1_h[q * 2 + 0], s11 = (int16_t)sc1_h[q * 2 + 1];
-                __m256i sv1 = _mm256_set_epi16(s11,s11,s11,s11,s11,s11,s11,s11, s10,s10,s10,s10,s10,s10,s10,s10);
-                sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(_mm256_maddubs_epi16(u1[q], xv), sv1));
-                sbias1 += (int32_t)s10 * b0_s + (int32_t)s11 * b1_s;
-            }
+            __m128i sc8_1 = _mm_cvtepi8_epi16(_mm_loadl_epi64((const __m128i *)sc1_h));
+            __m128i bp1 = _mm_madd_epi16(sc8_1, bs128);
+            __m128i bp1_hi = _mm_unpackhi_epi64(bp1, bp1);
+            __m128i bp1_64 = _mm_add_epi32(bp1, bp1_hi);
+            sbias1 += _mm_cvtsi128_si32(_mm_add_epi32(bp1_64, _mm_shuffle_epi32(bp1_64, _MM_SHUFFLE(1, 1, 1, 1))));
         }
         float xd0 = d0 * xb->d, xd1 = d1 * xb->d;
         sum_vec0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi0), _mm256_set1_ps(xd0), sum_vec0);
@@ -1170,16 +1192,15 @@ static inline void q4k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
 #elif defined(__AVX2__)
     const __m256i mask_0f = _mm256_set1_epi8(0x0F);
 
-    for (int i = row_start; i < row_end; i++) {
-        const uint8_t *row_ptr = weight_data + (size_t)i * row_bytes;
-        if (i + 2 < row_end) {
-            LILA_PREFETCH(row_ptr + 2 * row_bytes);
-        }
-        for (int t0 = 0; t0 < n_tokens; t0 += 32) {
-            int nt = n_tokens - t0;
-            if (nt > 32) nt = 32;
-            float acc[32];
-            for (int t = 0; t < nt; t++) acc[t] = 0.0f;
+    int t0 = 0;
+    for (; t0 + 7 < n_tokens; t0 += 8) {
+        for (int i = row_start; i < row_end; i++) {
+            const uint8_t *row_ptr = weight_data + (size_t)i * row_bytes;
+            if (i + 2 < row_end) {
+                LILA_PREFETCH(row_ptr + 2 * row_bytes);
+            }
+            _Alignas(32) float sv[8][8] = {{0}};
+            float bias[8] = {0};
 
             for (int b = 0; b < blocks_per_row; b++) {
                 const uint8_t *block = row_ptr + (size_t)b * Q4_K_BLOCK_SIZE;
@@ -1191,12 +1212,25 @@ static inline void q4k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
                 const uint8_t *scales_packed = block + 4;
                 const uint8_t *qs = block + 16;
 
-                __m256i sumi[32];
-                int32_t mins[32];
-                for (int t = 0; t < nt; t++) {
-                    sumi[t] = _mm256_setzero_si256();
-                    mins[t] = 0;
-                }
+                const LilaQ8KBlock *xb0 = qx_all + (size_t)b * n_tokens + t0;
+                const LilaQ8KBlock *xb1 = xb0 + 1;
+                const LilaQ8KBlock *xb2 = xb0 + 2;
+                const LilaQ8KBlock *xb3 = xb0 + 3;
+                const LilaQ8KBlock *xb4 = xb0 + 4;
+                const LilaQ8KBlock *xb5 = xb0 + 5;
+                const LilaQ8KBlock *xb6 = xb0 + 6;
+                const LilaQ8KBlock *xb7 = xb0 + 7;
+
+                __m256i sumi0 = _mm256_setzero_si256();
+                __m256i sumi1 = _mm256_setzero_si256();
+                __m256i sumi2 = _mm256_setzero_si256();
+                __m256i sumi3 = _mm256_setzero_si256();
+                __m256i sumi4 = _mm256_setzero_si256();
+                __m256i sumi5 = _mm256_setzero_si256();
+                __m256i sumi6 = _mm256_setzero_si256();
+                __m256i sumi7 = _mm256_setzero_si256();
+                int32_t mins0 = 0, mins1 = 0, mins2 = 0, mins3 = 0;
+                int32_t mins4 = 0, mins5 = 0, mins6 = 0, mins7 = 0;
 
                 int is = 0;
                 for (int sb = 0; sb < 8; sb += 2) {
@@ -1210,37 +1244,222 @@ static inline void q4k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
                     __m256i vsc1 = _mm256_set1_epi16((int16_t)sc1);
                     __m256i vsc2 = _mm256_set1_epi16((int16_t)sc2);
 #endif
-
                     __m256i qbits = _mm256_loadu_si256((const __m256i *)qs);
                     __m256i q_lo = _mm256_and_si256(qbits, mask_0f);
                     __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qbits, 4), mask_0f);
 
-                    for (int t = 0; t < nt; t++) {
-                        const LilaQ8KBlock *xb = qx_all + (size_t)b * n_tokens + (t0 + t);
-                        __m256i xl = _mm256_loadu_si256((const __m256i *)(xb->qs + sb * 32));
-                        __m256i xh = _mm256_loadu_si256((const __m256i *)(xb->qs + (sb + 1) * 32));
+                    int sb0_off = sb * 32;
+                    int sb1_off = (sb + 1) * 32;
+                    int bs0 = sb * 2;
+                    int bs1 = (sb + 1) * 2;
+
 #if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
-                        __m256i pl = _mm256_mullo_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), q_lo, xl), vsc1);
-                        __m256i ph = _mm256_mullo_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), q_hi, xh), vsc2);
+                    #define LILA_Q4_T8_STEP(SUMI, MINS, XB) do { \
+                        __m256i xl = _mm256_loadu_si256((const __m256i *)((XB)->qs + sb0_off)); \
+                        __m256i xh = _mm256_loadu_si256((const __m256i *)((XB)->qs + sb1_off)); \
+                        __m256i pl = _mm256_mullo_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), q_lo, xl), vsc1); \
+                        __m256i ph = _mm256_mullo_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), q_hi, xh), vsc2); \
+                        (SUMI) = _mm256_add_epi32((SUMI), _mm256_add_epi32(pl, ph)); \
+                        (MINS) += (int32_t)m1 * ((int32_t)(XB)->bsums[bs0] + (int32_t)(XB)->bsums[bs0 + 1]) \
+                                + (int32_t)m2 * ((int32_t)(XB)->bsums[bs1] + (int32_t)(XB)->bsums[bs1 + 1]); \
+                    } while (0)
 #else
-                        __m256i pl = _mm256_madd_epi16(_mm256_maddubs_epi16(q_lo, xl), vsc1);
-                        __m256i ph = _mm256_madd_epi16(_mm256_maddubs_epi16(q_hi, xh), vsc2);
+                    #define LILA_Q4_T8_STEP(SUMI, MINS, XB) do { \
+                        __m256i xl = _mm256_loadu_si256((const __m256i *)((XB)->qs + sb0_off)); \
+                        __m256i xh = _mm256_loadu_si256((const __m256i *)((XB)->qs + sb1_off)); \
+                        __m256i pl = _mm256_madd_epi16(_mm256_maddubs_epi16(q_lo, xl), vsc1); \
+                        __m256i ph = _mm256_madd_epi16(_mm256_maddubs_epi16(q_hi, xh), vsc2); \
+                        (SUMI) = _mm256_add_epi32((SUMI), _mm256_add_epi32(pl, ph)); \
+                        (MINS) += (int32_t)m1 * ((int32_t)(XB)->bsums[bs0] + (int32_t)(XB)->bsums[bs0 + 1]) \
+                                + (int32_t)m2 * ((int32_t)(XB)->bsums[bs1] + (int32_t)(XB)->bsums[bs1 + 1]); \
+                    } while (0)
 #endif
-                        sumi[t] = _mm256_add_epi32(sumi[t], _mm256_add_epi32(pl, ph));
-                        mins[t] += (int32_t)m1 * ((int32_t)xb->bsums[sb * 2 + 0] + (int32_t)xb->bsums[sb * 2 + 1])
-                                 + (int32_t)m2 * ((int32_t)xb->bsums[(sb + 1) * 2 + 0] + (int32_t)xb->bsums[(sb + 1) * 2 + 1]);
-                    }
+                    LILA_Q4_T8_STEP(sumi0, mins0, xb0);
+                    LILA_Q4_T8_STEP(sumi1, mins1, xb1);
+                    LILA_Q4_T8_STEP(sumi2, mins2, xb2);
+                    LILA_Q4_T8_STEP(sumi3, mins3, xb3);
+                    LILA_Q4_T8_STEP(sumi4, mins4, xb4);
+                    LILA_Q4_T8_STEP(sumi5, mins5, xb5);
+                    LILA_Q4_T8_STEP(sumi6, mins6, xb6);
+                    LILA_Q4_T8_STEP(sumi7, mins7, xb7);
+                    #undef LILA_Q4_T8_STEP
+
                     qs += 32;
                     is += 2;
                 }
-                for (int t = 0; t < nt; t++) {
-                    float xd = qx_all[(size_t)b * n_tokens + (t0 + t)].d;
-                    acc[t] += d * xd * (float)lila_hsum_i32_avx2(sumi[t]) - min * xd * (float)mins[t];
+
+                #define LILA_Q4_ACC(K, SUMI, MINS, XB) do { \
+                    float xd = (XB)->d; \
+                    __m256 s = _mm256_load_ps(sv[K]); \
+                    s = _mm256_fmadd_ps(_mm256_cvtepi32_ps(SUMI), _mm256_set1_ps(d * xd), s); \
+                    _mm256_store_ps(sv[K], s); \
+                    bias[K] += (min * xd) * (float)(MINS); \
+                } while (0)
+                LILA_Q4_ACC(0, sumi0, mins0, xb0);
+                LILA_Q4_ACC(1, sumi1, mins1, xb1);
+                LILA_Q4_ACC(2, sumi2, mins2, xb2);
+                LILA_Q4_ACC(3, sumi3, mins3, xb3);
+                LILA_Q4_ACC(4, sumi4, mins4, xb4);
+                LILA_Q4_ACC(5, sumi5, mins5, xb5);
+                LILA_Q4_ACC(6, sumi6, mins6, xb6);
+                LILA_Q4_ACC(7, sumi7, mins7, xb7);
+                #undef LILA_Q4_ACC
+            }
+            for (int k = 0; k < 8; k++) {
+                out[(size_t)(t0 + k) * total_rows + i] = lila_hsum_f32_avx2(_mm256_load_ps(sv[k])) - bias[k];
+            }
+        }
+    }
+    for (; t0 + 3 < n_tokens; t0 += 4) {
+        for (int i = row_start; i < row_end; i++) {
+            const uint8_t *row_ptr = weight_data + (size_t)i * row_bytes;
+            if (i + 2 < row_end) {
+                LILA_PREFETCH(row_ptr + 2 * row_bytes);
+            }
+            __m256 sum_vec0 = _mm256_setzero_ps();
+            __m256 sum_vec1 = _mm256_setzero_ps();
+            __m256 sum_vec2 = _mm256_setzero_ps();
+            __m256 sum_vec3 = _mm256_setzero_ps();
+            float bias0 = 0.0f, bias1 = 0.0f, bias2 = 0.0f, bias3 = 0.0f;
+
+            for (int b = 0; b < blocks_per_row; b++) {
+                const uint8_t *block = row_ptr + (size_t)b * Q4_K_BLOCK_SIZE;
+                uint16_t d_raw, dmin_raw;
+                memcpy(&d_raw, block, 2);
+                memcpy(&dmin_raw, block + 2, 2);
+                float d = fp16_to_fp32(d_raw);
+                float min = fp16_to_fp32(dmin_raw);
+                const uint8_t *scales_packed = block + 4;
+                const uint8_t *qs = block + 16;
+
+                const LilaQ8KBlock *xb0 = qx_all + (size_t)b * n_tokens + t0;
+                const LilaQ8KBlock *xb1 = xb0 + 1;
+                const LilaQ8KBlock *xb2 = xb0 + 2;
+                const LilaQ8KBlock *xb3 = xb0 + 3;
+
+                __m256i sumi0 = _mm256_setzero_si256();
+                __m256i sumi1 = _mm256_setzero_si256();
+                __m256i sumi2 = _mm256_setzero_si256();
+                __m256i sumi3 = _mm256_setzero_si256();
+                int32_t mins0 = 0, mins1 = 0, mins2 = 0, mins3 = 0;
+
+                int is = 0;
+                for (int sb = 0; sb < 8; sb += 2) {
+                    uint8_t sc1, m1, sc2, m2;
+                    get_scale_min_k4(is + 0, scales_packed, &sc1, &m1);
+                    get_scale_min_k4(is + 1, scales_packed, &sc2, &m2);
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+                    __m256i vsc1 = _mm256_set1_epi32((int32_t)sc1);
+                    __m256i vsc2 = _mm256_set1_epi32((int32_t)sc2);
+#else
+                    __m256i vsc1 = _mm256_set1_epi16((int16_t)sc1);
+                    __m256i vsc2 = _mm256_set1_epi16((int16_t)sc2);
+#endif
+                    __m256i qbits = _mm256_loadu_si256((const __m256i *)qs);
+                    __m256i q_lo = _mm256_and_si256(qbits, mask_0f);
+                    __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qbits, 4), mask_0f);
+
+                    int sb0_off = sb * 32;
+                    int sb1_off = (sb + 1) * 32;
+                    int bs0 = sb * 2;
+                    int bs1 = (sb + 1) * 2;
+
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+                    #define LILA_Q4_T4_STEP(SUMI, MINS, XB) do { \
+                        __m256i xl = _mm256_loadu_si256((const __m256i *)((XB)->qs + sb0_off)); \
+                        __m256i xh = _mm256_loadu_si256((const __m256i *)((XB)->qs + sb1_off)); \
+                        __m256i pl = _mm256_mullo_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), q_lo, xl), vsc1); \
+                        __m256i ph = _mm256_mullo_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), q_hi, xh), vsc2); \
+                        (SUMI) = _mm256_add_epi32((SUMI), _mm256_add_epi32(pl, ph)); \
+                        (MINS) += (int32_t)m1 * ((int32_t)(XB)->bsums[bs0] + (int32_t)(XB)->bsums[bs0 + 1]) \
+                                + (int32_t)m2 * ((int32_t)(XB)->bsums[bs1] + (int32_t)(XB)->bsums[bs1 + 1]); \
+                    } while (0)
+#else
+                    #define LILA_Q4_T4_STEP(SUMI, MINS, XB) do { \
+                        __m256i xl = _mm256_loadu_si256((const __m256i *)((XB)->qs + sb0_off)); \
+                        __m256i xh = _mm256_loadu_si256((const __m256i *)((XB)->qs + sb1_off)); \
+                        __m256i pl = _mm256_madd_epi16(_mm256_maddubs_epi16(q_lo, xl), vsc1); \
+                        __m256i ph = _mm256_madd_epi16(_mm256_maddubs_epi16(q_hi, xh), vsc2); \
+                        (SUMI) = _mm256_add_epi32((SUMI), _mm256_add_epi32(pl, ph)); \
+                        (MINS) += (int32_t)m1 * ((int32_t)(XB)->bsums[bs0] + (int32_t)(XB)->bsums[bs0 + 1]) \
+                                + (int32_t)m2 * ((int32_t)(XB)->bsums[bs1] + (int32_t)(XB)->bsums[bs1 + 1]); \
+                    } while (0)
+#endif
+                    LILA_Q4_T4_STEP(sumi0, mins0, xb0);
+                    LILA_Q4_T4_STEP(sumi1, mins1, xb1);
+                    LILA_Q4_T4_STEP(sumi2, mins2, xb2);
+                    LILA_Q4_T4_STEP(sumi3, mins3, xb3);
+                    #undef LILA_Q4_T4_STEP
+
+                    qs += 32;
+                    is += 2;
                 }
+
+                float xd0 = xb0->d, xd1 = xb1->d, xd2 = xb2->d, xd3 = xb3->d;
+                sum_vec0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi0), _mm256_set1_ps(d * xd0), sum_vec0);
+                sum_vec1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi1), _mm256_set1_ps(d * xd1), sum_vec1);
+                sum_vec2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi2), _mm256_set1_ps(d * xd2), sum_vec2);
+                sum_vec3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi3), _mm256_set1_ps(d * xd3), sum_vec3);
+                bias0 += (min * xd0) * (float)mins0;
+                bias1 += (min * xd1) * (float)mins1;
+                bias2 += (min * xd2) * (float)mins2;
+                bias3 += (min * xd3) * (float)mins3;
             }
-            for (int t = 0; t < nt; t++) {
-                out[(size_t)(t0 + t) * total_rows + i] = acc[t];
+            out[(size_t)(t0 + 0) * total_rows + i] = lila_hsum_f32_avx2(sum_vec0) - bias0;
+            out[(size_t)(t0 + 1) * total_rows + i] = lila_hsum_f32_avx2(sum_vec1) - bias1;
+            out[(size_t)(t0 + 2) * total_rows + i] = lila_hsum_f32_avx2(sum_vec2) - bias2;
+            out[(size_t)(t0 + 3) * total_rows + i] = lila_hsum_f32_avx2(sum_vec3) - bias3;
+        }
+    }
+    for (int t = t0; t < n_tokens; t++) {
+        for (int i = row_start; i < row_end; i++) {
+            const uint8_t *row_ptr = weight_data + (size_t)i * row_bytes;
+            if (i + 2 < row_end) {
+                LILA_PREFETCH(row_ptr + 2 * row_bytes);
             }
+            __m256 sum_vec = _mm256_setzero_ps();
+            float bias = 0.0f;
+            for (int b = 0; b < blocks_per_row; b++) {
+                const uint8_t *block = row_ptr + (size_t)b * Q4_K_BLOCK_SIZE;
+                uint16_t d_raw, dmin_raw;
+                memcpy(&d_raw, block, 2);
+                memcpy(&dmin_raw, block + 2, 2);
+                float d = fp16_to_fp32(d_raw);
+                float min = fp16_to_fp32(dmin_raw);
+                const uint8_t *scales_packed = block + 4;
+                const uint8_t *qs = block + 16;
+                const LilaQ8KBlock *xb = qx_all + (size_t)b * n_tokens + t;
+
+                __m256i sumi = _mm256_setzero_si256();
+                int32_t mins = 0;
+                int is = 0;
+                for (int sb = 0; sb < 8; sb += 2) {
+                    uint8_t sc1, m1, sc2, m2;
+                    get_scale_min_k4(is + 0, scales_packed, &sc1, &m1);
+                    get_scale_min_k4(is + 1, scales_packed, &sc2, &m2);
+                    __m256i qbits = _mm256_loadu_si256((const __m256i *)qs);
+                    __m256i q_lo = _mm256_and_si256(qbits, mask_0f);
+                    __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qbits, 4), mask_0f);
+                    __m256i xl = _mm256_loadu_si256((const __m256i *)(xb->qs + sb * 32));
+                    __m256i xh = _mm256_loadu_si256((const __m256i *)(xb->qs + (sb + 1) * 32));
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+                    __m256i pl = _mm256_mullo_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), q_lo, xl), _mm256_set1_epi32((int32_t)sc1));
+                    __m256i ph = _mm256_mullo_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), q_hi, xh), _mm256_set1_epi32((int32_t)sc2));
+#else
+                    __m256i pl = _mm256_madd_epi16(_mm256_maddubs_epi16(q_lo, xl), _mm256_set1_epi16((int16_t)sc1));
+                    __m256i ph = _mm256_madd_epi16(_mm256_maddubs_epi16(q_hi, xh), _mm256_set1_epi16((int16_t)sc2));
+#endif
+                    sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(pl, ph));
+                    mins += (int32_t)m1 * ((int32_t)xb->bsums[sb * 2 + 0] + (int32_t)xb->bsums[sb * 2 + 1])
+                          + (int32_t)m2 * ((int32_t)xb->bsums[(sb + 1) * 2 + 0] + (int32_t)xb->bsums[(sb + 1) * 2 + 1]);
+                    qs += 32;
+                    is += 2;
+                }
+                float xd = xb->d;
+                sum_vec = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi), _mm256_set1_ps(d * xd), sum_vec);
+                bias += (min * xd) * (float)mins;
+            }
+            out[(size_t)t * total_rows + i] = lila_hsum_f32_avx2(sum_vec) - bias;
         }
     }
 #elif defined(__aarch64__)
@@ -1479,16 +1698,15 @@ static inline void q6k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
     const __m256i mask_0f = _mm256_set1_epi8(0x0F);
     const __m256i mask_03 = _mm256_set1_epi8(0x03);
 
-    for (int i = row_start; i < row_end; i++) {
-        const uint8_t *row_ptr = weight_data + (size_t)i * row_bytes;
-        if (i + 2 < row_end) {
-            LILA_PREFETCH(row_ptr + 2 * row_bytes);
-        }
-        for (int t0 = 0; t0 < n_tokens; t0 += 32) {
-            int nt = n_tokens - t0;
-            if (nt > 32) nt = 32;
-            float acc[32];
-            for (int t = 0; t < nt; t++) acc[t] = 0.0f;
+    int t0 = 0;
+    for (; t0 + 7 < n_tokens; t0 += 8) {
+        for (int i = row_start; i < row_end; i++) {
+            const uint8_t *row_ptr = weight_data + (size_t)i * row_bytes;
+            if (i + 2 < row_end) {
+                LILA_PREFETCH(row_ptr + 2 * row_bytes);
+            }
+            _Alignas(32) float sv[8][8] = {{0}};
+            float bias[8] = {0};
 
             for (int b = 0; b < blocks_per_row; b++) {
                 const uint8_t *block = row_ptr + (size_t)b * Q6_K_BLOCK_SIZE;
@@ -1499,12 +1717,136 @@ static inline void q6k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
                 memcpy(&d_raw, block + 208, 2);
                 float d = fp16_to_fp32(d_raw);
 
-                __m256i sumi[32];
-                int32_t sbias[32];
-                for (int t = 0; t < nt; t++) {
-                    sumi[t] = _mm256_setzero_si256();
-                    sbias[t] = 0;
+                const LilaQ8KBlock *xb0 = qx_all + (size_t)b * n_tokens + t0;
+                const LilaQ8KBlock *xb1 = xb0 + 1;
+                const LilaQ8KBlock *xb2 = xb0 + 2;
+                const LilaQ8KBlock *xb3 = xb0 + 3;
+                const LilaQ8KBlock *xb4 = xb0 + 4;
+                const LilaQ8KBlock *xb5 = xb0 + 5;
+                const LilaQ8KBlock *xb6 = xb0 + 6;
+                const LilaQ8KBlock *xb7 = xb0 + 7;
+
+                __m256i sumi0 = _mm256_setzero_si256();
+                __m256i sumi1 = _mm256_setzero_si256();
+                __m256i sumi2 = _mm256_setzero_si256();
+                __m256i sumi3 = _mm256_setzero_si256();
+                __m256i sumi4 = _mm256_setzero_si256();
+                __m256i sumi5 = _mm256_setzero_si256();
+                __m256i sumi6 = _mm256_setzero_si256();
+                __m256i sumi7 = _mm256_setzero_si256();
+                int32_t sbias0 = 0, sbias1 = 0, sbias2 = 0, sbias3 = 0;
+                int32_t sbias4 = 0, sbias5 = 0, sbias6 = 0, sbias7 = 0;
+
+                for (int half = 0; half < 2; half++) {
+                    const uint8_t *ql_h = ql + half * 64;
+                    const uint8_t *qh_h = qh + half * 32;
+                    const int8_t  *sc_h = scales + half * 8;
+                    int sb_base = half * 4;
+
+                    __m256i ql0 = _mm256_loadu_si256((const __m256i *)(ql_h + 0));
+                    __m256i ql1 = _mm256_loadu_si256((const __m256i *)(ql_h + 32));
+                    __m256i qh0 = _mm256_loadu_si256((const __m256i *)qh_h);
+
+                    for (int q = 0; q < 4; q++) {
+                        __m256i u;
+                        if (q == 0) {
+                            u = _mm256_or_si256(_mm256_and_si256(ql0, mask_0f),
+                                                _mm256_slli_epi16(_mm256_and_si256(qh0, mask_03), 4));
+                        } else if (q == 1) {
+                            u = _mm256_or_si256(_mm256_and_si256(ql1, mask_0f),
+                                                _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh0, 2), mask_03), 4));
+                        } else if (q == 2) {
+                            u = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql0, 4), mask_0f),
+                                                _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh0, 4), mask_03), 4));
+                        } else {
+                            u = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql1, 4), mask_0f),
+                                                _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh0, 6), mask_03), 4));
+                        }
+                        int sb = sb_base + q;
+                        int16_t s0 = (int16_t)sc_h[q * 2 + 0];
+                        int16_t s1 = (int16_t)sc_h[q * 2 + 1];
+                        int qs_off = sb * 32;
+                        int bs_off = sb * 2;
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+                        __m256i sc_vec32 = _mm256_set_m128i(_mm_set1_epi32((int32_t)s1), _mm_set1_epi32((int32_t)s0));
+                        #define LILA_Q6_T8_STEP(SUMI, SBIAS, XB) do { \
+                            __m256i xv = _mm256_loadu_si256((const __m256i *)((XB)->qs + qs_off)); \
+                            __m256i dp = _mm256_dpbusd_epi32(_mm256_setzero_si256(), u, xv); \
+                            (SUMI) = _mm256_add_epi32((SUMI), _mm256_mullo_epi32(dp, sc_vec32)); \
+                            (SBIAS) += (int32_t)s0 * (XB)->bsums[bs_off] + (int32_t)s1 * (XB)->bsums[bs_off + 1]; \
+                        } while (0)
+#else
+                        __m256i sc_vec16 = _mm256_set_m128i(_mm_set1_epi16(s1), _mm_set1_epi16(s0));
+                        #define LILA_Q6_T8_STEP(SUMI, SBIAS, XB) do { \
+                            __m256i xv = _mm256_loadu_si256((const __m256i *)((XB)->qs + qs_off)); \
+                            (SUMI) = _mm256_add_epi32((SUMI), _mm256_madd_epi16(_mm256_maddubs_epi16(u, xv), sc_vec16)); \
+                            (SBIAS) += (int32_t)s0 * (XB)->bsums[bs_off] + (int32_t)s1 * (XB)->bsums[bs_off + 1]; \
+                        } while (0)
+#endif
+                        LILA_Q6_T8_STEP(sumi0, sbias0, xb0);
+                        LILA_Q6_T8_STEP(sumi1, sbias1, xb1);
+                        LILA_Q6_T8_STEP(sumi2, sbias2, xb2);
+                        LILA_Q6_T8_STEP(sumi3, sbias3, xb3);
+                        LILA_Q6_T8_STEP(sumi4, sbias4, xb4);
+                        LILA_Q6_T8_STEP(sumi5, sbias5, xb5);
+                        LILA_Q6_T8_STEP(sumi6, sbias6, xb6);
+                        LILA_Q6_T8_STEP(sumi7, sbias7, xb7);
+                        #undef LILA_Q6_T8_STEP
+                    }
                 }
+                #define LILA_Q6_ACC(K, SUMI, SBIAS, XB) do { \
+                    float xd = d * (XB)->d; \
+                    __m256 s = _mm256_load_ps(sv[K]); \
+                    s = _mm256_fmadd_ps(_mm256_cvtepi32_ps(SUMI), _mm256_set1_ps(xd), s); \
+                    _mm256_store_ps(sv[K], s); \
+                    bias[K] += 32.0f * xd * (float)(SBIAS); \
+                } while (0)
+                LILA_Q6_ACC(0, sumi0, sbias0, xb0);
+                LILA_Q6_ACC(1, sumi1, sbias1, xb1);
+                LILA_Q6_ACC(2, sumi2, sbias2, xb2);
+                LILA_Q6_ACC(3, sumi3, sbias3, xb3);
+                LILA_Q6_ACC(4, sumi4, sbias4, xb4);
+                LILA_Q6_ACC(5, sumi5, sbias5, xb5);
+                LILA_Q6_ACC(6, sumi6, sbias6, xb6);
+                LILA_Q6_ACC(7, sumi7, sbias7, xb7);
+                #undef LILA_Q6_ACC
+            }
+            for (int k = 0; k < 8; k++) {
+                out[(size_t)(t0 + k) * total_rows + i] = lila_hsum_f32_avx2(_mm256_load_ps(sv[k])) - bias[k];
+            }
+        }
+    }
+    for (; t0 + 3 < n_tokens; t0 += 4) {
+        for (int i = row_start; i < row_end; i++) {
+            const uint8_t *row_ptr = weight_data + (size_t)i * row_bytes;
+            if (i + 2 < row_end) {
+                LILA_PREFETCH(row_ptr + 2 * row_bytes);
+            }
+            __m256 sum_vec0 = _mm256_setzero_ps();
+            __m256 sum_vec1 = _mm256_setzero_ps();
+            __m256 sum_vec2 = _mm256_setzero_ps();
+            __m256 sum_vec3 = _mm256_setzero_ps();
+            float bias0 = 0.0f, bias1 = 0.0f, bias2 = 0.0f, bias3 = 0.0f;
+
+            for (int b = 0; b < blocks_per_row; b++) {
+                const uint8_t *block = row_ptr + (size_t)b * Q6_K_BLOCK_SIZE;
+                const uint8_t *ql = block;
+                const uint8_t *qh = block + 128;
+                const int8_t *scales = (const int8_t *)(block + 192);
+                uint16_t d_raw;
+                memcpy(&d_raw, block + 208, 2);
+                float d = fp16_to_fp32(d_raw);
+
+                const LilaQ8KBlock *xb0 = qx_all + (size_t)b * n_tokens + t0;
+                const LilaQ8KBlock *xb1 = xb0 + 1;
+                const LilaQ8KBlock *xb2 = xb0 + 2;
+                const LilaQ8KBlock *xb3 = xb0 + 3;
+
+                __m256i sumi0 = _mm256_setzero_si256();
+                __m256i sumi1 = _mm256_setzero_si256();
+                __m256i sumi2 = _mm256_setzero_si256();
+                __m256i sumi3 = _mm256_setzero_si256();
+                int32_t sbias0 = 0, sbias1 = 0, sbias2 = 0, sbias3 = 0;
 
                 for (int half = 0; half < 2; half++) {
                     const uint8_t *ql_h = ql + half * 64;
@@ -1534,32 +1876,101 @@ static inline void q6k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
                         int sb = sb_base + q;
                         int16_t s0 = (int16_t)sc_h[q * 2 + 0];
                         int16_t s1 = (int16_t)sc_h[q * 2 + 1];
+                        int qs_off = sb * 32;
+                        int bs_off = sb * 2;
 #if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
                         __m256i sc_vec32 = _mm256_set_m128i(_mm_set1_epi32((int32_t)s1), _mm_set1_epi32((int32_t)s0));
+                        #define LILA_Q6_T4_STEP(SUMI, SBIAS, XB) do { \
+                            __m256i xv = _mm256_loadu_si256((const __m256i *)((XB)->qs + qs_off)); \
+                            __m256i dp = _mm256_dpbusd_epi32(_mm256_setzero_si256(), u_vecs[q], xv); \
+                            (SUMI) = _mm256_add_epi32((SUMI), _mm256_mullo_epi32(dp, sc_vec32)); \
+                            (SBIAS) += (int32_t)s0 * (XB)->bsums[bs_off] + (int32_t)s1 * (XB)->bsums[bs_off + 1]; \
+                        } while (0)
 #else
                         __m256i sc_vec16 = _mm256_set_m128i(_mm_set1_epi16(s1), _mm_set1_epi16(s0));
+                        #define LILA_Q6_T4_STEP(SUMI, SBIAS, XB) do { \
+                            __m256i xv = _mm256_loadu_si256((const __m256i *)((XB)->qs + qs_off)); \
+                            (SUMI) = _mm256_add_epi32((SUMI), _mm256_madd_epi16(_mm256_maddubs_epi16(u_vecs[q], xv), sc_vec16)); \
+                            (SBIAS) += (int32_t)s0 * (XB)->bsums[bs_off] + (int32_t)s1 * (XB)->bsums[bs_off + 1]; \
+                        } while (0)
 #endif
-                        for (int t = 0; t < nt; t++) {
-                            const LilaQ8KBlock *xb = qx_all + (size_t)b * n_tokens + (t0 + t);
-                            __m256i xv = _mm256_loadu_si256((const __m256i *)(xb->qs + sb * 32));
-#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
-                            __m256i dp = _mm256_dpbusd_epi32(_mm256_setzero_si256(), u_vecs[q], xv);
-                            sumi[t] = _mm256_add_epi32(sumi[t], _mm256_mullo_epi32(dp, sc_vec32));
-#else
-                            sumi[t] = _mm256_add_epi32(sumi[t], _mm256_madd_epi16(_mm256_maddubs_epi16(u_vecs[q], xv), sc_vec16));
-#endif
-                            sbias[t] += (int32_t)s0 * xb->bsums[sb * 2 + 0] + (int32_t)s1 * xb->bsums[sb * 2 + 1];
-                        }
+                        LILA_Q6_T4_STEP(sumi0, sbias0, xb0);
+                        LILA_Q6_T4_STEP(sumi1, sbias1, xb1);
+                        LILA_Q6_T4_STEP(sumi2, sbias2, xb2);
+                        LILA_Q6_T4_STEP(sumi3, sbias3, xb3);
+                        #undef LILA_Q6_T4_STEP
                     }
                 }
-                for (int t = 0; t < nt; t++) {
-                    float xd = d * qx_all[(size_t)b * n_tokens + (t0 + t)].d;
-                    acc[t] += xd * (float)(lila_hsum_i32_avx2(sumi[t]) - 32 * sbias[t]);
+                float xd0 = d * xb0->d, xd1 = d * xb1->d, xd2 = d * xb2->d, xd3 = d * xb3->d;
+                sum_vec0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi0), _mm256_set1_ps(xd0), sum_vec0);
+                sum_vec1 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi1), _mm256_set1_ps(xd1), sum_vec1);
+                sum_vec2 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi2), _mm256_set1_ps(xd2), sum_vec2);
+                sum_vec3 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi3), _mm256_set1_ps(xd3), sum_vec3);
+                bias0 += 32.0f * xd0 * (float)sbias0;
+                bias1 += 32.0f * xd1 * (float)sbias1;
+                bias2 += 32.0f * xd2 * (float)sbias2;
+                bias3 += 32.0f * xd3 * (float)sbias3;
+            }
+            out[(size_t)(t0 + 0) * total_rows + i] = lila_hsum_f32_avx2(sum_vec0) - bias0;
+            out[(size_t)(t0 + 1) * total_rows + i] = lila_hsum_f32_avx2(sum_vec1) - bias1;
+            out[(size_t)(t0 + 2) * total_rows + i] = lila_hsum_f32_avx2(sum_vec2) - bias2;
+            out[(size_t)(t0 + 3) * total_rows + i] = lila_hsum_f32_avx2(sum_vec3) - bias3;
+        }
+    }
+    for (int t = t0; t < n_tokens; t++) {
+        for (int i = row_start; i < row_end; i++) {
+            const uint8_t *row_ptr = weight_data + (size_t)i * row_bytes;
+            if (i + 2 < row_end) {
+                LILA_PREFETCH(row_ptr + 2 * row_bytes);
+            }
+            __m256 sum_vec = _mm256_setzero_ps();
+            float bias = 0.0f;
+            for (int b = 0; b < blocks_per_row; b++) {
+                const uint8_t *block = row_ptr + (size_t)b * Q6_K_BLOCK_SIZE;
+                const uint8_t *ql = block;
+                const uint8_t *qh = block + 128;
+                const int8_t *scales = (const int8_t *)(block + 192);
+                uint16_t d_raw;
+                memcpy(&d_raw, block + 208, 2);
+                float d = fp16_to_fp32(d_raw);
+                const LilaQ8KBlock *xb = qx_all + (size_t)b * n_tokens + t;
+
+                __m256i sumi = _mm256_setzero_si256();
+                int32_t sbias = 0;
+                for (int half = 0; half < 2; half++) {
+                    const uint8_t *ql_h = ql + half * 64;
+                    const uint8_t *qh_h = qh + half * 32;
+                    const int8_t  *sc_h = scales + half * 8;
+                    int sb_base = half * 4;
+                    __m256i ql0 = _mm256_loadu_si256((const __m256i *)(ql_h + 0));
+                    __m256i ql1 = _mm256_loadu_si256((const __m256i *)(ql_h + 32));
+                    __m256i qh0 = _mm256_loadu_si256((const __m256i *)qh_h);
+                    __m256i u_vecs[4];
+                    u_vecs[0] = _mm256_or_si256(_mm256_and_si256(ql0, mask_0f), _mm256_slli_epi16(_mm256_and_si256(qh0, mask_03), 4));
+                    u_vecs[1] = _mm256_or_si256(_mm256_and_si256(ql1, mask_0f), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh0, 2), mask_03), 4));
+                    u_vecs[2] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql0, 4), mask_0f), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh0, 4), mask_03), 4));
+                    u_vecs[3] = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(ql1, 4), mask_0f), _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh0, 6), mask_03), 4));
+                    for (int q = 0; q < 4; q++) {
+                        int sb = sb_base + q;
+                        int16_t s0 = (int16_t)sc_h[q * 2 + 0];
+                        int16_t s1 = (int16_t)sc_h[q * 2 + 1];
+                        __m256i xv = _mm256_loadu_si256((const __m256i *)(xb->qs + sb * 32));
+#if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
+                        __m256i dp = _mm256_dpbusd_epi32(_mm256_setzero_si256(), u_vecs[q], xv);
+                        __m256i sc_vec32 = _mm256_set_m128i(_mm_set1_epi32((int32_t)s1), _mm_set1_epi32((int32_t)s0));
+                        sumi = _mm256_add_epi32(sumi, _mm256_mullo_epi32(dp, sc_vec32));
+#else
+                        __m256i sc_vec16 = _mm256_set_m128i(_mm_set1_epi16(s1), _mm_set1_epi16(s0));
+                        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(_mm256_maddubs_epi16(u_vecs[q], xv), sc_vec16));
+#endif
+                        sbias += (int32_t)s0 * xb->bsums[sb * 2 + 0] + (int32_t)s1 * xb->bsums[sb * 2 + 1];
+                    }
                 }
+                float xd = d * xb->d;
+                sum_vec = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi), _mm256_set1_ps(xd), sum_vec);
+                bias += 32.0f * xd * (float)sbias;
             }
-            for (int t = 0; t < nt; t++) {
-                out[(size_t)(t0 + t) * total_rows + i] = acc[t];
-            }
+            out[(size_t)t * total_rows + i] = lila_hsum_f32_avx2(sum_vec) - bias;
         }
     }
 #elif defined(__aarch64__)

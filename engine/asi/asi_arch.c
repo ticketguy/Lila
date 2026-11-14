@@ -73,6 +73,22 @@ typedef struct {
     float *alpha;
     float *beta;
     float *v_pred;
+    /* Persistent batch scratch buffers (grown up to chunk_max) */
+    uint32_t batch_cap;
+    float *xb;
+    float *xnb;
+    float *projb;
+    float *qkvb;
+    float *zb;
+    float *ab;
+    float *bb;
+    float *qgb;
+    float *kb;
+    float *vb;
+    float *aob;
+    float *fgb;
+    float *fub;
+    LilaQ8KBlock *qx_h;
 } Qwen35Scratch;
 
 struct AsiArchSession {
@@ -92,11 +108,97 @@ struct AsiArchSession {
     float *prefix_ssm;
     uint16_t *prefix_k;
     uint16_t *prefix_v;
+    float *rope_inv_freq;
 };
+
+#if defined(__AVX2__)
+static inline __m256 lila_expf_avx2(__m256 x)
+{
+    x = _mm256_max_ps(_mm256_min_ps(x, _mm256_set1_ps(88.0f)), _mm256_set1_ps(-88.0f));
+    const __m256 log2e = _mm256_set1_ps(1.44269504088896341f);
+    const __m256 half = _mm256_set1_ps(0.5f);
+    const __m256 ln2_hi = _mm256_set1_ps(0.693359375f);
+    const __m256 ln2_lo = _mm256_set1_ps(-2.12194440e-4f);
+    __m256 n = _mm256_floor_ps(_mm256_fmadd_ps(x, log2e, half));
+    x = _mm256_fnmadd_ps(n, ln2_hi, x);
+    x = _mm256_fnmadd_ps(n, ln2_lo, x);
+    __m256 y = _mm256_set1_ps(1.9875691500e-4f);
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.3981999507e-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(8.3334519073e-3f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(4.1665795894e-2f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(1.6666665459e-1f));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(5.0000001201e-1f));
+    y = _mm256_fmadd_ps(y, _mm256_mul_ps(x, x), x);
+    y = _mm256_add_ps(y, _mm256_set1_ps(1.0f));
+    __m256i emm0 = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvttps_epi32(n), _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(y, _mm256_castsi256_ps(emm0));
+}
+#endif
 
 static inline float fast_silu(float x)
 {
     return x / (1.0f + expf(-x));
+}
+
+static inline void fast_silu_mul_vec(float *gate, const float *up, uint32_t n)
+{
+    uint32_t i = 0;
+#if defined(__AVX2__)
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 neg = _mm256_set1_ps(-0.0f);
+    for (; i + 7 < n; i += 8)
+    {
+        __m256 g = _mm256_loadu_ps(gate + i);
+        __m256 u = _mm256_loadu_ps(up + i);
+        __m256 e = lila_expf_avx2(_mm256_xor_ps(g, neg));
+        __m256 sig = _mm256_div_ps(g, _mm256_add_ps(one, e));
+        _mm256_storeu_ps(gate + i, _mm256_mul_ps(sig, u));
+    }
+#endif
+    for (; i < n; ++i)
+    {
+        gate[i] = fast_silu(gate[i]) * up[i];
+    }
+}
+
+static inline void fast_silu_inplace_vec(float *x, uint32_t n)
+{
+    uint32_t i = 0;
+#if defined(__AVX2__)
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 neg = _mm256_set1_ps(-0.0f);
+    for (; i + 7 < n; i += 8)
+    {
+        __m256 v = _mm256_loadu_ps(x + i);
+        __m256 e = lila_expf_avx2(_mm256_xor_ps(v, neg));
+        _mm256_storeu_ps(x + i, _mm256_div_ps(v, _mm256_add_ps(one, e)));
+    }
+#endif
+    for (; i < n; ++i)
+    {
+        x[i] = fast_silu(x[i]);
+    }
+}
+
+static inline void fast_silu_mul_out_vec(float *out, const float *gate, uint32_t n)
+{
+    uint32_t i = 0;
+#if defined(__AVX2__)
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 neg = _mm256_set1_ps(-0.0f);
+    for (; i + 7 < n; i += 8)
+    {
+        __m256 g = _mm256_loadu_ps(gate + i);
+        __m256 o = _mm256_loadu_ps(out + i);
+        __m256 e = lila_expf_avx2(_mm256_xor_ps(g, neg));
+        __m256 sig = _mm256_div_ps(g, _mm256_add_ps(one, e));
+        _mm256_storeu_ps(out + i, _mm256_mul_ps(o, sig));
+    }
+#endif
+    for (; i < n; ++i)
+    {
+        out[i] *= fast_silu(gate[i]);
+    }
 }
 
 static inline float fast_sigmoid(float x)
@@ -213,13 +315,27 @@ static void asi_matvec_worker(int tid, int n_threads, void *vctx)
         if (ctx->quant_type == 12)
         {
             size_t rb = (size_t)bpr * Q4_K_BLOCK_SIZE;
-            for (int i = 0; i < rows; ++i)
+            int i = 0;
+            for (; i + 1 < rows; i += 2)
+            {
+                const uint8_t *rp = ctx->w + (size_t)i * rb;
+                if (i + 3 < rows) { LILA_PREFETCH(rp + 2 * rb); LILA_PREFETCH(rp + 3 * rb); }
+                q4k_dot2_q8k_avx2(rp, rp + rb, ctx->qx, bpr, &ctx->out[i], &ctx->out[i + 1]);
+            }
+            for (; i < rows; ++i)
                 ctx->out[i] = q4k_dot_q8k_avx2(ctx->w + (size_t)i * rb, ctx->qx, bpr);
         }
         else if (ctx->quant_type == 14)
         {
             size_t rb = (size_t)bpr * Q6_K_BLOCK_SIZE;
-            for (int i = 0; i < rows; ++i)
+            int i = 0;
+            for (; i + 1 < rows; i += 2)
+            {
+                const uint8_t *rp = ctx->w + (size_t)i * rb;
+                if (i + 3 < rows) { LILA_PREFETCH(rp + 2 * rb); LILA_PREFETCH(rp + 3 * rb); }
+                q6k_dot2_q8k_avx2(rp, rp + rb, ctx->qx, bpr, &ctx->out[i], &ctx->out[i + 1]);
+            }
+            for (; i < rows; ++i)
                 ctx->out[i] = q6k_dot_q8k_avx2(ctx->w + (size_t)i * rb, ctx->qx, bpr);
         }
         return;
@@ -239,7 +355,7 @@ static void asi_matvec_worker(int tid, int n_threads, void *vctx)
             {
                 const uint8_t *rp = ctx->w + (size_t)i * rb;
                 if (i + 2 < end) LILA_PREFETCH(rp + 2 * rb);
-                ctx->out[i] = q4k_dot_q8k_avx2(rp, ctx->qx, bpr);
+                ctx->out[i] = q4k_dot_q8k_simd(rp, ctx->qx, bpr);
             }
         }
         else if (ctx->quant_type == 14)
@@ -253,7 +369,7 @@ static void asi_matvec_worker(int tid, int n_threads, void *vctx)
                     LILA_PREFETCH(rp + 2 * rb);
                     LILA_PREFETCH(rp + 2 * rb + 64);
                 }
-                ctx->out[i] = q6k_dot_q8k_avx2(rp, ctx->qx, bpr);
+                ctx->out[i] = q6k_dot_q8k_simd(rp, ctx->qx, bpr);
             }
         }
     }
@@ -283,6 +399,98 @@ static int matvec_q8k_pool(AsiThreadPool *pool,
     else
         asi_matvec_worker(0, 1, &ctx);
     return 0;
+}
+
+typedef struct {
+    const uint8_t *w[4];
+    float *out[4];
+    int rows[4];
+    uint32_t quant_type[4];
+    int n_mats;
+    const LilaQ8KBlock *qx;
+    int blocks_per_row;
+    int apply_silu_mul;
+} AsiFusedMatvecCtx;
+
+static void asi_matvec_range(const uint8_t *w, const LilaQ8KBlock *qx, float *out,
+                             int start, int end, int bpr, uint32_t quant_type)
+{
+    if (quant_type == 12)
+    {
+        size_t rb = (size_t)bpr * Q4_K_BLOCK_SIZE;
+        for (int i = start; i < end; ++i)
+        {
+            const uint8_t *rp = w + (size_t)i * rb;
+            if (i + 2 < end) LILA_PREFETCH(rp + 2 * rb);
+            out[i] = q4k_dot_q8k_simd(rp, qx, bpr);
+        }
+    }
+    else if (quant_type == 14)
+    {
+        size_t rb = (size_t)bpr * Q6_K_BLOCK_SIZE;
+        for (int i = start; i < end; ++i)
+        {
+            const uint8_t *rp = w + (size_t)i * rb;
+            if (i + 2 < end)
+            {
+                LILA_PREFETCH(rp + 2 * rb);
+                LILA_PREFETCH(rp + 2 * rb + 64);
+            }
+            out[i] = q6k_dot_q8k_simd(rp, qx, bpr);
+        }
+    }
+}
+
+static void asi_fused_matvec_worker(int tid, int n_threads, void *vctx)
+{
+    const AsiFusedMatvecCtx *ctx = (const AsiFusedMatvecCtx *)vctx;
+    if (ctx->apply_silu_mul && ctx->n_mats == 2 && ctx->rows[0] == ctx->rows[1])
+    {
+        int total = ctx->rows[0];
+        int start = (total * tid) / n_threads;
+        int end = (total * (tid + 1)) / n_threads;
+        asi_matvec_range(ctx->w[0], ctx->qx, ctx->out[0], start, end, ctx->blocks_per_row, ctx->quant_type[0]);
+        asi_matvec_range(ctx->w[1], ctx->qx, ctx->out[1], start, end, ctx->blocks_per_row, ctx->quant_type[1]);
+        fast_silu_mul_vec(ctx->out[0] + start, ctx->out[1] + start, (uint32_t)(end - start));
+        return;
+    }
+    for (int m = 0; m < ctx->n_mats; ++m)
+    {
+        int total = ctx->rows[m];
+        int start = (total * tid) / n_threads;
+        int end = (total * (tid + 1)) / n_threads;
+        if (start < end)
+            asi_matvec_range(ctx->w[m], ctx->qx, ctx->out[m], start, end, ctx->blocks_per_row, ctx->quant_type[m]);
+    }
+}
+
+static void matvec_fused_q8k_pool(AsiThreadPool *pool,
+                                  const AsiV2Cartridge *cart,
+                                  const AsiV2TensorEntry **tensors,
+                                  float **outs,
+                                  int n_mats,
+                                  const LilaQ8KBlock *qx,
+                                  int bpr,
+                                  int apply_silu_mul)
+{
+    AsiFusedMatvecCtx ctx;
+    ctx.n_mats = n_mats;
+    ctx.qx = qx;
+    ctx.blocks_per_row = bpr;
+    ctx.apply_silu_mul = apply_silu_mul;
+    int max_rows = 0;
+    for (int m = 0; m < n_mats; ++m)
+    {
+        ctx.w[m] = tensor_data(cart, tensors[m]);
+        ctx.out[m] = outs[m];
+        ctx.rows[m] = (int)tensors[m]->shape[1];
+        ctx.quant_type[m] = tensors[m]->quant_type;
+        if (ctx.rows[m] > max_rows) max_rows = ctx.rows[m];
+    }
+    if (pool && max_rows >= 64)
+        asi_pool_run(pool, asi_fused_matvec_worker, &ctx);
+    else
+        asi_fused_matvec_worker(0, 1, &ctx);
 }
 
 static int matvec_tensor_pool(AsiThreadPool *pool,
@@ -416,12 +624,202 @@ static int matmul_batch_tensor(AsiThreadPool *pool,
     return -1;
 }
 
-static void apply_rope_neox_partial(float *vec, uint32_t rope_dim, uint32_t pos, float theta)
+typedef struct {
+    LilaQ8KBlock *qx_all;
+    const float *in;
+    int n_tokens;
+    int cols;
+} AsiQuantBatchCtx;
+
+static void asi_quantize_q8k_worker(int tid, int n_threads, void *vctx)
+{
+    const AsiQuantBatchCtx *ctx = (const AsiQuantBatchCtx *)vctx;
+    int start = (ctx->n_tokens * tid) / n_threads;
+    int end = (ctx->n_tokens * (tid + 1)) / n_threads;
+    for (int tok = start; tok < end; ++tok)
+    {
+        quantize_vec_q8k_strided(ctx->qx_all + tok, ctx->n_tokens,
+                                 ctx->in + (size_t)tok * ctx->cols, ctx->cols);
+    }
+}
+
+static void quantize_batch_q8k_pool(AsiThreadPool *pool,
+                                    LilaQ8KBlock *qx_all,
+                                    const float *in,
+                                    int n_tokens,
+                                    int cols)
+{
+    AsiQuantBatchCtx ctx = {qx_all, in, n_tokens, cols};
+    if (pool && n_tokens >= 16)
+        asi_pool_run(pool, asi_quantize_q8k_worker, &ctx);
+    else
+        asi_quantize_q8k_worker(0, 1, &ctx);
+}
+
+static int matmul_batch_tensor_qx(AsiThreadPool *pool,
+                                  const AsiV2Cartridge *cart,
+                                  const AsiV2TensorEntry *t,
+                                  float *out,
+                                  const LilaQ8KBlock *qx_all,
+                                  const float *in,
+                                  int n_tokens,
+                                  int bpr)
+{
+    if (qx_all && n_tokens > 1 && (t->quant_type == 12 || t->quant_type == 14) &&
+        !(t->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK))
+    {
+        return matmul_batch_q8k_pool(pool, cart, t, out, qx_all, n_tokens, bpr);
+    }
+    return matmul_batch_tensor(pool, cart, t, out, in, n_tokens);
+}
+
+typedef struct {
+    const uint8_t *w[4];
+    float *out[4];
+    int rows[4];
+    uint32_t quant_type[4];
+    int n_mats;
+    const LilaQ8KBlock *qx_all;
+    int n_tokens;
+    int blocks_per_row;
+    int apply_silu_mul;
+} AsiFusedMatmulBatchCtx;
+
+static void asi_fused_matmul_batch_worker(int tid, int n_threads, void *vctx)
+{
+    const AsiFusedMatmulBatchCtx *ctx = (const AsiFusedMatmulBatchCtx *)vctx;
+    for (int m = 0; m < ctx->n_mats; ++m)
+    {
+        int rows = ctx->rows[m];
+        int start = (rows * tid) / n_threads;
+        int end = (rows * (tid + 1)) / n_threads;
+        if (start >= end) continue;
+        if (ctx->quant_type[m] == 12)
+        {
+            q4k_matmul_batch_q8k_range(ctx->out[m], ctx->w[m], ctx->qx_all,
+                                       ctx->n_tokens, start, end, rows, ctx->blocks_per_row);
+        }
+        else if (ctx->quant_type[m] == 14)
+        {
+            q6k_matmul_batch_q8k_range(ctx->out[m], ctx->w[m], ctx->qx_all,
+                                       ctx->n_tokens, start, end, rows, ctx->blocks_per_row);
+        }
+    }
+    if (ctx->apply_silu_mul && ctx->n_mats >= 2)
+    {
+        int rows = ctx->rows[0];
+        int start = (rows * tid) / n_threads;
+        int end = (rows * (tid + 1)) / n_threads;
+        int count = end - start;
+        if (count > 0)
+        {
+            for (int t = 0; t < ctx->n_tokens; ++t)
+            {
+                size_t off = (size_t)t * (size_t)rows + (size_t)start;
+                fast_silu_mul_vec(ctx->out[0] + off, ctx->out[1] + off, (uint32_t)count);
+            }
+        }
+    }
+}
+
+static int matmul_batch_fused_q8k_pool(AsiThreadPool *pool,
+                                       const AsiV2Cartridge *cart,
+                                       const AsiV2TensorEntry **ts,
+                                       float **outs,
+                                       int n_mats,
+                                       const LilaQ8KBlock *qx_all,
+                                       const float *in,
+                                       int n_tokens,
+                                       int bpr,
+                                       int apply_silu_mul)
+{
+    if (n_tokens <= 1 || !qx_all)
+    {
+        for (int m = 0; m < n_mats; ++m)
+            matmul_batch_tensor(pool, cart, ts[m], outs[m], in, n_tokens);
+        if (apply_silu_mul && n_mats >= 2)
+            fast_silu_mul_vec(outs[0], outs[1], (uint32_t)((size_t)n_tokens * (size_t)ts[0]->shape[1]));
+        return 0;
+    }
+    for (int m = 0; m < n_mats; ++m)
+    {
+        if ((ts[m]->quant_type != 12 && ts[m]->quant_type != 14) ||
+            (ts[m]->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK))
+        {
+            for (int k = 0; k < n_mats; ++k)
+                matmul_batch_tensor_qx(pool, cart, ts[k], outs[k], qx_all, in, n_tokens, bpr);
+            if (apply_silu_mul && n_mats >= 2)
+                fast_silu_mul_vec(outs[0], outs[1], (uint32_t)((size_t)n_tokens * (size_t)ts[0]->shape[1]));
+            return 0;
+        }
+    }
+    AsiFusedMatmulBatchCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.n_mats = n_mats;
+    ctx.qx_all = qx_all;
+    ctx.n_tokens = n_tokens;
+    ctx.blocks_per_row = bpr;
+    ctx.apply_silu_mul = apply_silu_mul;
+    for (int m = 0; m < n_mats; ++m)
+    {
+        ctx.w[m] = tensor_data(cart, ts[m]);
+        ctx.out[m] = outs[m];
+        ctx.rows[m] = (int)ts[m]->shape[1];
+        ctx.quant_type[m] = ts[m]->quant_type;
+    }
+    if (pool)
+        asi_pool_run(pool, asi_fused_matmul_batch_worker, &ctx);
+    else
+        asi_fused_matmul_batch_worker(0, 1, &ctx);
+    return 0;
+}
+
+static inline float dot_f32_f16_avx2(const float *q, const uint16_t *k_fp16, uint32_t hd)
+{
+#if defined(__AVX2__) && defined(__F16C__)
+    if ((hd & 7u) == 0u)
+    {
+        __m256 vacc = _mm256_setzero_ps();
+        for (uint32_t d = 0; d < hd; d += 8)
+        {
+            __m128i kh = _mm_loadu_si128((const __m128i *)(k_fp16 + d));
+            __m256 kf = _mm256_cvtph_ps(kh);
+            __m256 qf = _mm256_loadu_ps(q + d);
+            vacc = _mm256_fmadd_ps(qf, kf, vacc);
+        }
+        return lila_hsum_f32_avx2(vacc);
+    }
+#endif
+    float dot = 0.0f;
+    for (uint32_t d = 0; d < hd; ++d) dot += q[d] * fp16_to_fp32(k_fp16[d]);
+    return dot;
+}
+
+static inline void accum_f16_f32_avx2(float *oh, const uint16_t *v_fp16, float prob, uint32_t hd)
+{
+#if defined(__AVX2__) && defined(__F16C__)
+    if ((hd & 7u) == 0u)
+    {
+        __m256 vp = _mm256_set1_ps(prob);
+        for (uint32_t d = 0; d < hd; d += 8)
+        {
+            __m128i vh = _mm_loadu_si128((const __m128i *)(v_fp16 + d));
+            __m256 vf = _mm256_cvtph_ps(vh);
+            __m256 ov = _mm256_loadu_ps(oh + d);
+            _mm256_storeu_ps(oh + d, _mm256_fmadd_ps(vp, vf, ov));
+        }
+        return;
+    }
+#endif
+    for (uint32_t d = 0; d < hd; ++d) oh[d] += prob * fp16_to_fp32(v_fp16[d]);
+}
+
+static void apply_rope_neox_partial(float *vec, uint32_t rope_dim, uint32_t pos, float theta, const float *inv_freq)
 {
     uint32_t half = rope_dim / 2;
     for (uint32_t i = 0; i < half; ++i)
     {
-        float freq = 1.0f / powf(theta, (float)(2 * i) / (float)rope_dim);
+        float freq = inv_freq ? inv_freq[i] : (1.0f / powf(theta, (float)(2 * i) / (float)rope_dim));
         float angle = (float)pos * freq;
         float c = cosf(angle);
         float s = sinf(angle);
@@ -457,6 +855,7 @@ static void qwen35_free_session(AsiArchSession *s)
     free(s->prefix_ssm);
     free(s->prefix_k);
     free(s->prefix_v);
+    free(s->rope_inv_freq);
     if (s->layers)
     {
         for (uint32_t i = 0; i < s->cart->config.n_layers; ++i)
@@ -491,6 +890,20 @@ static void qwen35_free_session(AsiArchSession *s)
     free(s->scratch.alpha);
     free(s->scratch.beta);
     free(s->scratch.v_pred);
+    free(s->scratch.xb);
+    free(s->scratch.xnb);
+    free(s->scratch.projb);
+    free(s->scratch.qkvb);
+    free(s->scratch.zb);
+    free(s->scratch.ab);
+    free(s->scratch.bb);
+    free(s->scratch.qgb);
+    free(s->scratch.kb);
+    free(s->scratch.vb);
+    free(s->scratch.aob);
+    free(s->scratch.fgb);
+    free(s->scratch.fub);
+    free(s->scratch.qx_h);
     free(s);
 }
 
@@ -587,6 +1000,16 @@ static int qwen35_init_session(const AsiV2Cartridge *cart,
     s->scratch.alpha = (float *)calloc(c->ssm_time_step_rank, sizeof(float));
     s->scratch.beta = (float *)calloc(c->ssm_time_step_rank, sizeof(float));
     s->scratch.v_pred = (float *)calloc(c->ssm_state_size, sizeof(float));
+    if (c->rope_dim >= 2)
+    {
+        uint32_t half = c->rope_dim / 2;
+        s->rope_inv_freq = (float *)malloc((size_t)half * sizeof(float));
+        if (s->rope_inv_freq)
+        {
+            for (uint32_t i = 0; i < half; ++i)
+                s->rope_inv_freq[i] = 1.0f / powf(c->rope_theta, (float)(2 * i) / (float)c->rope_dim);
+        }
+    }
 
     if (!s->scratch.x || !s->scratch.x_norm || !s->scratch.qkv || !s->scratch.z ||
         !s->scratch.qg || !s->scratch.k || !s->scratch.v || !s->scratch.attn_out ||
@@ -903,7 +1326,7 @@ static inline void deltanet_head_step_avx2(float *S,
         }
     }
     rmsnorm(oh, oh, ssm_norm_w, v_dim, rms_eps);
-    for (uint32_t j = 0; j < v_dim; ++j) oh[j] *= fast_silu(zh[j]);
+    fast_silu_mul_out_vec(oh, zh, v_dim);
 }
 
 typedef struct {
@@ -976,10 +1399,9 @@ static void qwen35_step_deltanet(AsiArchSession *s, uint32_t layer_idx)
     if (qx)
     {
         quantize_vec_q8k(qx, sc->x_norm, (int)c->hidden_size);
-        matvec_q8k_pool(s->pool, cart, lw->attn_qkv, sc->qkv, qx, bpr);
-        matvec_q8k_pool(s->pool, cart, lw->attn_gate, sc->z, qx, bpr);
-        matvec_q8k_pool(s->pool, cart, lw->ssm_alpha, sc->alpha, qx, bpr);
-        matvec_q8k_pool(s->pool, cart, lw->ssm_beta, sc->beta, qx, bpr);
+        const AsiV2TensorEntry *ts[4] = {lw->attn_qkv, lw->attn_gate, lw->ssm_alpha, lw->ssm_beta};
+        float *outs[4] = {sc->qkv, sc->z, sc->alpha, sc->beta};
+        matvec_fused_q8k_pool(s->pool, cart, ts, outs, 4, qx, bpr, 0);
         if (qx != stack_qx) free(qx);
     }
     else
@@ -1007,8 +1429,9 @@ static void qwen35_step_deltanet(AsiArchSession *s, uint32_t layer_idx)
         {
             st->conv_state[(size_t)(conv_hist - 1) * qkv_dim + ch] = sc->qkv[ch];
         }
-        sc->qkv[ch] = fast_silu(sum);
+        sc->qkv[ch] = sum;
     }
+    fast_silu_inplace_vec(sc->qkv, qkv_dim);
 
     const float *ssm_a = (const float *)tensor_data(cart, lw->ssm_a);
     const float *dt_bias = (const float *)tensor_data(cart, lw->ssm_dt_bias);
@@ -1050,9 +1473,9 @@ static void qwen35_step_full_attn(AsiArchSession *s, uint32_t layer_idx, uint32_
     if (qx)
     {
         quantize_vec_q8k(qx, sc->x_norm, (int)c->hidden_size);
-        matvec_q8k_pool(s->pool, cart, lw->attn_q, sc->qg, qx, bpr);
-        matvec_q8k_pool(s->pool, cart, lw->attn_k, sc->k, qx, bpr);
-        matvec_q8k_pool(s->pool, cart, lw->attn_v, sc->v, qx, bpr);
+        const AsiV2TensorEntry *ts[3] = {lw->attn_q, lw->attn_k, lw->attn_v};
+        float *outs[3] = {sc->qg, sc->k, sc->v};
+        matvec_fused_q8k_pool(s->pool, cart, ts, outs, 3, qx, bpr, 0);
         if (qx != stack_qx) free(qx);
     }
     else
@@ -1069,7 +1492,7 @@ static void qwen35_step_full_attn(AsiArchSession *s, uint32_t layer_idx, uint32_
     {
         float *kh = sc->k + (size_t)h * hd;
         rmsnorm(kh, kh, kn_w, hd, c->rms_norm_eps);
-        apply_rope_neox_partial(kh, c->rope_dim, pos, c->rope_theta);
+        apply_rope_neox_partial(kh, c->rope_dim, pos, c->rope_theta, s->rope_inv_freq);
     }
 
     uint16_t *k_dst = kv->k_cache + (size_t)pos * kv_dim;
@@ -1086,19 +1509,14 @@ static void qwen35_step_full_attn(AsiArchSession *s, uint32_t layer_idx, uint32_
         float *qh = sc->qg + (size_t)h * 2 * hd;
         const float *gh = qh + hd;
         rmsnorm(qh, qh, qn_w, hd, c->rms_norm_eps);
-        apply_rope_neox_partial(qh, c->rope_dim, pos, c->rope_theta);
+        apply_rope_neox_partial(qh, c->rope_dim, pos, c->rope_theta, s->rope_inv_freq);
 
         uint32_t kvh = h / n_rep;
         float max_score = -1e30f;
         for (uint32_t t = 0; t <= pos; ++t)
         {
             const uint16_t *kt = kv->k_cache + (size_t)t * kv_dim + (size_t)kvh * hd;
-            float dot = 0.0f;
-            for (uint32_t d = 0; d < hd; ++d)
-            {
-                dot += qh[d] * fp16_to_fp32(kt[d]);
-            }
-            float score = dot * scale;
+            float score = dot_f32_f16_avx2(qh, kt, hd) * scale;
             sc->attn_scores[t] = score;
             if (score > max_score) max_score = score;
         }
@@ -1118,10 +1536,7 @@ static void qwen35_step_full_attn(AsiArchSession *s, uint32_t layer_idx, uint32_
         {
             float prob = sc->attn_scores[t] * inv_sum;
             const uint16_t *vt = kv->v_cache + (size_t)t * kv_dim + (size_t)kvh * hd;
-            for (uint32_t d = 0; d < hd; ++d)
-            {
-                oh[d] += prob * fp16_to_fp32(vt[d]);
-            }
+            accum_f16_f32_avx2(oh, vt, prob, hd);
         }
         for (uint32_t d = 0; d < hd; ++d)
         {
@@ -1184,18 +1599,16 @@ static int qwen35_forward_token(AsiArchSession *s, int32_t token_id, uint32_t po
         if (qx)
         {
             quantize_vec_q8k(qx, sc->x_norm, (int)c->hidden_size);
-            matvec_q8k_pool(s->pool, cart, lw->ffn_gate, sc->ffn_gate, qx, bpr);
-            matvec_q8k_pool(s->pool, cart, lw->ffn_up, sc->ffn_up, qx, bpr);
+            const AsiV2TensorEntry *ts[2] = {lw->ffn_gate, lw->ffn_up};
+            float *outs[2] = {sc->ffn_gate, sc->ffn_up};
+            matvec_fused_q8k_pool(s->pool, cart, ts, outs, 2, qx, bpr, 1);
             if (qx != stack_qx) free(qx);
         }
         else
         {
             matvec_tensor_pool(s->pool, cart, lw->ffn_gate, sc->ffn_gate, sc->x_norm);
             matvec_tensor_pool(s->pool, cart, lw->ffn_up, sc->ffn_up, sc->x_norm);
-        }
-        for (uint32_t i = 0; i < c->intermediate_size; ++i)
-        {
-            sc->ffn_gate[i] = fast_silu(sc->ffn_gate[i]) * sc->ffn_up[i];
+            fast_silu_mul_vec(sc->ffn_gate, sc->ffn_up, c->intermediate_size);
         }
         matvec_tensor_pool(s->pool, cart, lw->ffn_down, sc->proj_out, sc->ffn_gate);
         for (uint32_t i = 0; i < c->hidden_size; ++i)
@@ -1220,6 +1633,169 @@ static int qwen35_forward_token(AsiArchSession *s, int32_t token_id, uint32_t po
     return rc;
 }
 
+typedef struct {
+    float *qkvb;
+    float *conv_state;
+    const float *conv_w;
+    uint32_t B;
+    uint32_t qkv_dim;
+    uint32_t k_conv;
+    uint32_t conv_hist;
+} AsiConv1dCtx;
+
+static void asi_conv1d_worker(int tid, int n_threads, void *vctx)
+{
+    const AsiConv1dCtx *ctx = (const AsiConv1dCtx *)vctx;
+    uint32_t ch_start = (ctx->qkv_dim * (uint32_t)tid) / (uint32_t)n_threads;
+    uint32_t ch_end = (ctx->qkv_dim * (uint32_t)(tid + 1)) / (uint32_t)n_threads;
+    uint32_t k_conv = ctx->k_conv;
+    uint32_t conv_hist = ctx->conv_hist;
+    uint32_t qkv_dim = ctx->qkv_dim;
+
+    for (uint32_t t = 0; t < ctx->B; ++t)
+    {
+        float *qkv = ctx->qkvb + (size_t)t * qkv_dim;
+        for (uint32_t ch = ch_start; ch < ch_end; ++ch)
+        {
+            const float *w = ctx->conv_w + (size_t)ch * k_conv;
+            float sum = w[k_conv - 1] * qkv[ch];
+            for (uint32_t k = 0; k < conv_hist; ++k)
+                sum += w[k] * ctx->conv_state[(size_t)k * qkv_dim + ch];
+            for (uint32_t k = 0; k + 1 < conv_hist; ++k)
+                ctx->conv_state[(size_t)k * qkv_dim + ch] = ctx->conv_state[(size_t)(k + 1) * qkv_dim + ch];
+            if (conv_hist > 0)
+                ctx->conv_state[(size_t)(conv_hist - 1) * qkv_dim + ch] = qkv[ch];
+            qkv[ch] = sum;
+        }
+        fast_silu_inplace_vec(qkv + ch_start, ch_end - ch_start);
+    }
+}
+
+typedef struct {
+    float *qgb;
+    float *aob;
+    const uint16_t *k_cache;
+    const uint16_t *v_cache;
+    const float *qn_w;
+    const float *rope_inv_freq;
+    uint32_t B;
+    uint32_t pos_start;
+    uint32_t n_heads;
+    uint32_t n_rep;
+    uint32_t hd;
+    uint32_t qg_dim;
+    uint32_t kv_dim;
+    uint32_t attn_dim;
+    uint32_t rope_dim;
+    float rope_theta;
+    float rms_eps;
+    float scale;
+} AsiFullAttnBatchCtx;
+
+static void asi_full_attn_batch_worker(int tid, int n_threads, void *vctx)
+{
+    const AsiFullAttnBatchCtx *ctx = (const AsiFullAttnBatchCtx *)vctx;
+    uint32_t h_start = (ctx->n_heads * (uint32_t)tid) / (uint32_t)n_threads;
+    uint32_t h_end = (ctx->n_heads * (uint32_t)(tid + 1)) / (uint32_t)n_threads;
+    uint32_t max_pos = ctx->pos_start + ctx->B;
+    float stack_scores[2048];
+    float *scores = (max_pos <= 2048) ? stack_scores : (float *)malloc((size_t)max_pos * sizeof(float));
+    if (!scores) return;
+
+    uint32_t hd = ctx->hd;
+    uint32_t kv_dim = ctx->kv_dim;
+    for (uint32_t t = 0; t < ctx->B; ++t)
+    {
+        uint32_t pos = ctx->pos_start + t;
+        float *qg = ctx->qgb + (size_t)t * ctx->qg_dim;
+        float *ao = ctx->aob + (size_t)t * ctx->attn_dim;
+        for (uint32_t h = h_start; h < h_end; ++h)
+        {
+            float *qh = qg + (size_t)h * 2 * hd;
+            const float *gh = qh + hd;
+            rmsnorm(qh, qh, ctx->qn_w, hd, ctx->rms_eps);
+            apply_rope_neox_partial(qh, ctx->rope_dim, pos, ctx->rope_theta, ctx->rope_inv_freq);
+            uint32_t kvh = h / ctx->n_rep;
+            float max_score = -1e30f;
+            for (uint32_t p = 0; p <= pos; ++p)
+            {
+                const uint16_t *kt = ctx->k_cache + (size_t)p * kv_dim + (size_t)kvh * hd;
+                float sc_val = dot_f32_f16_avx2(qh, kt, hd) * ctx->scale;
+                scores[p] = sc_val;
+                if (sc_val > max_score) max_score = sc_val;
+            }
+            float sum_exp = 0.0f;
+            for (uint32_t p = 0; p <= pos; ++p)
+            {
+                float e = expf(scores[p] - max_score);
+                scores[p] = e;
+                sum_exp += e;
+            }
+            float inv_sum = 1.0f / sum_exp;
+            float *oh = ao + (size_t)h * hd;
+            memset(oh, 0, hd * sizeof(float));
+            for (uint32_t p = 0; p <= pos; ++p)
+            {
+                float prob = scores[p] * inv_sum;
+                const uint16_t *vt = ctx->v_cache + (size_t)p * kv_dim + (size_t)kvh * hd;
+                accum_f16_f32_avx2(oh, vt, prob, hd);
+            }
+            for (uint32_t d = 0; d < hd; ++d) oh[d] *= fast_sigmoid(gh[d]);
+        }
+    }
+    if (scores != stack_scores) free(scores);
+}
+
+static int ensure_batch_scratch(AsiArchSession *s, uint32_t B)
+{
+    Qwen35Scratch *sc = &s->scratch;
+    if (B <= sc->batch_cap) return 0;
+
+    const AsiV2ModelConfig *c = &s->cart->config;
+    uint32_t H = c->hidden_size;
+    uint32_t I = c->intermediate_size;
+    uint32_t qkv_dim = c->ssm_inner_size * 3;
+    uint32_t z_dim = c->ssm_inner_size;
+    uint32_t qg_dim = c->n_heads * 2 * c->head_dim;
+    uint32_t kv_dim = c->n_kv_heads * c->head_dim;
+    uint32_t attn_dim = c->n_heads * c->head_dim;
+    uint32_t ssm_r = c->ssm_time_step_rank;
+    uint32_t max_in_dim = H;
+    if (I > max_in_dim) max_in_dim = I;
+    if (attn_dim > max_in_dim) max_in_dim = attn_dim;
+    if (z_dim > max_in_dim) max_in_dim = z_dim;
+    int bpr_max = ((int)max_in_dim + QK_K - 1) / QK_K;
+
+    free(sc->xb); free(sc->xnb); free(sc->projb); free(sc->qkvb);
+    free(sc->zb); free(sc->ab); free(sc->bb); free(sc->qgb);
+    free(sc->kb); free(sc->vb); free(sc->aob); free(sc->fgb);
+    free(sc->fub); free(sc->qx_h);
+
+    sc->xb    = (float *)malloc((size_t)B * H * sizeof(float));
+    sc->xnb   = (float *)malloc((size_t)B * H * sizeof(float));
+    sc->projb = (float *)malloc((size_t)B * H * sizeof(float));
+    sc->qkvb  = (float *)malloc((size_t)B * qkv_dim * sizeof(float));
+    sc->zb    = (float *)malloc((size_t)B * z_dim * sizeof(float));
+    sc->ab    = (float *)malloc((size_t)B * ssm_r * sizeof(float));
+    sc->bb    = (float *)malloc((size_t)B * ssm_r * sizeof(float));
+    sc->qgb   = (float *)malloc((size_t)B * qg_dim * sizeof(float));
+    sc->kb    = (float *)malloc((size_t)B * kv_dim * sizeof(float));
+    sc->vb    = (float *)malloc((size_t)B * kv_dim * sizeof(float));
+    sc->aob   = (float *)malloc((size_t)B * (attn_dim > z_dim ? attn_dim : z_dim) * sizeof(float));
+    sc->fgb   = (float *)malloc((size_t)B * I * sizeof(float));
+    sc->fub   = (float *)malloc((size_t)B * I * sizeof(float));
+    sc->qx_h  = (LilaQ8KBlock *)malloc((size_t)B * (size_t)bpr_max * sizeof(LilaQ8KBlock));
+
+    if (!sc->xb || !sc->xnb || !sc->projb || !sc->qkvb || !sc->zb || !sc->ab || !sc->bb ||
+        !sc->qgb || !sc->kb || !sc->vb || !sc->aob || !sc->fgb || !sc->fub || !sc->qx_h)
+    {
+        sc->batch_cap = 0;
+        return -1;
+    }
+    sc->batch_cap = B;
+    return 0;
+}
+
 static int qwen35_forward_chunk(AsiArchSession *s,
                                 const int32_t *token_ids,
                                 uint32_t B,
@@ -1229,38 +1805,35 @@ static int qwen35_forward_chunk(AsiArchSession *s,
 {
     int do_prof = (getenv("LILA_ASI_PROFILE") != NULL);
     double tc0 = do_prof ? asi_now_ms() : 0.0;
-    double t_mm = 0.0, t_ssm = 0.0, t_attn = 0.0;
+    double t_mm = 0.0, t_ssm = 0.0, t_attn = 0.0, t_conv = 0.0, t_norm = 0.0, t_lm = 0.0;
     const AsiV2Cartridge *cart = s->cart;
     const AsiV2ModelConfig *c = &cart->config;
     uint32_t H = c->hidden_size;
     uint32_t I = c->intermediate_size;
     uint32_t qkv_dim = c->ssm_inner_size * 3;
     uint32_t z_dim = c->ssm_inner_size;
+    (void)z_dim;
     uint32_t qg_dim = c->n_heads * 2 * c->head_dim;
     uint32_t kv_dim = c->n_kv_heads * c->head_dim;
     uint32_t attn_dim = c->n_heads * c->head_dim;
     uint32_t ssm_r = c->ssm_time_step_rank;
+    int bpr_h = ((int)H + QK_K - 1) / QK_K;
 
-    float *xb = (float *)malloc((size_t)B * H * sizeof(float));
-    float *xnb = (float *)malloc((size_t)B * H * sizeof(float));
-    float *projb = (float *)malloc((size_t)B * H * sizeof(float));
-    float *qkvb = (float *)malloc((size_t)B * qkv_dim * sizeof(float));
-    float *zb = (float *)malloc((size_t)B * z_dim * sizeof(float));
-    float *ab = (float *)malloc((size_t)B * ssm_r * sizeof(float));
-    float *bb = (float *)malloc((size_t)B * ssm_r * sizeof(float));
-    float *qgb = (float *)malloc((size_t)B * qg_dim * sizeof(float));
-    float *kb = (float *)malloc((size_t)B * kv_dim * sizeof(float));
-    float *vb = (float *)malloc((size_t)B * kv_dim * sizeof(float));
-    float *aob = (float *)malloc((size_t)B * (attn_dim > z_dim ? attn_dim : z_dim) * sizeof(float));
-    float *fgb = (float *)malloc((size_t)B * I * sizeof(float));
-    float *fub = (float *)malloc((size_t)B * I * sizeof(float));
-
-    if (!xb || !xnb || !projb || !qkvb || !zb || !ab || !bb || !qgb || !kb || !vb || !aob || !fgb || !fub)
-    {
-        free(xb); free(xnb); free(projb); free(qkvb); free(zb); free(ab); free(bb);
-        free(qgb); free(kb); free(vb); free(aob); free(fgb); free(fub);
-        return -1;
-    }
+    if (ensure_batch_scratch(s, B) != 0) return -1;
+    float *xb    = s->scratch.xb;
+    float *xnb   = s->scratch.xnb;
+    float *projb = s->scratch.projb;
+    float *qkvb  = s->scratch.qkvb;
+    float *zb    = s->scratch.zb;
+    float *ab    = s->scratch.ab;
+    float *bb    = s->scratch.bb;
+    float *qgb   = s->scratch.qgb;
+    float *kb    = s->scratch.kb;
+    float *vb    = s->scratch.vb;
+    float *aob   = s->scratch.aob;
+    float *fgb   = s->scratch.fgb;
+    float *fub   = s->scratch.fub;
+    LilaQ8KBlock *qx_h = s->scratch.qx_h;
 
     const uint8_t *embd_base = tensor_data(cart, s->token_embd);
     if (s->token_embd->layout_flags & ASI_TENSOR_LAYOUT_AVX2_REPACK)
@@ -1279,18 +1852,22 @@ static int qwen35_forward_chunk(AsiArchSession *s,
     for (uint32_t l = 0; l < c->n_layers; ++l)
     {
         const Qwen35LayerWeights *lw = &s->layers[l];
+        double tp = do_prof ? asi_now_ms() : 0.0;
         const float *an_w = (const float *)tensor_data(cart, lw->attn_norm);
         for (uint32_t t = 0; t < B; ++t)
         {
             rmsnorm(xnb + (size_t)t * H, xb + (size_t)t * H, an_w, H, c->rms_norm_eps);
         }
+        if (do_prof) t_norm += asi_now_ms() - tp;
 
         if (lw->kind == QWEN35_LAYER_DELTANET)
         {
-            matmul_batch_tensor(s->pool, cart, lw->attn_qkv, qkvb, xnb, (int)B);
-            matmul_batch_tensor(s->pool, cart, lw->attn_gate, zb, xnb, (int)B);
-            matmul_batch_tensor(s->pool, cart, lw->ssm_alpha, ab, xnb, (int)B);
-            matmul_batch_tensor(s->pool, cart, lw->ssm_beta, bb, xnb, (int)B);
+            tp = do_prof ? asi_now_ms() : 0.0;
+            quantize_batch_q8k_pool(s->pool, qx_h, xnb, (int)B, (int)H);
+            const AsiV2TensorEntry *ts[4] = {lw->attn_qkv, lw->attn_gate, lw->ssm_alpha, lw->ssm_beta};
+            float *outs[4] = {qkvb, zb, ab, bb};
+            matmul_batch_fused_q8k_pool(s->pool, cart, ts, outs, 4, qx_h, xnb, (int)B, bpr_h, 0);
+            if (do_prof) t_mm += asi_now_ms() - tp;
 
             Qwen35DeltaNetState *st = &s->ssm_states[l];
             const float *conv_w = (const float *)tensor_data(cart, lw->ssm_conv1d);
@@ -1304,22 +1881,11 @@ static int qwen35_forward_chunk(AsiArchSession *s,
             uint32_t conv_hist = (k_conv > 1) ? (k_conv - 1) : 0;
             float q_scale = 1.0f / sqrtf((float)k_dim);
 
-            for (uint32_t t = 0; t < B; ++t)
-            {
-                float *qkv = qkvb + (size_t)t * qkv_dim;
-                for (uint32_t ch = 0; ch < qkv_dim; ++ch)
-                {
-                    const float *w = conv_w + (size_t)ch * k_conv;
-                    float sum = w[k_conv - 1] * qkv[ch];
-                    for (uint32_t k = 0; k < conv_hist; ++k)
-                        sum += w[k] * st->conv_state[(size_t)k * qkv_dim + ch];
-                    for (uint32_t k = 0; k + 1 < conv_hist; ++k)
-                        st->conv_state[(size_t)k * qkv_dim + ch] = st->conv_state[(size_t)(k + 1) * qkv_dim + ch];
-                    if (conv_hist > 0)
-                        st->conv_state[(size_t)(conv_hist - 1) * qkv_dim + ch] = qkv[ch];
-                    qkv[ch] = fast_silu(sum);
-                }
-            }
+            tp = do_prof ? asi_now_ms() : 0.0;
+            AsiConv1dCtx cctx = {qkvb, st->conv_state, conv_w, B, qkv_dim, k_conv, conv_hist};
+            asi_pool_run(s->pool, asi_conv1d_worker, &cctx);
+            if (do_prof) t_conv += asi_now_ms() - tp;
+            tp = do_prof ? asi_now_ms() : 0.0;
             AsiDeltaNetCtx dctx = {
                 st->ssm_state, qkvb, zb, ab, bb, aob,
                 ssm_a, dt_bias, ssm_norm_w,
@@ -1327,13 +1893,22 @@ static int qwen35_forward_chunk(AsiArchSession *s,
                 q_scale, c->rms_norm_eps
             };
             asi_pool_run(s->pool, asi_deltanet_worker, &dctx);
-            matmul_batch_tensor(s->pool, cart, lw->ssm_out, projb, aob, (int)B);
+            if (do_prof) t_ssm += asi_now_ms() - tp;
+            tp = do_prof ? asi_now_ms() : 0.0;
+            int ssm_in_cols = (int)lw->ssm_out->shape[0];
+            int ssm_in_bpr = (ssm_in_cols + QK_K - 1) / QK_K;
+            quantize_batch_q8k_pool(s->pool, qx_h, aob, (int)B, ssm_in_cols);
+            matmul_batch_tensor_qx(s->pool, cart, lw->ssm_out, projb, qx_h, aob, (int)B, ssm_in_bpr);
+            if (do_prof) t_mm += asi_now_ms() - tp;
         }
         else
         {
-            matmul_batch_tensor(s->pool, cart, lw->attn_q, qgb, xnb, (int)B);
-            matmul_batch_tensor(s->pool, cart, lw->attn_k, kb, xnb, (int)B);
-            matmul_batch_tensor(s->pool, cart, lw->attn_v, vb, xnb, (int)B);
+            tp = do_prof ? asi_now_ms() : 0.0;
+            quantize_batch_q8k_pool(s->pool, qx_h, xnb, (int)B, (int)H);
+            const AsiV2TensorEntry *ts[3] = {lw->attn_q, lw->attn_k, lw->attn_v};
+            float *outs[3] = {qgb, kb, vb};
+            matmul_batch_fused_q8k_pool(s->pool, cart, ts, outs, 3, qx_h, xnb, (int)B, bpr_h, 0);
+            if (do_prof) t_mm += asi_now_ms() - tp;
 
             Qwen35AttnKVState *kv = &s->kv_states[l];
             const float *qn_w = (const float *)tensor_data(cart, lw->attn_q_norm);
@@ -1344,19 +1919,18 @@ static int qwen35_forward_chunk(AsiArchSession *s,
             uint32_t n_rep = n_heads / n_kv;
             float scale = 1.0f / sqrtf((float)hd);
 
+            tp = do_prof ? asi_now_ms() : 0.0;
             for (uint32_t t = 0; t < B; ++t)
             {
                 uint32_t pos = pos_start + t;
-                float *qg = qgb + (size_t)t * qg_dim;
                 float *k = kb + (size_t)t * kv_dim;
                 float *v = vb + (size_t)t * kv_dim;
-                float *ao = aob + (size_t)t * attn_dim;
 
                 for (uint32_t h = 0; h < n_kv; ++h)
                 {
                     float *kh = k + (size_t)h * hd;
                     rmsnorm(kh, kh, kn_w, hd, c->rms_norm_eps);
-                    apply_rope_neox_partial(kh, c->rope_dim, pos, c->rope_theta);
+                    apply_rope_neox_partial(kh, c->rope_dim, pos, c->rope_theta, s->rope_inv_freq);
                 }
                 uint16_t *k_dst = kv->k_cache + (size_t)pos * kv_dim;
                 uint16_t *v_dst = kv->v_cache + (size_t)pos * kv_dim;
@@ -1365,46 +1939,23 @@ static int qwen35_forward_chunk(AsiArchSession *s,
                     k_dst[i] = fp32_to_fp16(k[i]);
                     v_dst[i] = fp32_to_fp16(v[i]);
                 }
-
-                for (uint32_t h = 0; h < n_heads; ++h)
-                {
-                    float *qh = qg + (size_t)h * 2 * hd;
-                    const float *gh = qh + hd;
-                    rmsnorm(qh, qh, qn_w, hd, c->rms_norm_eps);
-                    apply_rope_neox_partial(qh, c->rope_dim, pos, c->rope_theta);
-                    uint32_t kvh = h / n_rep;
-                    float max_score = -1e30f;
-                    for (uint32_t p = 0; p <= pos; ++p)
-                    {
-                        const uint16_t *kt = kv->k_cache + (size_t)p * kv_dim + (size_t)kvh * hd;
-                        float dot = 0.0f;
-                        for (uint32_t d = 0; d < hd; ++d) dot += qh[d] * fp16_to_fp32(kt[d]);
-                        float sc_val = dot * scale;
-                        s->scratch.attn_scores[p] = sc_val;
-                        if (sc_val > max_score) max_score = sc_val;
-                    }
-                    float sum_exp = 0.0f;
-                    for (uint32_t p = 0; p <= pos; ++p)
-                    {
-                        float e = expf(s->scratch.attn_scores[p] - max_score);
-                        s->scratch.attn_scores[p] = e;
-                        sum_exp += e;
-                    }
-                    float inv_sum = 1.0f / sum_exp;
-                    float *oh = ao + (size_t)h * hd;
-                    memset(oh, 0, hd * sizeof(float));
-                    for (uint32_t p = 0; p <= pos; ++p)
-                    {
-                        float prob = s->scratch.attn_scores[p] * inv_sum;
-                        const uint16_t *vt = kv->v_cache + (size_t)p * kv_dim + (size_t)kvh * hd;
-                        for (uint32_t d = 0; d < hd; ++d) oh[d] += prob * fp16_to_fp32(vt[d]);
-                    }
-                    for (uint32_t d = 0; d < hd; ++d) oh[d] *= fast_sigmoid(gh[d]);
-                }
             }
-            matmul_batch_tensor(s->pool, cart, lw->attn_output, projb, aob, (int)B);
+            AsiFullAttnBatchCtx fctx = {
+                qgb, aob, kv->k_cache, kv->v_cache, qn_w, s->rope_inv_freq,
+                B, pos_start, n_heads, n_rep, hd, qg_dim, kv_dim, attn_dim,
+                c->rope_dim, c->rope_theta, c->rms_norm_eps, scale
+            };
+            asi_pool_run(s->pool, asi_full_attn_batch_worker, &fctx);
+            if (do_prof) t_attn += asi_now_ms() - tp;
+            tp = do_prof ? asi_now_ms() : 0.0;
+            int attn_in_cols = (int)lw->attn_output->shape[0];
+            int attn_in_bpr = (attn_in_cols + QK_K - 1) / QK_K;
+            quantize_batch_q8k_pool(s->pool, qx_h, aob, (int)B, attn_in_cols);
+            matmul_batch_tensor_qx(s->pool, cart, lw->attn_output, projb, qx_h, aob, (int)B, attn_in_bpr);
+            if (do_prof) t_mm += asi_now_ms() - tp;
         }
 
+        tp = do_prof ? asi_now_ms() : 0.0;
         for (size_t i = 0; i < (size_t)B * H; ++i) xb[i] += projb[i];
 
         const float *pn_w = (const float *)tensor_data(cart, lw->post_attn_norm);
@@ -1412,32 +1963,39 @@ static int qwen35_forward_chunk(AsiArchSession *s,
         {
             rmsnorm(xnb + (size_t)t * H, xb + (size_t)t * H, pn_w, H, c->rms_norm_eps);
         }
-        matmul_batch_tensor(s->pool, cart, lw->ffn_gate, fgb, xnb, (int)B);
-        matmul_batch_tensor(s->pool, cart, lw->ffn_up, fub, xnb, (int)B);
-        for (size_t i = 0; i < (size_t)B * I; ++i)
-        {
-            fgb[i] = fast_silu(fgb[i]) * fub[i];
-        }
-        matmul_batch_tensor(s->pool, cart, lw->ffn_down, projb, fgb, (int)B);
+        if (do_prof) t_norm += asi_now_ms() - tp;
+        tp = do_prof ? asi_now_ms() : 0.0;
+        quantize_batch_q8k_pool(s->pool, qx_h, xnb, (int)B, (int)H);
+        const AsiV2TensorEntry *ffn_ts[2] = {lw->ffn_gate, lw->ffn_up};
+        float *ffn_outs[2] = {fgb, fub};
+        matmul_batch_fused_q8k_pool(s->pool, cart, ffn_ts, ffn_outs, 2, qx_h, xnb, (int)B, bpr_h, 1);
+        if (do_prof) t_mm += asi_now_ms() - tp;
+        tp = do_prof ? asi_now_ms() : 0.0;
+        int ffn_in_bpr = ((int)I + QK_K - 1) / QK_K;
+        quantize_batch_q8k_pool(s->pool, qx_h, fgb, (int)B, (int)I);
+        matmul_batch_tensor_qx(s->pool, cart, lw->ffn_down, projb, qx_h, fgb, (int)B, ffn_in_bpr);
+        if (do_prof) t_mm += asi_now_ms() - tp;
+        tp = do_prof ? asi_now_ms() : 0.0;
         for (size_t i = 0; i < (size_t)B * H; ++i) xb[i] += projb[i];
+        if (do_prof) t_norm += asi_now_ms() - tp;
     }
 
     int rc = 0;
     if (compute_logits && out_last_logits)
     {
+        double tp = do_prof ? asi_now_ms() : 0.0;
         const float *on_w = (const float *)tensor_data(cart, s->output_norm);
         rmsnorm(s->scratch.x_norm, xb + (size_t)(B - 1) * H, on_w, H, c->rms_norm_eps);
         const AsiV2TensorEntry *lm_head = s->output_weight ? s->output_weight : s->token_embd;
         rc = matvec_tensor_pool(s->pool, cart, lm_head, out_last_logits, s->scratch.x_norm);
+        if (do_prof) t_lm += asi_now_ms() - tp;
     }
 
-    free(xb); free(xnb); free(projb); free(qkvb); free(zb); free(ab); free(bb);
-    free(qgb); free(kb); free(vb); free(aob); free(fgb); free(fub);
     if (do_prof)
     {
         double tc1 = asi_now_ms();
-        fprintf(stderr, "[PROF chunk B=%u pos=%u] total=%.2f ms (mm=%.2f ssm=%.2f attn=%.2f)\n",
-                B, pos_start, tc1 - tc0, t_mm, t_ssm, t_attn);
+        fprintf(stderr, "[PROF chunk B=%u pos=%u] total=%.2f ms (mm=%.2f conv=%.2f ssm=%.2f attn=%.2f norm=%.2f lm=%.2f)\n",
+                B, pos_start, tc1 - tc0, t_mm, t_conv, t_ssm, t_attn, t_norm, t_lm);
     }
     return rc;
 }
@@ -1455,7 +2013,7 @@ static int qwen35_forward_batch(AsiArchSession *s,
         return qwen35_forward_token(s, token_ids[0], pos_start, out_last_logits);
     }
 
-    const uint32_t chunk_max = 64;
+    const uint32_t chunk_max = 128;
     uint32_t done = 0;
     asi_pool_begin(s->pool);
     while (done < n_tokens)
