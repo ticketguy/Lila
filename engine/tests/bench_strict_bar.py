@@ -9,10 +9,14 @@ Requirements enforced:
 3. Matched settings: n_ctx=2048, n_threads=2, n_threads_batch=2, n_batch=512,
    use_mmap=True, flash_attn=False, greedy (temperature=0.0 / argmax).
 4. Page-cache warmup (1 discarded trial per engine) + N interleaved pairs.
-5. Primary metrics: t1_ttft, t1_dec, t2_ttft, t2_dec, long_prefill_tps, rss_mb.
-   Secondary metric: load_s.
-6. Pure-stdlib stats: median, [min..max], 95% bootstrap CI, Mann-Whitney U p-value,
-   and PASS/FAIL against non-overlapping [min..max] + median bar.
+5. Fair load measurement by default: load_open_s (open/map) + populate_s
+   (MADV_WILLNEED + touch 1 byte per 4 KiB page right after open) -> load_s
+   (pass --no-prepopulate for lazy load only).
+6. Primary metrics: t1_ttft, t1_dec, t2_ttft, t2_dec, long_prefill_tps, rss_mb.
+   Secondary metrics: vm_hwm_mb, load_s, load_open_s.
+7. Pure-stdlib stats: median, [min..max], p95, max, 95% bootstrap CI,
+   Mann-Whitney U two-sided p-value, and honest verdicts (PASS,
+   ADVANTAGE (overlap), PARITY (p=...), FAIL).
 """
 
 from __future__ import annotations
@@ -130,8 +134,9 @@ def _get_mem_mb() -> Tuple[float, float]:
     return rss_mb, hwm_mb
 
 
-def _prepopulate_file(path: str) -> None:
-    """Advise MADV_WILLNEED and touch one byte per 4 KiB page to warm page cache."""
+def _prepopulate_file(path: str) -> float:
+    """Advise MADV_WILLNEED and touch one byte per 4 KiB page; return elapsed seconds."""
+    t0 = time.perf_counter()
     with open(path, "rb") as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
             if hasattr(mm, "madvise") and hasattr(mmap, "MADV_WILLNEED"):
@@ -142,6 +147,7 @@ def _prepopulate_file(path: str) -> None:
                 acc ^= mm[off]
             if acc == -1:  # never true; keeps loop from being elided
                 raise RuntimeError("unreachable")
+    return time.perf_counter() - t0
 
 
 def _bind_asi_lib(lib_path: str) -> ctypes.CDLL:
@@ -198,11 +204,8 @@ def run_asi_trial(
     n_threads: int,
     n_batch: int,
     n_gen: int,
-    prepopulate: bool = False,
+    prepopulate: bool = True,
 ) -> Dict:
-    if prepopulate:
-        _prepopulate_file(asi_path)
-
     lib = _bind_asi_lib(lib_path)
     err = ctypes.create_string_buffer(256)
 
@@ -216,7 +219,10 @@ def run_asi_trial(
     sess = lib.lila_asi_session_create(model, n_ctx, n_threads, err, 256)
     if not sess:
         raise RuntimeError(f"lila_asi_session_create failed: {err.value.decode('utf-8', 'replace')}")
-    load_s = time.perf_counter() - t_load0
+    load_open_s = time.perf_counter() - t_load0
+
+    populate_s = _prepopulate_file(asi_path) if prepopulate else 0.0
+    load_s = load_open_s + populate_s
 
     logits = (ctypes.c_float * cfg.vocab_size)()
     rng = ctypes.c_uint64(42)
@@ -291,6 +297,8 @@ def run_asi_trial(
     return {
         "engine": "asi",
         "load_s": load_s,
+        "load_open_s": load_open_s,
+        "populate_s": populate_s,
         "t1_ttft": t1_ttft,
         "t1_dec": t1_dec,
         "t2_ttft": t2_ttft,
@@ -314,12 +322,9 @@ def run_llama_trial(
     n_threads: int,
     n_batch: int,
     n_gen: int,
-    prepopulate: bool = False,
+    prepopulate: bool = True,
 ) -> Dict:
     from llama_cpp import Llama
-
-    if prepopulate:
-        _prepopulate_file(gguf_path)
 
     t_load0 = time.perf_counter()
     llm = Llama(
@@ -333,7 +338,10 @@ def run_llama_trial(
         n_gpu_layers=0,
         verbose=False,
     )
-    load_s = time.perf_counter() - t_load0
+    load_open_s = time.perf_counter() - t_load0
+
+    populate_s = _prepopulate_file(gguf_path) if prepopulate else 0.0
+    load_s = load_open_s + populate_s
 
     def sample_greedy() -> int:
         return int(llm.sample(temp=0.0, top_k=1, top_p=1.0, min_p=0.0, repeat_penalty=1.0))
@@ -387,6 +395,8 @@ def run_llama_trial(
     return {
         "engine": "llama",
         "load_s": load_s,
+        "load_open_s": load_open_s,
+        "populate_s": populate_s,
         "t1_ttft": t1_ttft,
         "t1_dec": t1_dec,
         "t2_ttft": t2_ttft,
@@ -472,6 +482,137 @@ def _mann_whitney_u_p(x: Sequence[float], y: Sequence[float]) -> float:
     return min(1.0, math.erfc(z / math.sqrt(2.0)))
 
 
+def _percentile(xs: Sequence[float], q: float) -> float:
+    """Return the q-th percentile (0..100) using linear interpolation (type 7)."""
+    if not xs:
+        raise ValueError("Cannot compute percentile of an empty sequence")
+    s = sorted(xs)
+    if len(s) == 1:
+        return float(s[0])
+    pos = (q / 100.0) * (len(s) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        return float(s[lo])
+    frac = pos - lo
+    return float(s[lo] + frac * (s[hi] - s[lo]))
+
+
+def _engine_stats(xs: Sequence[float]) -> Dict[str, float]:
+    """Compute pure-stdlib summary statistics for one engine's metric samples."""
+    ci_lo, ci_hi = _bootstrap_median_ci(xs)
+    return {
+        "median": statistics.median(xs),
+        "min": min(xs),
+        "max": max(xs),
+        "p95": _percentile(xs, 95.0),
+        "ci95_lo": ci_lo,
+        "ci95_hi": ci_hi,
+    }
+
+
+def _evaluate_verdict(
+    ax: Sequence[float],
+    lx: Sequence[float],
+    a_stats: Dict[str, float],
+    l_stats: Dict[str, float],
+    direction: str,
+) -> Tuple[float, str, bool]:
+    """Return (mwu_p, verdict_label, strict_passed) without overclaiming ties."""
+    pval = _mann_whitney_u_p(ax, lx)
+    if pval >= 0.05:
+        return pval, f"PARITY (p={pval:.4g})", False
+
+    sign = 1.0 if direction == "higher" else -1.0
+    non_overlap_asi = (
+        a_stats["min"] > l_stats["max"]
+        if direction == "higher"
+        else a_stats["max"] < l_stats["min"]
+    )
+    a_med_s, l_med_s = sign * a_stats["median"], sign * l_stats["median"]
+    if a_med_s != l_med_s:
+        asi_in_favor = a_med_s > l_med_s
+    else:
+        wins = sum(1 for a in ax for b in lx if sign * a > sign * b)
+        losses = sum(1 for a in ax for b in lx if sign * a < sign * b)
+        asi_in_favor = wins > losses
+
+    if non_overlap_asi:
+        return pval, "PASS", True
+    if asi_in_favor:
+        return pval, "ADVANTAGE (overlap)", False
+    return pval, "FAIL", False
+
+
+def _format_engine_summary(stats: Dict[str, float]) -> Tuple[str, str]:
+    """Format median [min..max] (95% CI) and tail (p95 / max) strings."""
+    med_ci = (
+        f"{stats['median']:.3f} [{stats['min']:.3f}..{stats['max']:.3f}] "
+        f"({stats['ci95_lo']:.3f}..{stats['ci95_hi']:.3f})"
+    )
+    tail = f"{stats['p95']:.3f} / {stats['max']:.3f}"
+    return med_ci, tail
+
+
+def _summarize_and_print(
+    asi_runs: Sequence[Dict],
+    llama_runs: Sequence[Dict],
+    metrics: Sequence[Tuple[str, str, str, bool]],
+) -> Tuple[Dict[str, Dict], str]:
+    """Compute summary stats/verdicts, print the summary table, and return (summary_export, overall_verdict)."""
+    rows = []
+    all_primary_pass = True
+    summary_export: Dict[str, Dict] = {}
+
+    for key, unit, direction, is_primary in metrics:
+        ax = [r[key] for r in asi_runs]
+        lx = [r[key] for r in llama_runs]
+        a_stats = _engine_stats(ax)
+        l_stats = _engine_stats(lx)
+        pval, verdict, passed = _evaluate_verdict(ax, lx, a_stats, l_stats, direction)
+
+        if is_primary and not passed:
+            all_primary_pass = False
+
+        bar_str = verdict + ("" if is_primary else " (sec)")
+        a_str, a_tail = _format_engine_summary(a_stats)
+        l_str, l_tail = _format_engine_summary(l_stats)
+        rows.append((key, unit, direction, a_str, a_tail, l_str, l_tail, f"{pval:.4g}", bar_str))
+
+        summary_export[key] = {
+            "unit": unit,
+            "direction": direction,
+            "primary": is_primary,
+            "asi": a_stats,
+            "llama": l_stats,
+            "mwu_p": pval,
+            "bar_verdict": verdict,
+        }
+
+    headers = (
+        "Metric",
+        "Unit",
+        "Dir",
+        "ASI med [min..max] (95% CI)",
+        "ASI p95/max",
+        "llama med [min..max] (95% CI)",
+        "llama p95/max",
+        "MWU p",
+        "Bar",
+    )
+    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+    print("\n=== Statistical Summary & Strict Bar Verdict ===")
+    header_line = " ".join(f"{h:<{w}}" for h, w in zip(headers, widths))
+    print(header_line)
+    print("-" * len(header_line))
+    for row in rows:
+        print(" ".join(f"{val:<{w}}" for val, w in zip(row, widths)))
+
+    overall_verdict = "PASS" if all_primary_pass else "FAIL"
+    print(f"\nOVERALL PRIMARY BAR: {overall_verdict}")
+    return summary_export, overall_verdict
+
+
 def _tokenize_once(gguf_path: str) -> Dict[str, List[int]]:
     from llama_cpp import Llama
 
@@ -493,7 +634,7 @@ def _run_worker_subprocess(
     n_threads: int,
     n_batch: int,
     n_gen: int,
-    prepopulate: bool = False,
+    prepopulate: bool = True,
 ) -> Dict:
     cmd = [
         sys.executable,
@@ -516,9 +657,8 @@ def _run_worker_subprocess(
         str(n_batch),
         "--n-gen",
         str(n_gen),
+        "--prepopulate" if prepopulate else "--no-prepopulate",
     ]
-    if prepopulate:
-        cmd.append("--prepopulate")
     proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
     for line in reversed(proc.stdout.strip().splitlines()):
         line = line.strip()
@@ -539,8 +679,9 @@ def main() -> int:
     parser.add_argument("--n-gen", type=int, default=N_GEN)
     parser.add_argument(
         "--prepopulate",
-        action="store_true",
-        help="Advise MADV_WILLNEED and touch model file pages before loading (warmed load)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Advise MADV_WILLNEED and touch model file pages right after open so load_s includes weight residency (default: True; pass --no-prepopulate for lazy load only)",
     )
     parser.add_argument(
         "--json-out",
@@ -622,11 +763,13 @@ def main() -> int:
         llama_runs.append(r_llama)
         print(
             f"  pair {idx:2d}/{args.n}: "
-            f"ASI(t1_ttft={r_asi['t1_ttft']:.3f}s, t1_dec={r_asi['t1_dec']:.2f}, "
+            f"ASI(load={r_asi['load_s']:.3f}s[open={r_asi['load_open_s']:.3f}s], "
+            f"t1_ttft={r_asi['t1_ttft']:.3f}s, t1_dec={r_asi['t1_dec']:.2f}, "
             f"t2_ttft={r_asi['t2_ttft']:.3f}s, t2_dec={r_asi['t2_dec']:.2f}, "
             f"long={r_asi['long_prefill_tps']:.2f}, rss={r_asi['rss_mb']:.1f}MB, "
             f"hwm={r_asi['vm_hwm_mb']:.1f}MB) | "
-            f"llama(t1_ttft={r_llama['t1_ttft']:.3f}s, t1_dec={r_llama['t1_dec']:.2f}, "
+            f"llama(load={r_llama['load_s']:.3f}s[open={r_llama['load_open_s']:.3f}s], "
+            f"t1_ttft={r_llama['t1_ttft']:.3f}s, t1_dec={r_llama['t1_dec']:.2f}, "
             f"t2_ttft={r_llama['t2_ttft']:.3f}s, t2_dec={r_llama['t2_dec']:.2f}, "
             f"long={r_llama['long_prefill_tps']:.2f}, rss={r_llama['rss_mb']:.1f}MB, "
             f"hwm={r_llama['vm_hwm_mb']:.1f}MB)"
@@ -641,67 +784,10 @@ def main() -> int:
         ("rss_mb", "MiB", "lower", True),
         ("vm_hwm_mb", "MiB", "lower", False),
         ("load_s", "s", "lower", False),
+        ("load_open_s", "s", "lower", False),
     ]
 
-    print("\n=== Statistical Summary & Strict Bar Verdict ===")
-    header = (
-        f"{'Metric':<18} {'Unit':<6} {'Dir':<7} "
-        f"{'ASI med [min..max] (95% CI)':<38} "
-        f"{'llama med [min..max] (95% CI)':<38} "
-        f"{'MWU p':<9} {'Bar'}"
-    )
-    print(header)
-    print("-" * len(header))
-
-    all_primary_pass = True
-    summary_export: Dict[str, Dict] = {}
-    for key, unit, direction, is_primary in metrics:
-        ax = [r[key] for r in asi_runs]
-        lx = [r[key] for r in llama_runs]
-        a_med, a_min, a_max = statistics.median(ax), min(ax), max(ax)
-        l_med, l_min, l_max = statistics.median(lx), min(lx), max(lx)
-        a_ci = _bootstrap_median_ci(ax)
-        l_ci = _bootstrap_median_ci(lx)
-        pval = _mann_whitney_u_p(ax, lx)
-
-        if direction == "higher":
-            passed = (a_med > l_med) and (a_min > l_max)
-        else:
-            passed = (a_med < l_med) and (a_max < l_min)
-
-        if is_primary and not passed:
-            all_primary_pass = False
-
-        verdict = "PASS" if passed else "FAIL"
-        bar_str = verdict + ("" if is_primary else " (sec)")
-        a_str = f"{a_med:.3f} [{a_min:.3f}..{a_max:.3f}] ({a_ci[0]:.3f}..{a_ci[1]:.3f})"
-        l_str = f"{l_med:.3f} [{l_min:.3f}..{l_max:.3f}] ({l_ci[0]:.3f}..{l_ci[1]:.3f})"
-        print(f"{key:<18} {unit:<6} {direction:<7} {a_str:<38} {l_str:<38} {pval:<9.4g} {bar_str}")
-
-        summary_export[key] = {
-            "unit": unit,
-            "direction": direction,
-            "primary": is_primary,
-            "asi": {
-                "median": a_med,
-                "min": a_min,
-                "max": a_max,
-                "ci95_lo": a_ci[0],
-                "ci95_hi": a_ci[1],
-            },
-            "llama": {
-                "median": l_med,
-                "min": l_min,
-                "max": l_max,
-                "ci95_lo": l_ci[0],
-                "ci95_hi": l_ci[1],
-            },
-            "mwu_p": pval,
-            "bar_verdict": verdict,
-        }
-
-    overall_verdict = "PASS" if all_primary_pass else "FAIL"
-    print(f"\nOVERALL PRIMARY BAR: {overall_verdict}")
+    summary_export, overall_verdict = _summarize_and_print(asi_runs, llama_runs, metrics)
 
     if args.json_out:
         out_path = Path(args.json_out)
