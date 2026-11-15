@@ -17,10 +17,16 @@ import os
 import socket
 import statistics
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
 from pathlib import Path
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -45,7 +51,7 @@ def _free_port() -> int:
 
 
 def test_1_correctness() -> None:
-    print("\n[1] Real-model inference correctness (batch vs token-by-token parity)...")
+    print("\n[1] Real-model inference correctness (batch vs token-by-token parity)...", flush=True)
     llm = AsiLlamaAdapter(ASI_PATH, n_ctx=512, n_threads=N_THREADS)
     try:
         ids = llm.tokenizer.encode("<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n")
@@ -78,13 +84,13 @@ def test_1_correctness() -> None:
         den = sum(logits_tok[i] ** 2 for i in range(0, llm._cfg.vocab_size, 17)) + 1e-12
         rel_l2 = (num / den) ** 0.5
         assert rel_l2 < 0.15, f"relative L2 logit drift too large: {rel_l2}"
-        print(f"  PASS: argmax={tok_next_1} matched, top5_overlap={overlap}/5, rel_l2={rel_l2:.6f}")
+        print(f"  PASS: argmax={tok_next_1} matched, top5_overlap={overlap}/5, rel_l2={rel_l2:.6f}", flush=True)
     finally:
         llm.close()
 
 
 def test_2_multiturn_long_toolcall() -> None:
-    print("\n[2] Multi-turn conversations, long prompts, and tool-call outputs...")
+    print("\n[2] Multi-turn conversations, long prompts, tool-call outputs, and disk prefix cache...", flush=True)
     llm = AsiLlamaAdapter(ASI_PATH, n_ctx=512, n_threads=N_THREADS)
     try:
         # Multi-turn
@@ -98,7 +104,7 @@ def test_2_multiturn_long_toolcall() -> None:
         msgs.append({"role": "user", "content": "What is my favorite number?"})
         r2 = llm.create_chat_completion(msgs, max_tokens=24, temperature=0.0)["choices"][0]["message"]["content"]
         assert "42" in r2, f"Multi-turn lost context: {r2!r}"
-        print(f"  PASS multi-turn: Turn2={r2.strip()!r}")
+        print(f"  PASS multi-turn: Turn2={r2.strip()!r}", flush=True)
 
         # Long prompt (~300+ tokens within n_ctx=512)
         filler = " ".join(f"item_{i}={i*3}" for i in range(50))
@@ -110,7 +116,7 @@ def test_2_multiturn_long_toolcall() -> None:
         assert 250 < n_toks < 500, f"expected 250..500 tokens, got {n_toks}"
         rl = llm.create_chat_completion(long_msgs, max_tokens=16, temperature=0.0)["choices"][0]["message"]["content"]
         assert rl.strip(), "Long prompt returned empty output"
-        print(f"  PASS long prompt ({n_toks} tokens): {rl.strip()[:80]!r}")
+        print(f"  PASS long prompt ({n_toks} tokens): {rl.strip()[:80]!r}", flush=True)
 
         # Over-context prompt (> n_ctx=512) must fail cleanly without crashing
         over_msgs = [{"role": "user", "content": " ".join(f"item_{i}={i*3}" for i in range(100))}]
@@ -118,7 +124,7 @@ def test_2_multiturn_long_toolcall() -> None:
             llm.create_chat_completion(over_msgs, max_tokens=8, temperature=0.0)
             raise AssertionError("Expected RuntimeError when prompt exceeds n_ctx=512")
         except RuntimeError as exc:
-            print(f"  PASS over-context guard: {exc}")
+            print(f"  PASS over-context guard: {exc}", flush=True)
 
         # Tool-call output
         tool_msgs = [
@@ -133,13 +139,78 @@ def test_2_multiturn_long_toolcall() -> None:
         ]
         rt = llm.create_chat_completion(tool_msgs, max_tokens=40, temperature=0.0)["choices"][0]["message"]["content"]
         assert "get_time" in rt or "tool_call" in rt, f"Tool call not emitted: {rt!r}"
-        print(f"  PASS tool-call output: {rt.strip()[:100]!r}")
+        print(f"  PASS tool-call output: {rt.strip()[:100]!r}", flush=True)
     finally:
         llm.close()
 
+    # Disk-persisted prefix snapshot (.asip) save/load across fresh adapter instances
+    with tempfile.TemporaryDirectory(prefix="lila_asip_cache_") as td:
+        sys_prompt = "You are Lila, a concise local assistant. Answer accurately."
+        user_prompt = "What is 6 * 7? Reply with the number only."
+        msgs = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        adapter_a = AsiLlamaAdapter(
+            ASI_PATH, n_ctx=512, n_threads=N_THREADS, prefix_cache_dir=td
+        )
+        try:
+            assert getattr(adapter_a, "_supports_prefix_file", False) is True, (
+                "liblila_asi.so missing disk prefix-file support (_supports_prefix_file is False/missing)"
+            )
+            n_warm_a = adapter_a.warm_prefix(sys_prompt)
+            assert n_warm_a > 0, f"warm_prefix returned invalid token count: {n_warm_a}"
+            hit_a = getattr(adapter_a, "last_prefix_cache_hit", None)
+            assert hit_a in ("miss", None), f"Expected cold miss on initial warm_prefix, got {hit_a!r}"
+            asip_files = list(Path(td).rglob("*.asip"))
+            assert asip_files, f"Expected .asip snapshot file in {td}, found none"
+            out_a = adapter_a.create_chat_completion(
+                msgs, max_tokens=20, temperature=0.0
+            )["choices"][0]["message"]["content"]
+            assert out_a.strip(), "Adapter A completion was empty"
+        finally:
+            adapter_a.close()
+
+        adapter_b = AsiLlamaAdapter(
+            ASI_PATH, n_ctx=512, n_threads=N_THREADS, prefix_cache_dir=td
+        )
+        try:
+            assert getattr(adapter_b, "_supports_prefix_file", False) is True
+            n_warm_b = adapter_b.warm_prefix(sys_prompt)
+            assert n_warm_b == n_warm_a, f"Restored prefix length mismatch: {n_warm_b} != {n_warm_a}"
+            hit_b = getattr(adapter_b, "last_prefix_cache_hit", None)
+            assert hit_b == "disk", f"Expected last_prefix_cache_hit == 'disk', got {hit_b!r}"
+            out_b = adapter_b.create_chat_completion(
+                msgs, max_tokens=20, temperature=0.0
+            )["choices"][0]["message"]["content"]
+            assert out_b == out_a, f"Disk prefix completion mismatch: {out_b!r} != {out_a!r}"
+
+            # Changing 1 character of the system prompt must miss the disk/memory cache cleanly
+            sys_prompt_mut = sys_prompt[:-1] + "!"
+            n_warm_mut = adapter_b.warm_prefix(sys_prompt_mut)
+            assert n_warm_mut > 0
+            hit_mut = getattr(adapter_b, "last_prefix_cache_hit", None)
+            assert hit_mut == "miss" and hit_mut not in ("disk", "ram", "memory"), (
+                f"Expected cache miss on 1-char mutated system prompt, got {hit_mut!r}"
+            )
+            out_mut = adapter_b.create_chat_completion(
+                [{"role": "system", "content": sys_prompt_mut}, {"role": "user", "content": user_prompt}],
+                max_tokens=20,
+                temperature=0.0,
+            )["choices"][0]["message"]["content"]
+            assert out_mut.strip(), "Mutated system prompt completion was empty"
+            print(
+                f"  PASS disk prefix cache (.asip): n_tokens={n_warm_b}, hit_b={hit_b!r}, "
+                f"mut_hit={hit_mut!r}, files={len(asip_files)}, out={out_b.strip()!r}",
+                flush=True,
+            )
+        finally:
+            adapter_b.close()
+
 
 def test_3_cancel_isolation_simultaneous() -> None:
-    print("\n[3] Cancellation, session isolation, and simultaneous inference...")
+    print("\n[3] Cancellation, session isolation, and simultaneous inference...", flush=True)
     # 3a. Cancellation via cancel_event & early stream close
     llm1 = AsiLlamaAdapter(ASI_PATH, n_ctx=512, n_threads=N_THREADS)
     llm2 = AsiLlamaAdapter(ASI_PATH, n_ctx=512, n_threads=N_THREADS)
@@ -165,7 +236,7 @@ def test_3_cancel_isolation_simultaneous() -> None:
             [{"role": "user", "content": "Say hello."}], max_tokens=12, temperature=0.0
         )["choices"][0]["message"]["content"]
         assert after.strip(), "Post-cancel generation failed"
-        print(f"  PASS cancellation: stopped at {seen} chunks, post-cancel={after.strip()[:60]!r}")
+        print(f"  PASS cancellation: stopped at {seen} chunks, post-cancel={after.strip()[:60]!r}", flush=True)
 
         # 3b. Session isolation + simultaneous requests on same adapter (lock-serialized)
         res_a, res_b = [], []
@@ -191,7 +262,7 @@ def test_3_cancel_isolation_simultaneous() -> None:
         ta.join(timeout=30)
         tb.join(timeout=30)
         assert res_a and res_b and res_a[0].strip() and res_b[0].strip(), "Simultaneous same-adapter failed"
-        print(f"  PASS simultaneous same-adapter: A={res_a[0].strip()[:40]!r}, B={res_b[0].strip()[:40]!r}")
+        print(f"  PASS simultaneous same-adapter: A={res_a[0].strip()[:40]!r}, B={res_b[0].strip()[:40]!r}", flush=True)
 
         # 3c. Simultaneous inference on TWO independent sessions sharing ONE LilaAsiModel
         lib = llm1._lib
@@ -219,7 +290,7 @@ def test_3_cancel_isolation_simultaneous() -> None:
             p1.join(timeout=30)
             p2.join(timeout=30)
             assert out_par["s1"][0] == 0 and out_par["s2"][0] == 0, f"Parallel shared-model eval failed: {out_par}"
-            print(f"  PASS parallel shared-model sessions: s1_tok={out_par['s1'][1]}, s2_tok={out_par['s2'][1]}")
+            print(f"  PASS parallel shared-model sessions: s1_tok={out_par['s1'][1]}, s2_tok={out_par['s2'][1]}", flush=True)
         finally:
             lib.lila_asi_session_free(s1)
             lib.lila_asi_session_free(s2)
@@ -229,7 +300,7 @@ def test_3_cancel_isolation_simultaneous() -> None:
 
 
 def test_4_memory_and_prefix_invalidation() -> None:
-    print("\n[4] Memory cleanup, model unloading, and prefix-cache invalidation...")
+    print("\n[4] Memory cleanup, model unloading, and prefix-cache invalidation...", flush=True)
     # 4a. Prefix-cache invalidation
     llm = AsiLlamaAdapter(ASI_PATH, n_ctx=512, n_threads=N_THREADS)
     try:
@@ -247,7 +318,7 @@ def test_4_memory_and_prefix_invalidation() -> None:
 
         rn = llm.create_chat_completion(no_sys, max_tokens=10, temperature=0.0)["choices"][0]["message"]["content"]
         assert rn.strip(), "No-system prompt failed after cached prefix"
-        print(f"  PASS prefix invalidation: A_len={len(cached_a)}, B_len={len(cached_b)}, no_sys={rn.strip()[:40]!r}")
+        print(f"  PASS prefix invalidation: A_len={len(cached_a)}, B_len={len(cached_b)}, no_sys={rn.strip()[:40]!r}", flush=True)
     finally:
         llm.close()
 
@@ -267,20 +338,19 @@ def test_4_memory_and_prefix_invalidation() -> None:
     rss_end = _rss_mb()
     drift = rss_end - rss_start
     assert drift < 8.0, f"RSS grew too much across 5 open/close cycles: {drift:.2f} MB"
-    print(f"  PASS memory cleanup: RSS start={rss_start:.1f} MB, end={rss_end:.1f} MB (drift={drift:+.1f} MB)")
+    print(f"  PASS memory cleanup: RSS start={rss_start:.1f} MB, end={rss_end:.1f} MB (drift={drift:+.1f} MB)", flush=True)
 
 
 def test_5_daemon_with_lila_backend_asi() -> None:
-    print("\n[5] Actual Lila daemon (LilaDaemon mTLS HTTPS /chat) with LILA_BACKEND=asi...")
+    print("\n[5] Actual Lila daemon (LilaDaemon mTLS HTTPS /chat) with LILA_BACKEND=asi...", flush=True)
     import hashlib
     import shutil
     import ssl
     import subprocess
-    import tempfile
     from src.daemon.service import LilaDaemon
 
     tls_keys = (
-        "LILA_BACKEND", "LILA_ASI_PATH", "LILA_THREADS",
+        "LILA_BACKEND", "LILA_ASI_PATH", "LILA_N_THREADS",
         "LILA_TLS_SERVER_CERT", "LILA_TLS_SERVER_KEY",
         "LILA_TLS_CLIENT_CA", "LILA_TLS_ALLOWED_CLIENT_SHA256",
     )
@@ -316,7 +386,7 @@ def test_5_daemon_with_lila_backend_asi() -> None:
 
         os.environ["LILA_BACKEND"] = "asi"
         os.environ["LILA_ASI_PATH"] = ASI_PATH
-        os.environ["LILA_THREADS"] = str(N_THREADS)
+        os.environ["LILA_N_THREADS"] = str(N_THREADS)
         os.environ["LILA_TLS_SERVER_CERT"] = str(srv_crt)
         os.environ["LILA_TLS_SERVER_KEY"] = str(srv_key)
         os.environ["LILA_TLS_CLIENT_CA"] = str(ca_crt)
@@ -361,7 +431,7 @@ def test_5_daemon_with_lila_backend_asi() -> None:
             assert isinstance(daemon.lila._llm, AsiLlamaAdapter), f"Expected AsiLlamaAdapter, got {type(daemon.lila._llm)}"
             reply = body.get("reply") or body.get("response") or ""
             assert isinstance(reply, str) and reply.strip(), f"Empty daemon reply: {body}"
-            print(f"  PASS daemon mTLS /chat (HTTPS 200 in {elapsed_req:.1f}s): {reply.strip()[:120]!r}")
+            print(f"  PASS daemon mTLS /chat (HTTPS 200 in {elapsed_req:.1f}s): {reply.strip()[:120]!r}", flush=True)
         finally:
             daemon._stop_api()
             if daemon.lila and getattr(daemon.lila, "_llm", None) and hasattr(daemon.lila._llm, "close"):
@@ -376,7 +446,7 @@ def test_5_daemon_with_lila_backend_asi() -> None:
 
 
 def test_6_controlled_medians() -> None:
-    print("\n[6] Controlled N=5 benchmark medians + [min..max] spread (Lila ASI v2 vs llama-cpp-python)...")
+    print("\n[6] Controlled N=5 benchmark medians + [min..max] spread (Lila ASI v2 vs llama-cpp-python)...", flush=True)
     from llama_cpp import Llama
 
     messages = [
@@ -423,7 +493,8 @@ def test_6_controlled_medians() -> None:
         unit = "tok/s" if "dec" in metric else "s"
         print(
             f"  {metric:8s}: ASI = {a_med:6.2f} [{a_min:.2f}..{a_max:.2f}] {unit}"
-            f"  |  llama.cpp = {l_med:6.2f} [{l_min:.2f}..{l_max:.2f}] {unit}"
+            f"  |  llama.cpp = {l_med:6.2f} [{l_min:.2f}..{l_max:.2f}] {unit}",
+            flush=True,
         )
 
 
@@ -434,4 +505,4 @@ if __name__ == "__main__":
     test_4_memory_and_prefix_invalidation()
     test_5_daemon_with_lila_backend_asi()
     test_6_controlled_medians()
-    print("\nALL 6 ASI QUALIFICATION CHECKS PASSED")
+    print("\nALL 6 ASI QUALIFICATION CHECKS PASSED", flush=True)
