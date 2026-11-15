@@ -46,7 +46,7 @@
 - **Resolution & Gate:**
   - Verified kernel-level parity against FP32 scalar reference in [`test_quant_kernels.c`](file:///home/ticket/workspaces/lila/source/engine/tests/test_quant_kernels.c) (`rel_l2 < 0.01`).
   - Built [`test_correctness_gate.py`](file:///home/ticket/workspaces/lila/source/engine/tests/test_correctness_gate.py) to measure end-to-end prefill logit `rel_l2`, `ASI(batch)` vs. `ASI(token)` first divergence, and corpus-wide greedy top-1 agreement (5 prompts × 32 tokens = 160 tokens) against `llama-cpp-python` on identical token IDs.
-  - Unifying the FP32 block-level reduction order in `q4k.h` (accumulating 8-lane `__m256 sum_vec` + scalar `float bias` and reducing via `lila_hsum_f32_avx2(sum_vec) - bias`) reduced `ASI(batch)` vs. `ASI(token)` logit relative L2 error from `0.050–0.154` down to `0.000000` across all 5 prompts, yielding `160/160` (`100.00%`) token agreement at `N=32` and `320/320` (`100.00%`) at `N=64` (`135/160` = `84.38%` at `N=32` and `229/320` = `71.56%` at `N=64` vs. `llama.cpp`).
+  - Unifying the FP32 block-level reduction order in `q4k.h` (accumulating 8-lane `__m256 sum_vec` + scalar `float bias` and reducing via `lila_hsum_f32_avx2(sum_vec) - bias`) reduced `ASI(batch)` vs. `ASI(token)` logit relative L2 error from `0.050–0.154` down to `0.000000` across all 5 prompts (`320/320` = `100.00%` at `N=64`). Adding the Teacher-Forced + `LILA_ASI_FP32_REF=1` audit (`5 x 64 = 320` positions, [`correctness_broadwell_n64.json`](file:///home/ticket/workspaces/lila/source/paper/correctness_broadwell_n64.json)) confirmed **`316/320` (`98.75%`)** `ASI(Q8_K)` vs. `llama.cpp` top-1 agreement (`315/320` vs `FP32-Ref`, `llama.cpp` `316/320` vs `FP32-Ref`), lower mean/median logit rel-L2 vs `FP32-Ref` (`0.047385/0.038031` vs `0.047615/0.038385`), and `4/320` flips all occurring at tiny near-tie `FP32-Ref` margins (`<= 0.0948`).
 
 ---
 
@@ -67,9 +67,9 @@
   - Identical `int32` token IDs tokenized once and fed to both `liblila_asi.so` and `llama-cpp-python`.
   - Assertion-verified Turn-2 KV/prefix reuse (`t2_eval_tokens == len(toks["t2"])`).
   - Matched `n_ctx=2048`, `n_threads=2`, `n_threads_batch=2`, `n_batch=512`, `use_mmap=True`, `flash_attn=False`, greedy `temperature=0.0`.
-  - Discarded warmup + `N >= 15` interleaved subprocess pairs + optional `--prepopulate` (`MADV_WILLNEED` + 4 KiB page touch).
-  - 95% bootstrap CI + two-sided Mann-Whitney U + non-overlapping `[min..max]` strict bar.
-- **Status (i5-5300U `N=15`, [`results_broadwell_n15.json`](file:///home/ticket/workspaces/lila/source/paper/results_broadwell_n15.json)):** `t1_dec` (`14.064` vs `13.943 tok/s`, `p=0.9339`), `t2_ttft` (`0.554` vs `0.561 s`, `p=0.901`), and `t2_dec` (`13.812` vs `13.952 tok/s`, `p=0.9339`) reached statistical parity; `rss_mb` (`615.8` vs `978.0 MiB`), `vm_hwm_mb` (`615.8` vs `1101.2 MiB`), and `load_s` (`0.026` vs `2.087 s`) passed with non-overlapping ranges; `t1_ttft` (`1.055` vs `1.002 s`) and `long_prefill_tps` (`45.055` vs `53.747 tok/s`) remain behind `llama.cpp`. Google Colab multi-core verification remains pending execution of [`colab_asi_benchmark.ipynb`](file:///home/ticket/workspaces/lila/source/engine/tests/colab_asi_benchmark.ipynb).
+  - Discarded warmup + `N >= 15` interleaved subprocess pairs + default `--prepopulate` (`load_s = load_open_s + populate_s` via `madvise(MADV_WILLNEED)` + 4 KiB page touch, plus `--no-prepopulate`).
+  - 95% bootstrap CI, two-sided Mann-Whitney U, `p95`/`max` tail reporting, non-overlapping `[min..max]` strict bar, and honest `_evaluate_verdict` labels (`PARITY (p=...)` when `p >= 0.05`, `ADVANTAGE (overlap)`, `PASS`, `FAIL`).
+- **Status (i5-5300U `N=15`, [`results_broadwell_n15.json`](file:///home/ticket/workspaces/lila/source/paper/results_broadwell_n15.json)):** Initially (Trial 08, without `--prepopulate`) `t1_dec`, `t2_ttft`, and `t2_dec` showed statistical parity (`p=0.901..0.9339`), while `t1_ttft` and `long_prefill_tps` trailed `llama.cpp`. After Trial 09 optimizations and `--prepopulate` resident-weight enforcement, `long_prefill_tps` (`52.799` vs `46.213 tok/s`, `p=0.0003609`), `t1_ttft` (`0.908` vs `1.094 s`, `p=0.00105`), and `t2_ttft` (`0.487` vs `0.607 s`, `p=0.003691`) show statistically significant `ADVANTAGE (overlap)` on ASI; `t1_dec` (`p=0.3401`) and `t2_dec` (`p=0.3615`) remain `PARITY`; `rss_mb` (`616.266` vs `978.223 MiB`), `vm_hwm_mb` (`638.824` vs `1406.730 MiB`), and `load_s` (`0.053` vs `2.182 s`) `PASS` with non-overlapping ranges (`p < 3.4e-06`), while `OVERALL PRIMARY BAR` remains `FAIL` due to narrow min-max overlaps and decode parity. Google Colab multi-core verification remains pending execution of [`colab_asi_benchmark.ipynb`](file:///home/ticket/workspaces/lila/source/engine/tests/colab_asi_benchmark.ipynb).
 
 ---
 
@@ -81,3 +81,36 @@
   3. **Exp 3 (`chunk_max = 512`):** Raising `chunk_max` from `128` to `512` in `qwen35_forward_batch` reduced chunk/barrier overhead at `B=512` (`16.96s` / `30.19 tok/s` -> `15.59s` / `32.84 tok/s`).
   4. **Exp 4 (`1x4` register-accumulated + pre-broadcast scales + SIMD `bsums` + dTLB `T_TILE`):** Microbenchmarking showed `2x4` spilled `sv[2][4][8]` per block `b`, whereas `1x4` keeps `sv0..3` and `sumi0..3` resident in YMM registers (`12.52 ms` / `37.54 GMAC/s` vs `23.10 ms` at `T=128`). Floating-point `bsums` accumulation broke `0.000000` batch/token parity (`0.058` L2) and was **rejected** in favor of exact `int32` `_mm256_madd_epi16` `bias0..3`. Sizing `T_TILE = (n_tokens <= 64 && blocks_per_row <= 4) ? 64 : 32` avoided 64-entry L1 dTLB thrashing at `T=512` (`61.00 ms` vs `78.95 ms` for `T_TILE=64`). `B=512` improved to `13.51s` (`37.90 tok/s`).
   5. **Exp 5 (`asi_conv1d_worker` `T_TILE=32` register-cached state):** Tiling `conv_hist == 3 && k_conv == 4 && B >= 2` with `ch` outer / `t` inner (`T_TILE=32`) and register-cached `s0, s1, s2` removed per-token `conv_state` shifts, lifting `B=512` to `13.04s` (`39.27 tok/s`), `B=53` to `1.19s` (`44.58 tok/s`), and `N=15` interleaved `long_prefill_tps` median to **`45.055 [13.927..48.266] tok/s`** while keeping `0.000000` batch/token L2 parity.
+
+---
+
+## Trial 09 — Bounded-Spin Thread Pool, Single-Unpack `tile_out` GEMM, Dynamic Work-Stealing, Teacher-Forced/`FP32-Ref` Audit, and `--prepopulate` Fair Load
+
+- **Root Cause Hypotheses:**
+  1. *Extreme tail latency spikes:* Workers and barrier polling in `asi_pool.h` spun indefinitely on shared cache lines (`false sharing` + OS preemption on 2 vCPUs).
+  2. *Prefill gap vs `llama.cpp`:* Unpacking Q4_K/Q6_K weight rows inside every token tile repeated 4-bit/6-bit bit-unpacking work, while static row/head splits left one thread idle when preempted, and batch non-GEMM stages (`asi_norm_quant`, `asi_kv_prep`, scalar `conv1d`) ran single-threaded or scalar.
+  3. *Correctness opacity:* Free-running `ASI` vs `llama.cpp` agreement (`71.6%` / `74.38%`) collapsed after single near-tie argmax flips without showing logit margins or which engine deviated from unquantized FP32 math.
+  4. *Cold-page load asymmetry:* `use_mmap=True` let ASI defer page faults into Turn-1 TTFT while `llama.cpp` absorbed them earlier, obscuring resident startup cost.
+
+- **Changes Implemented (`asi_pool.h`, `q4k.h`, `asi_arch.c`, `test_correctness_gate.py`, `bench_strict_bar.py`):**
+  1. *Bounded-spin cache-padded thread pool (`asi_pool.h`):* Aligned hot atomics (`fn`, `gen`, `done_count`, `active`, `sleeping`, `shutdown`) on `_Alignas(64)`; bounded worker wait (`asi_cpu_pause()` < 2048, `sched_yield()` < 4096, then `p->sleeping` + `pthread_cond_wait`) and added `sched_yield()` after 2048 barrier spins in `asi_pool_run`.
+  2. *1× Row Unpack + `tile_out` GEMM (`q4k.h`):* Added `lila_q4k_unpack_row_avx2` and `lila_q6k_unpack_row_avx2`, restructuring AVX2 `q4k_matmul_batch_q8k_range` and `q6k_matmul_batch_q8k_range` (`n_tokens >= 4 && blocks_per_row <= 16`) to unpack each weight row once per token chunk across paired `2x4` blocks into contiguous `tile_out`.
+  3. *Dynamic work-stealing & parallel non-GEMM prefill (`asi_arch.c`):* Converted batch matmul, DeltaNet, and GQA workers to atomic `next_row`/`next_h` work-stealing; parallelized `asi_norm_quant_pool` and `asi_kv_prep_batch_worker`; vectorized `asi_conv1d_worker` with AVX2 `_MM_TRANSPOSE4_PS` + `lila_expf_avx2` (fixing a 1-ULP `4.3e-8` FMA vs `-std=c11` mismatch).
+  4. *Unquantized `FP32-Ref` & Teacher-Forced Audit (`q4k.h`, `asi_arch.c`, `test_correctness_gate.py`):* Added `dequant_q4k_block`, `dequant_q6k_block`, `dequant_q6k_repacked_block`, `lila_quant_dot_fp32`, and `lila_quant_matmul_batch_fp32_range` toggled via `LILA_ASI_FP32_REF=1`, plus isolated `--fp32-worker` evaluation in `test_correctness_gate.py`.
+  5. *Fair `--prepopulate` load & tail metrics (`bench_strict_bar.py`):* Enabled `--prepopulate` by default (`load_s = load_open_s + populate_s` via `madvise(MADV_WILLNEED)` + 4 KiB page touch, alongside `--no-prepopulate`) and added `p95`/`max` reporting and explicit `PARITY`/`ADVANTAGE (overlap)` verdicts.
+
+- **Verified Results (`i5-5300U`, `n_threads=2`, `N=64` correctness & `N=15` interleaved `--prepopulate` benchmark):**
+  - *Correctness Gate ([`correctness_broadwell_n64.json`](file:///home/ticket/workspaces/lila/source/paper/correctness_broadwell_n64.json)):*
+    - Batch vs token-by-token (`N=64`): `0.000000` L2, `320/320 (100.00%)` agreement.
+    - Teacher-forced top-1 (`5 x 64 = 320` positions): `ASI(Q8_K) vs llama.cpp = 316/320 (98.75%)`, `ASI(Q8_K) vs FP32-Ref = 315/320 (98.44%)`, `llama.cpp vs FP32-Ref = 316/320 (98.75%)`.
+    - Logit rel-L2 vs `FP32-Ref`: `ASI(Q8_K)` mean `0.047385` (median `0.038031`, max `0.404697`) vs `llama.cpp` mean `0.047615` (median `0.038385`, max `0.342743`).
+    - All `4/320` `ASI vs llama.cpp` flips occurred on near-tie `FP32-Ref` top-1/top-2 margins (`max=0.0948, median=0.0715, min=0.0500`): `ASI==FP32` (`1`), `Llama==FP32` (`2`), `Neither==FP32` (`1`).
+  - *Strict Benchmark ([`results_broadwell_n15.json`](file:///home/ticket/workspaces/lila/source/paper/results_broadwell_n15.json), `--prepopulate`, `T1=53, T2_delta=27, Long=939`):*
+    - `long_prefill_tps`: ASI `52.799 [44.701..55.541]` (`p95=54.864, max=55.541`) vs llama `46.213 [40.022..50.272]` (`p95=49.912, max=50.272`) (`p=0.0003609`, `ADVANTAGE (overlap)`).
+    - `t1_ttft`: ASI `0.908 [0.862..1.208]` (`p95=1.128, max=1.208`) vs llama `1.094 [1.027..1.810]` (`p95=1.604, max=1.810`) (`p=0.00105`, `ADVANTAGE (overlap)`).
+    - `t2_ttft`: ASI `0.487 [0.459..0.953]` (`p95=0.844, max=0.953`) vs llama `0.607 [0.559..0.839]` (`p95=0.794, max=0.839`) (`p=0.003691`, `ADVANTAGE (overlap)`).
+    - `t1_dec`: ASI `13.808 [9.232..15.030]` vs llama `13.477 [9.162..14.280]` (`p=0.3401`, `PARITY`).
+    - `t2_dec`: ASI `13.062 [10.792..14.722]` vs llama `12.889 [10.098..13.918]` (`p=0.3615`, `PARITY`).
+    - `rss_mb` (`616.266` vs `978.223 MiB`, `p=3.341e-06`), `vm_hwm_mb` (`638.824` vs `1406.730 MiB`, `p=3.375e-06`), `load_s` (`0.053` vs `2.182 s`, `p=3.392e-06`), and `load_open_s` (`0.027` vs `2.156 s`, `p=3.392e-06`): `PASS` with non-overlapping ranges.
+    - `OVERALL PRIMARY BAR`: `FAIL` (due to decode parity and narrow min-max overlaps on TTFT/prefill).
+
