@@ -1,15 +1,19 @@
 # Lila Inference Engine — Build System
 UNAME_M := $(shell uname -m)
+UNAME_S := $(shell uname -s)
 CC := gcc
 CFLAGS := -O3 -march=native -Wall -Wextra -std=c11 -pthread -fopenmp
-LDFLAGS := -lm -lpthread -fopenmp -Wl,-z,noexecstack
+LDFLAGS := -lm -lpthread -fopenmp
+ifeq ($(UNAME_S),Linux)
+    LDFLAGS += -Wl,-z,noexecstack
+endif
 
 ifeq ($(UNAME_M),x86_64)
     ASM := nasm
     ASMFLAGS := -f elf64
     ARCH_DIR := x86_64
     CFLAGS += -mavx2 -mfma -mf16c
-else ifeq ($(UNAME_M),aarch64)
+else ifneq ($(filter $(UNAME_M),aarch64 arm64),)
     ASM := as
     ASMFLAGS :=
     ARCH_DIR := arm64
@@ -40,7 +44,7 @@ lila-asi: $(KERN_OBJ) $(RT_OBJ) $(ASI_OBJ) asi/libasi_v2.so asi/liblila_asi.so
 	$(CC) $(CFLAGS) -o $@ $(KERN_OBJ) $(RT_OBJ) $(ASI_OBJ) $(LDFLAGS)
 	@echo "\n✅ Built lila-asi for $(UNAME_M)"
 
-liblila-asi: asi/liblila_asi.so
+liblila-asi: asi/liblila_asi.so asi/libasi_v2.so
 
 asi/liblila_asi.so: asi/asi_v2.c asi/asi_arch.c asi/lila_asi.c asi/asi_v2.h asi/asi_arch.h asi/lila_asi.h runtime/q4k.h
 	$(CC) $(CFLAGS) -fPIC -shared -D_GNU_SOURCE -o $@ asi/asi_v2.c asi/asi_arch.c asi/lila_asi.c -I runtime/ -I asi/ $(LDFLAGS)
@@ -74,4 +78,4 @@ test-v2: asi/asi_v2.o tests/test_asi_v2.c
 	/tmp/test_asi_v2 /tmp/test_v2.asi
 
 clean:
-	rm -f lila-engine lila-asi $(KERN_OBJ) $(RT_OBJ) $(CLI_OBJ) $(ASI_OBJ)
+	rm -f lila-engine lila-asi asi/liblila_asi.so asi/libasi_v2.so $(KERN_OBJ) $(RT_OBJ) $(CLI_OBJ) $(ASI_OBJ)
