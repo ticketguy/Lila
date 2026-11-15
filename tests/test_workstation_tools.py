@@ -340,8 +340,8 @@ class WorkstationToolsTests(unittest.TestCase):
         self.assertTrue(WORKSTATION_TOOL_NAMES.issubset(core.available_tools))
         system_message = core._build_messages("hello", None)[0]["content"]
         self.assertIn("Command Center registry describes registered", system_message)
-        self.assertIn("clearly distinguish registry declarations", system_message)
-        self.assertIn("never infer workspace names", system_message)
+        self.assertIn("not guaranteed live state", system_message)
+        self.assertIn("Use workspace names and paths only when returned by an available Workstation tool", system_message)
         self.assertIn("workstation_get_workspace", system_message)
 
     def test_lilacore_does_not_enable_personal_workstation_by_default(self) -> None:

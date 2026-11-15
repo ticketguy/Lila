@@ -9,6 +9,7 @@ import ctypes
 import json
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
@@ -210,6 +211,8 @@ class AsiLlamaAdapter:
         self._logits = (ctypes.c_float * self._cfg.vocab_size)()
         self._rng = ctypes.c_uint64(0x9E3779B97F4A7C15)
         self._cached_prefix_ids: Optional[List[int]] = None
+        self._cached_prefix_text: Optional[str] = None
+        self._lock = threading.Lock()
 
     def _bind_abi(self) -> None:
         lib = self._lib
@@ -244,6 +247,8 @@ class AsiLlamaAdapter:
         lib.lila_asi_sample.restype = ctypes.c_int32
 
     def close(self) -> None:
+        self._cached_prefix_ids = None
+        self._cached_prefix_text = None
         if getattr(self, "_session", None):
             self._lib.lila_asi_session_free(self._session)
             self._session = None
@@ -254,18 +259,45 @@ class AsiLlamaAdapter:
     def __del__(self):
         self.close()
 
+    def _format_message(self, role: str, content: object) -> str:
+        if isinstance(content, list):
+            content = "\n".join(
+                c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"
+            )
+        return f"<|im_start|>{role}\n{content}<|im_end|>\n"
+
     def _format_chat(self, messages: List[Dict]) -> str:
-        parts = []
-        for m in messages:
-            role = m.get("role", "user")
-            content = m.get("content", "")
-            if isinstance(content, list):
-                content = "\n".join(
-                    c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"
-                )
-            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+        parts = [self._format_message(m.get("role", "user"), m.get("content", "")) for m in messages]
         parts.append("<|im_start|>assistant\n")
         return "".join(parts)
+
+    def _save_prefix_locked(self, sys_text: str, sys_ids: List[int]) -> None:
+        self._lib.lila_asi_session_reset(self._session)
+        sys_arr = (ctypes.c_int32 * len(sys_ids))(*sys_ids)
+        if self._lib.lila_asi_eval_batch(self._session, sys_arr, len(sys_ids), 0, self._logits) != 0:
+            raise RuntimeError("lila_asi_eval_batch(prefix) failed")
+        if self._lib.lila_asi_session_save_prefix(self._session, len(sys_ids)) == 0:
+            self._cached_prefix_ids = sys_ids
+            self._cached_prefix_text = sys_text
+
+    def warm_prefix(self, system_prompt: str, role: str = "system") -> int:
+        """Pre-evaluate and snapshot the system prompt prefix so Turn 1 skips system prefill."""
+        if not system_prompt:
+            return 0
+        sys_text = self._format_message(role, system_prompt)
+        with self._lock:
+            if not self._session or not self._model:
+                raise RuntimeError("AsiLlamaAdapter is closed")
+            if self._cached_prefix_text == sys_text and self._cached_prefix_ids:
+                return len(self._cached_prefix_ids)
+            sys_ids = self.tokenizer.encode(sys_text)
+            if not sys_ids:
+                return 0
+            if self._cached_prefix_ids == sys_ids:
+                self._cached_prefix_text = sys_text
+                return len(sys_ids)
+            self._save_prefix_locked(sys_text, sys_ids)
+            return len(sys_ids)
 
     def _stream_tokens(
         self,
@@ -274,22 +306,42 @@ class AsiLlamaAdapter:
         temperature: float,
         top_p: float,
         top_k: int,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Iterator[Dict]:
-        prompt = self._format_chat(messages)
-        prompt_ids = self.tokenizer.encode(prompt)
-        if not prompt_ids:
-            return
+        has_system_prefix = len(messages) > 1 and messages[0].get("role") == "system"
+        sys_text = ""
+        if has_system_prefix:
+            sys_text = self._format_message(
+                messages[0].get("role", "system"),
+                messages[0].get("content", ""),
+            )
 
-        # Automatic system-prompt prefix state caching (DeltaNet + KV snapshot)
-        prefix_len = 0
-        if len(messages) > 1 and messages[0].get("role") == "system":
-            sys_role = messages[0].get("role", "system")
-            sys_content = messages[0].get("content", "")
-            if isinstance(sys_content, list):
-                sys_content = "\n".join(
-                    c.get("text", "") for c in sys_content if isinstance(c, dict) and c.get("type") == "text"
-                )
-            sys_ids = self.tokenizer.encode(f"<|im_start|>{sys_role}\n{sys_content}<|im_end|>\n")
+        with self._lock:
+            if not self._session or not self._model:
+                raise RuntimeError("AsiLlamaAdapter is closed")
+
+            # Fast path: reuse cached system-prompt tokenization when boundary tokens are atomic.
+            can_split_sys = (
+                has_system_prefix
+                and self._cached_prefix_text == sys_text
+                and self._cached_prefix_ids
+                and "<|im_start|>" in self.tokenizer._special_tokens
+                and "<|im_end|>" in self.tokenizer._special_tokens
+            )
+            if can_split_sys:
+                sys_ids = self._cached_prefix_ids
+                rest_ids = self.tokenizer.encode(self._format_chat(messages[1:]))
+                prompt_ids = sys_ids + rest_ids
+            else:
+                prompt = self._format_chat(messages)
+                prompt_ids = self.tokenizer.encode(prompt)
+                sys_ids = self.tokenizer.encode(sys_text) if has_system_prefix else []
+
+            if not prompt_ids:
+                return
+
+            # Automatic system-prompt prefix state caching (DeltaNet + KV snapshot)
+            prefix_len = 0
             if sys_ids and len(prompt_ids) > len(sys_ids) and prompt_ids[: len(sys_ids)] == sys_ids:
                 n_restored = ctypes.c_uint32(0)
                 if (
@@ -297,46 +349,46 @@ class AsiLlamaAdapter:
                     and self._lib.lila_asi_session_restore_prefix(self._session, ctypes.byref(n_restored)) == 0
                     and n_restored.value == len(sys_ids)
                 ):
+                    self._cached_prefix_text = sys_text
                     prefix_len = len(sys_ids)
                 else:
-                    self._lib.lila_asi_session_reset(self._session)
-                    sys_arr = (ctypes.c_int32 * len(sys_ids))(*sys_ids)
-                    if self._lib.lila_asi_eval_batch(self._session, sys_arr, len(sys_ids), 0, self._logits) != 0:
-                        raise RuntimeError("lila_asi_eval_batch(prefix) failed")
-                    if self._lib.lila_asi_session_save_prefix(self._session, len(sys_ids)) == 0:
-                        self._cached_prefix_ids = sys_ids
+                    self._save_prefix_locked(sys_text, sys_ids)
                     prefix_len = len(sys_ids)
 
-        if prefix_len == 0:
-            self._lib.lila_asi_session_reset(self._session)
+            if prefix_len == 0:
+                self._lib.lila_asi_session_reset(self._session)
 
-        rem_ids = prompt_ids[prefix_len:]
-        if rem_ids:
-            arr = (ctypes.c_int32 * len(rem_ids))(*rem_ids)
-            if self._lib.lila_asi_eval_batch(self._session, arr, len(rem_ids), prefix_len, self._logits) != 0:
-                raise RuntimeError("lila_asi_eval_batch failed")
+            rem_ids = prompt_ids[prefix_len:]
+            if rem_ids:
+                arr = (ctypes.c_int32 * len(rem_ids))(*rem_ids)
+                if self._lib.lila_asi_eval_batch(self._session, arr, len(rem_ids), prefix_len, self._logits) != 0:
+                    raise RuntimeError("lila_asi_eval_batch failed")
 
-        pos = len(prompt_ids)
-        eos = self.tokenizer.eos_token_id
-        for _ in range(max_tokens):
-            tok = int(
-                self._lib.lila_asi_sample(
-                    self._logits,
-                    self._cfg.vocab_size,
-                    float(temperature),
-                    int(top_k),
-                    float(top_p),
-                    ctypes.byref(self._rng),
+            pos = len(prompt_ids)
+            eos = self.tokenizer.eos_token_id
+            for _ in range(max_tokens):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                tok = int(
+                    self._lib.lila_asi_sample(
+                        self._logits,
+                        self._cfg.vocab_size,
+                        float(temperature),
+                        int(top_k),
+                        float(top_p),
+                        ctypes.byref(self._rng),
+                    )
                 )
-            )
-            if tok == eos or tok < 0:
-                break
-            piece = self.tokenizer.decode([tok])
-            if piece:
-                yield {"choices": [{"delta": {"content": piece}}]}
-            if self._lib.lila_asi_eval_token(self._session, tok, pos, self._logits) != 0:
-                break
-            pos += 1
+                if tok == eos or tok < 0:
+                    break
+                piece = self.tokenizer.decode([tok])
+                if piece:
+                    yield {"choices": [{"delta": {"content": piece}}]}
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                if self._lib.lila_asi_eval_token(self._session, tok, pos, self._logits) != 0:
+                    break
+                pos += 1
 
     def create_chat_completion(
         self,
@@ -346,12 +398,13 @@ class AsiLlamaAdapter:
         top_p: float = 0.95,
         top_k: int = 20,
         stream: bool = False,
+        cancel_event: Optional[threading.Event] = None,
         **_: object,
     ):
         if stream:
-            return self._stream_tokens(messages, max_tokens, temperature, top_p, top_k)
+            return self._stream_tokens(messages, max_tokens, temperature, top_p, top_k, cancel_event=cancel_event)
         text = "".join(
             ev["choices"][0]["delta"]["content"]
-            for ev in self._stream_tokens(messages, max_tokens, temperature, top_p, top_k)
+            for ev in self._stream_tokens(messages, max_tokens, temperature, top_p, top_k, cancel_event=cancel_event)
         )
         return {"choices": [{"message": {"role": "assistant", "content": text}}]}
