@@ -31,7 +31,7 @@ CLI_OBJ := $(CLI_SRC:.c=.o)
 ASI_SRC := asi/asi_runtime.c asi/asi_cli.c asi/lilavm.c asi/asi_v2.c asi/asi_arch.c asi/lila_asi.c
 ASI_OBJ := $(ASI_SRC:.c=.o)
 
-.PHONY: all clean test test-v2 lila-asi liblila-asi
+.PHONY: all clean test test-v2 lila-asi liblila-asi bench-roofline claim-check
 
 all: lila-engine
 
@@ -72,10 +72,23 @@ interface/%.o: interface/%.c
 test: lila-engine
 	./lila-engine --test
 
-test-v2: asi/asi_v2.o tests/test_asi_v2.c
+test-v2: asi/asi_v2.o asi/asi_arch.o asi/lila_asi.o tests/test_asi_v2.c
 	python3 tests/test_asi_v2.py /tmp/test_v2.asi
-	$(CC) $(CFLAGS) -D_GNU_SOURCE -I asi/ tests/test_asi_v2.c asi/asi_v2.o -o /tmp/test_asi_v2 $(LDFLAGS)
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I runtime/ -I asi/ tests/test_asi_v2.c asi/asi_v2.o asi/asi_arch.o asi/lila_asi.o -o /tmp/test_asi_v2 $(LDFLAGS)
 	/tmp/test_asi_v2 /tmp/test_v2.asi
 
+tests/bench_roofline: tests/bench_roofline.c asi/asi_v2.o asi/asi_arch.o asi/lila_asi.o asi/asi_v2.h asi/asi_arch.h asi/lila_asi.h asi/asi_pool.h runtime/q4k.h
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -I runtime/ -I asi/ tests/bench_roofline.c asi/asi_v2.o asi/asi_arch.o asi/lila_asi.o -o $@ $(LDFLAGS)
+
+bench-roofline: tests/bench_roofline
+	./tests/bench_roofline $(ARGS)
+
+claim-check:
+	@if [ -x /home/ticket/workspaces/lila/environment/.venv/bin/python ]; then \
+		/home/ticket/workspaces/lila/environment/.venv/bin/python tests/claim_check.py $(ARGS); \
+	else \
+		python3 tests/claim_check.py $(ARGS); \
+	fi
+
 clean:
-	rm -f lila-engine lila-asi asi/liblila_asi.so asi/libasi_v2.so $(KERN_OBJ) $(RT_OBJ) $(CLI_OBJ) $(ASI_OBJ)
+	rm -f lila-engine lila-asi asi/liblila_asi.so asi/libasi_v2.so tests/bench_roofline $(KERN_OBJ) $(RT_OBJ) $(CLI_OBJ) $(ASI_OBJ)

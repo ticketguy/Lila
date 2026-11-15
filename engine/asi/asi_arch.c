@@ -1,11 +1,63 @@
 #include "asi_arch.h"
 #include "asi_pool.h"
+#include "lila_asi.h"
 #include "q4k.h"
+#include <errno.h>
 #include <math.h>
+#include <pthread.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+
+typedef struct {
+    int q6k_dot2;
+    int q4k_dot2;
+    int matvec_chunk;
+    int lmhead_chunk;
+    int fused_chunk;
+    int fused_chunk_overridden;
+    int batch_chunk_max;
+    int profile;
+} AsiRuntimeConfig;
+
+static AsiRuntimeConfig g_asi_rt_cfg;
+static pthread_once_t g_asi_rt_cfg_once = PTHREAD_ONCE_INIT;
+
+static int asi_env_int(const char *name, int def_val, int min_val, int *overridden)
+{
+    if (overridden) *overridden = 0;
+    const char *v = getenv(name);
+    if (!v || v[0] == '\0') return def_val;
+    char *endp = NULL;
+    long parsed = strtol(v, &endp, 10);
+    if (endp == v || *endp != '\0' || parsed < (long)min_val || parsed > 1048576L)
+    {
+        return def_val;
+    }
+    if (overridden) *overridden = 1;
+    return (int)parsed;
+}
+
+static void asi_init_runtime_config(void)
+{
+    g_asi_rt_cfg.q6k_dot2 = asi_env_int("LILA_ASI_Q6K_DOT2", 1, 0, NULL) ? 1 : 0;
+    g_asi_rt_cfg.q4k_dot2 = asi_env_int("LILA_ASI_Q4K_DOT2", 1, 0, NULL) ? 1 : 0;
+    g_asi_rt_cfg.matvec_chunk = asi_env_int("LILA_ASI_MATVEC_CHUNK", 64, 1, NULL);
+    g_asi_rt_cfg.lmhead_chunk = asi_env_int("LILA_ASI_LMHEAD_CHUNK", 512, 1, NULL);
+    g_asi_rt_cfg.fused_chunk = asi_env_int("LILA_ASI_FUSED_CHUNK", 32, 1, &g_asi_rt_cfg.fused_chunk_overridden);
+    g_asi_rt_cfg.batch_chunk_max = asi_env_int("LILA_ASI_BATCH_CHUNK_MAX", 512, 1, NULL);
+    const char *prof = getenv("LILA_ASI_PROFILE");
+    g_asi_rt_cfg.profile = (prof && prof[0] != '\0' && strcmp(prof, "0") != 0) ? 1 : 0;
+}
+
+static inline const AsiRuntimeConfig *asi_runtime_config(void)
+{
+    pthread_once(&g_asi_rt_cfg_once, asi_init_runtime_config);
+    return &g_asi_rt_cfg;
+}
 
 static inline double asi_now_ms(void)
 {
@@ -280,7 +332,8 @@ static void rmsnorm(float *out, const float *x, const float *w, uint32_t n, floa
         }
         return;
     }
-#elif defined(__AVX2__)
+#endif
+#if defined(__AVX2__)
     if ((n & 7u) == 0u)
     {
         __m256 vss = _mm256_setzero_ps();
@@ -300,7 +353,8 @@ static void rmsnorm(float *out, const float *x, const float *w, uint32_t n, floa
         }
         return;
     }
-#elif defined(__aarch64__)
+#endif
+#if defined(__aarch64__)
     if ((n & 3u) == 0u)
     {
         float32x4_t vss = vdupq_n_f32(0.0f);
@@ -355,22 +409,28 @@ static inline void asi_prefetch_row(const uint8_t *rp, size_t rb)
 }
 
 static void asi_matvec_range(const uint8_t *w, const LilaQ8KBlock *qx, float *out,
-                             int start, int end, int bpr, uint32_t quant_type)
+                             int start, int end, int bpr, uint32_t quant_type, int n_threads)
 {
+    (void)n_threads;
     if (quant_type == 12)
     {
         size_t rb = (size_t)bpr * Q4_K_BLOCK_SIZE;
         int i = start;
-#if defined(__AVX2__) && !defined(__AVX512F__)
-        for (; i + 1 < end; i += 2)
+#if defined(__AVX2__)
+        const AsiRuntimeConfig *cfg = asi_runtime_config();
+        int use_dot2 = (cfg->q4k_dot2 < 0) ? (n_threads <= 1) : cfg->q4k_dot2;
+        if (use_dot2)
         {
-            const uint8_t *rp = w + (size_t)i * rb;
-            if (i + 3 < end)
+            for (; i + 1 < end; i += 2)
             {
-                asi_prefetch_row(rp + 2 * rb, rb);
-                asi_prefetch_row(rp + 3 * rb, rb);
+                const uint8_t *rp = w + (size_t)i * rb;
+                if (i + 3 < end)
+                {
+                    asi_prefetch_row(rp + 2 * rb, rb);
+                    asi_prefetch_row(rp + 3 * rb, rb);
+                }
+                q4k_dot2_q8k_avx2(rp, rp + rb, qx, bpr, &out[i], &out[i + 1]);
             }
-            q4k_dot2_q8k_avx2(rp, rp + rb, qx, bpr, &out[i], &out[i + 1]);
         }
 #endif
         for (; i < end; ++i)
@@ -384,16 +444,19 @@ static void asi_matvec_range(const uint8_t *w, const LilaQ8KBlock *qx, float *ou
     {
         size_t rb = (size_t)bpr * Q6_K_BLOCK_SIZE;
         int i = start;
-#if defined(__AVX2__) && !defined(__AVX512F__)
-        for (; i + 1 < end; i += 2)
+#if defined(__AVX2__)
+        if (asi_runtime_config()->q6k_dot2)
         {
-            const uint8_t *rp = w + (size_t)i * rb;
-            if (i + 3 < end)
+            for (; i + 1 < end; i += 2)
             {
-                asi_prefetch_row(rp + 2 * rb, rb);
-                asi_prefetch_row(rp + 3 * rb, rb);
+                const uint8_t *rp = w + (size_t)i * rb;
+                if (i + 3 < end)
+                {
+                    asi_prefetch_row(rp + 2 * rb, rb);
+                    asi_prefetch_row(rp + 3 * rb, rb);
+                }
+                q6k_dot2_q8k_avx2(rp, rp + rb, qx, bpr, &out[i], &out[i + 1]);
             }
-            q6k_dot2_q8k_avx2(rp, rp + rb, qx, bpr, &out[i], &out[i + 1]);
         }
 #endif
         for (; i < end; ++i)
@@ -415,7 +478,7 @@ static void asi_matvec_worker(int tid, int n_threads, void *vctx)
 
     if (n_threads <= 1)
     {
-        asi_matvec_range(ctx->w, ctx->qx, ctx->out, 0, rows, bpr, ctx->quant_type);
+        asi_matvec_range(ctx->w, ctx->qx, ctx->out, 0, rows, bpr, ctx->quant_type, n_threads);
         return;
     }
 
@@ -425,7 +488,7 @@ static void asi_matvec_worker(int tid, int n_threads, void *vctx)
         if (start >= rows) break;
         int end = start + chunk;
         if (end > rows) end = rows;
-        asi_matvec_range(ctx->w, ctx->qx, ctx->out, start, end, bpr, ctx->quant_type);
+        asi_matvec_range(ctx->w, ctx->qx, ctx->out, start, end, bpr, ctx->quant_type, n_threads);
     }
 }
 
@@ -438,7 +501,8 @@ static int matvec_q8k_pool(AsiThreadPool *pool,
 {
     const uint8_t *w = tensor_data(cart, t);
     int rows = (int)t->shape[1];
-    int chunk = (rows >= 16384) ? 512 : 64;
+    const AsiRuntimeConfig *cfg = asi_runtime_config();
+    int chunk = (rows >= 16384) ? cfg->lmhead_chunk : cfg->matvec_chunk;
     AsiMatvecCtx ctx;
     ctx.w = w;
     ctx.qx = qx;
@@ -476,7 +540,7 @@ static void asi_fused_matvec_worker(int tid, int n_threads, void *vctx)
         for (int m = 0; m < ctx->n_mats; ++m)
         {
             asi_matvec_range(ctx->w[m], ctx->qx, ctx->out[m], 0, ctx->rows[m],
-                             ctx->blocks_per_row, ctx->quant_type[m]);
+                             ctx->blocks_per_row, ctx->quant_type[m], n_threads);
         }
         if (ctx->apply_silu_mul && ctx->n_mats == 2 && ctx->rows[0] == ctx->rows[1])
         {
@@ -485,18 +549,19 @@ static void asi_fused_matvec_worker(int tid, int n_threads, void *vctx)
         return;
     }
 
+    const AsiRuntimeConfig *cfg = asi_runtime_config();
     if (ctx->apply_silu_mul && ctx->n_mats == 2 && ctx->rows[0] == ctx->rows[1])
     {
         int total = ctx->rows[0];
-        int chunk = (total >= 256) ? 32 : 16;
+        int chunk = cfg->fused_chunk_overridden ? cfg->fused_chunk : ((total >= 256) ? cfg->fused_chunk : 16);
         for (;;)
         {
             int start = atomic_fetch_add_explicit(&ctx->next_row[0], chunk, memory_order_relaxed);
             if (start >= total) break;
             int end = start + chunk;
             if (end > total) end = total;
-            asi_matvec_range(ctx->w[0], ctx->qx, ctx->out[0], start, end, ctx->blocks_per_row, ctx->quant_type[0]);
-            asi_matvec_range(ctx->w[1], ctx->qx, ctx->out[1], start, end, ctx->blocks_per_row, ctx->quant_type[1]);
+            asi_matvec_range(ctx->w[0], ctx->qx, ctx->out[0], start, end, ctx->blocks_per_row, ctx->quant_type[0], n_threads);
+            asi_matvec_range(ctx->w[1], ctx->qx, ctx->out[1], start, end, ctx->blocks_per_row, ctx->quant_type[1], n_threads);
             fast_silu_mul_vec(ctx->out[0] + start, ctx->out[1] + start, (uint32_t)(end - start));
         }
         return;
@@ -505,14 +570,14 @@ static void asi_fused_matvec_worker(int tid, int n_threads, void *vctx)
     for (int m = 0; m < ctx->n_mats; ++m)
     {
         int total = ctx->rows[m];
-        int chunk = (total >= 256) ? 32 : 16;
+        int chunk = cfg->fused_chunk_overridden ? cfg->fused_chunk : ((total >= 256) ? cfg->fused_chunk : 16);
         for (;;)
         {
             int start = atomic_fetch_add_explicit(&ctx->next_row[m], chunk, memory_order_relaxed);
             if (start >= total) break;
             int end = start + chunk;
             if (end > total) end = total;
-            asi_matvec_range(ctx->w[m], ctx->qx, ctx->out[m], start, end, ctx->blocks_per_row, ctx->quant_type[m]);
+            asi_matvec_range(ctx->w[m], ctx->qx, ctx->out[m], start, end, ctx->blocks_per_row, ctx->quant_type[m], n_threads);
         }
     }
 }
@@ -1425,7 +1490,8 @@ static inline void deltanet_head_step_avx2(float *S,
         }
     }
     else
-#elif defined(__AVX2__)
+#endif
+#if defined(__AVX2__)
     if ((k_dim & 7u) == 0u)
     {
         __m256 vq = _mm256_setzero_ps();
@@ -1450,7 +1516,8 @@ static inline void deltanet_head_step_avx2(float *S,
         }
     }
     else
-#elif defined(__aarch64__)
+#endif
+#if defined(__aarch64__)
     if ((k_dim & 3u) == 0u)
     {
         float32x4_t vq = vdupq_n_f32(0.0f);
@@ -1515,7 +1582,8 @@ static inline void deltanet_head_step_avx2(float *S,
         }
     }
     else
-#elif defined(__AVX2__)
+#endif
+#if defined(__AVX2__)
     if ((k_dim & 7u) == 0u)
     {
         __m256 vg = _mm256_set1_ps(g);
@@ -1543,7 +1611,8 @@ static inline void deltanet_head_step_avx2(float *S,
         }
     }
     else
-#elif defined(__aarch64__)
+#endif
+#if defined(__aarch64__)
     if ((k_dim & 3u) == 0u)
     {
         float32x4_t vg = vdupq_n_f32(g);
@@ -1799,7 +1868,16 @@ static void asi_deltanet_worker(int tid, int n_threads, void *vctx)
     }
 }
 
-static void qwen35_step_deltanet(AsiArchSession *s, uint32_t layer_idx)
+typedef struct {
+    double dn_proj;
+    double ssm;
+    double fa_proj;
+    double fa_gqa;
+    double ffn;
+    double norm;
+} Qwen35TokenProf;
+
+static void qwen35_step_deltanet(AsiArchSession *s, uint32_t layer_idx, Qwen35TokenProf *prof)
 {
     const AsiV2Cartridge *cart = s->cart;
     const AsiV2ModelConfig *c = &cart->config;
@@ -1815,6 +1893,7 @@ static void qwen35_step_deltanet(AsiArchSession *s, uint32_t layer_idx)
     uint32_t k_conv = c->ssm_conv_kernel;
     uint32_t conv_hist = (k_conv > 1) ? (k_conv - 1) : 0;
 
+    double tp = prof ? asi_now_ms() : 0.0;
     int bpr = ((int)c->hidden_size + QK_K - 1) / QK_K;
     const AsiV2TensorEntry *ts[4] = {lw->attn_qkv, lw->attn_gate, lw->ssm_alpha, lw->ssm_beta};
     float *outs[4] = {sc->qkv, sc->z, sc->alpha, sc->beta};
@@ -1837,6 +1916,12 @@ static void qwen35_step_deltanet(AsiArchSession *s, uint32_t layer_idx)
             for (int m = 0; m < 4; ++m)
                 matvec_tensor_pool(s->pool, cart, ts[m], outs[m], sc->x_norm, 0);
         }
+    }
+    if (prof)
+    {
+        double now = asi_now_ms();
+        prof->dn_proj += now - tp;
+        tp = now;
     }
 
     const float *conv_w = (const float *)tensor_data(cart, lw->ssm_conv1d);
@@ -1872,15 +1957,25 @@ static void qwen35_step_deltanet(AsiArchSession *s, uint32_t layer_idx)
         q_scale, c->rms_norm_eps, ATOMIC_VAR_INIT(0)
     };
     asi_pool_run(s->pool, asi_deltanet_worker, &dctx);
+    if (prof)
+    {
+        double now = asi_now_ms();
+        prof->ssm += now - tp;
+        tp = now;
+    }
 
     matvec_tensor_pool(s->pool, cart, lw->ssm_out, sc->proj_out, sc->attn_out, s->fp32_ref);
     for (uint32_t i = 0; i < c->hidden_size; ++i)
     {
         sc->x[i] += sc->proj_out[i];
     }
+    if (prof)
+    {
+        prof->dn_proj += asi_now_ms() - tp;
+    }
 }
 
-static void qwen35_step_full_attn(AsiArchSession *s, uint32_t layer_idx, uint32_t pos)
+static void qwen35_step_full_attn(AsiArchSession *s, uint32_t layer_idx, uint32_t pos, Qwen35TokenProf *prof)
 {
     const AsiV2Cartridge *cart = s->cart;
     const AsiV2ModelConfig *c = &cart->config;
@@ -1894,6 +1989,7 @@ static void qwen35_step_full_attn(AsiArchSession *s, uint32_t layer_idx, uint32_
     uint32_t kv_dim = n_kv * hd;
     uint32_t n_rep = n_heads / n_kv;
 
+    double tp = prof ? asi_now_ms() : 0.0;
     int bpr = ((int)c->hidden_size + QK_K - 1) / QK_K;
     const AsiV2TensorEntry *ts[3] = {lw->attn_q, lw->attn_k, lw->attn_v};
     float *outs[3] = {sc->qg, sc->k, sc->v};
@@ -1916,6 +2012,12 @@ static void qwen35_step_full_attn(AsiArchSession *s, uint32_t layer_idx, uint32_
             for (int m = 0; m < 3; ++m)
                 matvec_tensor_pool(s->pool, cart, ts[m], outs[m], sc->x_norm, 0);
         }
+    }
+    if (prof)
+    {
+        double now = asi_now_ms();
+        prof->fa_proj += now - tp;
+        tp = now;
     }
 
     const float *qn_w = (const float *)tensor_data(cart, lw->attn_q_norm);
@@ -1966,11 +2068,21 @@ static void qwen35_step_full_attn(AsiArchSession *s, uint32_t layer_idx, uint32_
         }
         asi_mul_sigmoid_vec(oh, gh, hd);
     }
+    if (prof)
+    {
+        double now = asi_now_ms();
+        prof->fa_gqa += now - tp;
+        tp = now;
+    }
 
     matvec_tensor_pool(s->pool, cart, lw->attn_output, sc->proj_out, sc->attn_out, s->fp32_ref);
     for (uint32_t i = 0; i < c->hidden_size; ++i)
     {
         sc->x[i] += sc->proj_out[i];
+    }
+    if (prof)
+    {
+        prof->fa_proj += asi_now_ms() - tp;
     }
 }
 
@@ -1982,7 +2094,8 @@ static int qwen35_forward_token(AsiArchSession *s, int32_t token_id, uint32_t po
     if ((uint32_t)token_id >= c->vocab_size) return -1;
 
     Qwen35Scratch *sc = &s->scratch;
-    int do_prof = (getenv("LILA_ASI_PROFILE") != NULL);
+    const int do_prof = asi_runtime_config()->profile;
+    Qwen35TokenProf prof = {0};
     double t_start = do_prof ? asi_now_ms() : 0.0;
     asi_pool_begin(s->pool);
     const uint8_t *embd_base = tensor_data(cart, s->token_embd);
@@ -2002,19 +2115,28 @@ static int qwen35_forward_token(AsiArchSession *s, int32_t token_id, uint32_t po
     {
         const Qwen35LayerWeights *lw = &s->layers[l];
         const float *an_w = (const float *)tensor_data(cart, lw->attn_norm);
+        double tp = do_prof ? asi_now_ms() : 0.0;
         rmsnorm(sc->x_norm, sc->x, an_w, c->hidden_size, c->rms_norm_eps);
+        if (do_prof) prof.norm += asi_now_ms() - tp;
 
         if (lw->kind == QWEN35_LAYER_DELTANET)
         {
-            qwen35_step_deltanet(s, l);
+            qwen35_step_deltanet(s, l, do_prof ? &prof : NULL);
         }
         else
         {
-            qwen35_step_full_attn(s, l, pos);
+            qwen35_step_full_attn(s, l, pos, do_prof ? &prof : NULL);
         }
 
         const float *pn_w = (const float *)tensor_data(cart, lw->post_attn_norm);
+        tp = do_prof ? asi_now_ms() : 0.0;
         rmsnorm(sc->x_norm, sc->x, pn_w, c->hidden_size, c->rms_norm_eps);
+        if (do_prof)
+        {
+            double now = asi_now_ms();
+            prof.norm += now - tp;
+            tp = now;
+        }
 
         int bpr = ((int)c->hidden_size + QK_K - 1) / QK_K;
         const AsiV2TensorEntry *ts[2] = {lw->ffn_gate, lw->ffn_up};
@@ -2045,20 +2167,31 @@ static int qwen35_forward_token(AsiArchSession *s, int32_t token_id, uint32_t po
         {
             sc->x[i] += sc->proj_out[i];
         }
+        if (do_prof) prof.ffn += asi_now_ms() - tp;
     }
 
-    double t_after_layers = do_prof ? asi_now_ms() : 0.0;
+    double tp = do_prof ? asi_now_ms() : 0.0;
     const float *on_w = (const float *)tensor_data(cart, s->output_norm);
     rmsnorm(sc->x_norm, sc->x, on_w, c->hidden_size, c->rms_norm_eps);
+    if (do_prof)
+    {
+        double now = asi_now_ms();
+        prof.norm += now - tp;
+        tp = now;
+    }
 
     const AsiV2TensorEntry *lm_head = s->output_weight ? s->output_weight : s->token_embd;
     int rc = matvec_tensor_pool(s->pool, cart, lm_head, out_logits, sc->x_norm, s->fp32_ref);
+    double t_lm = do_prof ? (asi_now_ms() - tp) : 0.0;
     asi_pool_end(s->pool);
     if (do_prof)
     {
         double t_end = asi_now_ms();
-        fprintf(stderr, "[PROF token pos=%u] layers=%.2f ms | lm_head=%.2f ms | total=%.2f ms\n",
-                pos, t_after_layers - t_start, t_end - t_after_layers, t_end - t_start);
+        fprintf(stderr,
+                "[PROF token pos=%u] total=%.2f ms | dn_proj=%.2f ssm=%.2f fa_proj=%.2f fa_gqa=%.2f ffn=%.2f norm=%.2f lm_head=%.2f\n",
+                pos, t_end - t_start,
+                prof.dn_proj, prof.ssm, prof.fa_proj, prof.fa_gqa,
+                prof.ffn, prof.norm, t_lm);
     }
     return rc;
 }
@@ -2424,7 +2557,7 @@ static void asi_full_attn_batch_worker(int tid, int n_threads, void *vctx)
             h = (uint32_t)atomic_fetch_add_explicit(&ctx->next_h, 1, memory_order_relaxed);
             if (h >= n_heads) break;
         }
-        uint32_t kvh = h / ctx->n_rep;
+        uint32_t kvh = h / n_rep;
         for (uint32_t t = 0; t < ctx->B; ++t)
         {
             uint32_t pos = ctx->pos_start + t;
@@ -2658,7 +2791,7 @@ static int qwen35_forward_chunk(AsiArchSession *s,
                                 int compute_logits,
                                 float *out_last_logits)
 {
-    int do_prof = (getenv("LILA_ASI_PROFILE") != NULL);
+    int do_prof = asi_runtime_config()->profile;
     double tc0 = do_prof ? asi_now_ms() : 0.0;
     double t_mm = 0.0, t_ssm = 0.0, t_attn = 0.0, t_conv = 0.0, t_norm = 0.0, t_lm = 0.0;
     const AsiV2Cartridge *cart = s->cart;
@@ -2869,7 +3002,7 @@ static int qwen35_forward_batch(AsiArchSession *s,
         return qwen35_forward_token(s, token_ids[0], pos_start, out_last_logits);
     }
 
-    const uint32_t chunk_max = 512;
+    const uint32_t chunk_max = (uint32_t)asi_runtime_config()->batch_chunk_max;
     uint32_t done = 0;
     asi_pool_begin(s->pool);
     while (done < n_tokens)
@@ -2983,6 +3116,279 @@ static int qwen35_restore_prefix(AsiArchSession *s, uint32_t *out_n_tokens)
     return 0;
 }
 
+typedef struct {
+    char magic[8];
+    uint32_t numerics_version;
+    uint32_t arch_id;
+    uint8_t cart_identity_hash[24];
+    uint8_t key_hash[32];
+    uint32_t fp32_ref;
+    uint32_t prefix_len;
+    uint32_t n_dn;
+    uint32_t n_fa;
+    uint64_t conv_bytes;
+    uint64_t ssm_bytes;
+    uint64_t k_bytes;
+    uint64_t v_bytes;
+    uint64_t reserved;
+    uint64_t payload_crc64;
+    uint64_t header_crc64;
+} AsiPrefixSnapshotHeader;
+
+_Static_assert(sizeof(AsiPrefixSnapshotHeader) == 144, "AsiPrefixSnapshotHeader must be 144 bytes");
+_Static_assert(offsetof(AsiPrefixSnapshotHeader, header_crc64) == 136, "header_crc64 offset mismatch");
+
+static uint64_t g_asi_pfx_crc64_tab[256];
+static pthread_once_t g_asi_pfx_crc64_once = PTHREAD_ONCE_INIT;
+
+static void asi_pfx_crc64_init(void)
+{
+    for (uint64_t i = 0; i < 256; ++i)
+    {
+        uint64_t crc = i << 56;
+        for (int b = 0; b < 8; ++b)
+        {
+            if (crc & 0x8000000000000000ULL)
+                crc = (crc << 1) ^ 0x42F0E1EBA9EA3693ULL;
+            else
+                crc <<= 1;
+        }
+        g_asi_pfx_crc64_tab[i] = crc;
+    }
+}
+
+static uint64_t asi_crc64_update(uint64_t crc, const uint8_t *data, size_t len)
+{
+    pthread_once(&g_asi_pfx_crc64_once, asi_pfx_crc64_init);
+    for (size_t i = 0; i < len; ++i)
+    {
+        crc = (crc << 8) ^ g_asi_pfx_crc64_tab[((crc >> 56) ^ data[i]) & 0xFFu];
+    }
+    return crc;
+}
+
+static void qwen35_prefix_geometry(const AsiArchSession *s,
+                                   uint32_t plen,
+                                   uint32_t *out_n_dn,
+                                   uint32_t *out_n_fa,
+                                   uint64_t *out_conv_bytes,
+                                   uint64_t *out_ssm_bytes,
+                                   uint64_t *out_k_bytes,
+                                   uint64_t *out_v_bytes)
+{
+    const AsiV2ModelConfig *c = &s->cart->config;
+    uint32_t qkv_dim = c->ssm_inner_size * 3u;
+    uint32_t conv_hist = (c->ssm_conv_kernel > 1u) ? (c->ssm_conv_kernel - 1u) : 0u;
+    size_t conv_per_layer = (size_t)conv_hist * qkv_dim;
+    uint32_t ssm_head_dim = (c->ssm_group_count > 0u) ? (c->ssm_inner_size / c->ssm_group_count) : 0u;
+    size_t ssm_per_layer = (size_t)c->ssm_group_count * c->ssm_state_size * ssm_head_dim;
+    size_t kv_dim = (size_t)c->n_kv_heads * c->head_dim;
+    size_t kv_per_layer = (size_t)plen * kv_dim;
+
+    uint32_t n_dn = 0, n_fa = 0;
+    for (uint32_t l = 0; l < c->n_layers; ++l)
+    {
+        if (s->layers[l].kind == QWEN35_LAYER_DELTANET) n_dn++; else n_fa++;
+    }
+    *out_n_dn = n_dn;
+    *out_n_fa = n_fa;
+    *out_conv_bytes = (uint64_t)n_dn * (uint64_t)conv_per_layer * sizeof(float);
+    *out_ssm_bytes  = (uint64_t)n_dn * (uint64_t)ssm_per_layer * sizeof(float);
+    *out_k_bytes    = (uint64_t)n_fa * (uint64_t)kv_per_layer * sizeof(uint16_t);
+    *out_v_bytes    = (uint64_t)n_fa * (uint64_t)kv_per_layer * sizeof(uint16_t);
+}
+
+static int qwen35_save_prefix_file(const AsiArchSession *s,
+                                   const uint8_t key_hash[32],
+                                   const char *filepath)
+{
+    if (!s || s->prefix_len == 0 || !key_hash || !filepath || filepath[0] == '\0') return -1;
+    uint32_t n_dn = 0, n_fa = 0;
+    uint64_t conv_bytes = 0, ssm_bytes = 0, k_bytes = 0, v_bytes = 0;
+    qwen35_prefix_geometry(s, s->prefix_len, &n_dn, &n_fa, &conv_bytes, &ssm_bytes, &k_bytes, &v_bytes);
+
+    if ((conv_bytes && !s->prefix_conv) || (ssm_bytes && !s->prefix_ssm) ||
+        (k_bytes && !s->prefix_k) || (v_bytes && !s->prefix_v))
+    {
+        return -1;
+    }
+
+    AsiPrefixSnapshotHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    memcpy(hdr.magic, "ASIPFX02", 8);
+    hdr.numerics_version = LILA_ASI_NUMERICS_VERSION;
+    hdr.arch_id = ASI_ARCH_HYBRID_QWEN35;
+    memcpy(hdr.cart_identity_hash, s->cart->header.identity_hash, 24);
+    memcpy(hdr.key_hash, key_hash, 32);
+    hdr.fp32_ref = (uint32_t)(s->fp32_ref ? 1u : 0u);
+    hdr.prefix_len = s->prefix_len;
+    hdr.n_dn = n_dn;
+    hdr.n_fa = n_fa;
+    hdr.conv_bytes = conv_bytes;
+    hdr.ssm_bytes = ssm_bytes;
+    hdr.k_bytes = k_bytes;
+    hdr.v_bytes = v_bytes;
+
+    uint64_t pcrc = 0;
+    if (conv_bytes) pcrc = asi_crc64_update(pcrc, (const uint8_t *)s->prefix_conv, (size_t)conv_bytes);
+    if (ssm_bytes)  pcrc = asi_crc64_update(pcrc, (const uint8_t *)s->prefix_ssm,  (size_t)ssm_bytes);
+    if (k_bytes)    pcrc = asi_crc64_update(pcrc, (const uint8_t *)s->prefix_k,    (size_t)k_bytes);
+    if (v_bytes)    pcrc = asi_crc64_update(pcrc, (const uint8_t *)s->prefix_v,    (size_t)v_bytes);
+    hdr.payload_crc64 = pcrc;
+    hdr.header_crc64 = asi_v2_crc64((const uint8_t *)&hdr, offsetof(AsiPrefixSnapshotHeader, header_crc64));
+
+    size_t flen = strlen(filepath);
+    size_t tcap = flen + 64;
+    char *tmp_path = (char *)malloc(tcap);
+    if (!tmp_path) return -1;
+    int tn = snprintf(tmp_path, tcap, "%s.tmp.%ld", filepath, (long)getpid());
+    if (tn <= 0 || (size_t)tn >= tcap)
+    {
+        free(tmp_path);
+        return -1;
+    }
+
+    FILE *fp = fopen(tmp_path, "wb");
+    if (!fp)
+    {
+        free(tmp_path);
+        return -1;
+    }
+
+    if (fwrite(&hdr, 1, sizeof(hdr), fp) != sizeof(hdr) ||
+        (conv_bytes > 0 && fwrite(s->prefix_conv, 1, (size_t)conv_bytes, fp) != (size_t)conv_bytes) ||
+        (ssm_bytes > 0  && fwrite(s->prefix_ssm,  1, (size_t)ssm_bytes,  fp) != (size_t)ssm_bytes) ||
+        (k_bytes > 0    && fwrite(s->prefix_k,    1, (size_t)k_bytes,    fp) != (size_t)k_bytes) ||
+        (v_bytes > 0    && fwrite(s->prefix_v,    1, (size_t)v_bytes,    fp) != (size_t)v_bytes))
+    {
+        fclose(fp);
+        unlink(tmp_path);
+        free(tmp_path);
+        return -1;
+    }
+
+    if (fflush(fp) != 0)
+    {
+        fclose(fp);
+        unlink(tmp_path);
+        free(tmp_path);
+        return -1;
+    }
+    int fd = fileno(fp);
+    if (fd >= 0 && fsync(fd) != 0 && errno != EINVAL && errno != EROFS)
+    {
+        fclose(fp);
+        unlink(tmp_path);
+        free(tmp_path);
+        return -1;
+    }
+    if (fclose(fp) != 0)
+    {
+        unlink(tmp_path);
+        free(tmp_path);
+        return -1;
+    }
+    if (rename(tmp_path, filepath) != 0)
+    {
+        unlink(tmp_path);
+        free(tmp_path);
+        return -1;
+    }
+    free(tmp_path);
+    return 0;
+}
+
+static int qwen35_load_prefix_file(AsiArchSession *s,
+                                   const uint8_t expected_key_hash[32],
+                                   const char *filepath,
+                                   uint32_t *out_n_tokens)
+{
+    if (!s || !expected_key_hash || !filepath || filepath[0] == '\0') return -1;
+
+    FILE *fp = fopen(filepath, "rb");
+    if (!fp) return -1;
+
+    AsiPrefixSnapshotHeader hdr;
+    float *new_conv = NULL;
+    float *new_ssm = NULL;
+    uint16_t *new_k = NULL;
+    uint16_t *new_v = NULL;
+
+    if (fread(&hdr, 1, sizeof(hdr), fp) != sizeof(hdr)) goto fail;
+    if (memcmp(hdr.magic, "ASIPFX02", 8) != 0) goto fail;
+
+    uint64_t expected_hcrc = asi_v2_crc64((const uint8_t *)&hdr, offsetof(AsiPrefixSnapshotHeader, header_crc64));
+    if (hdr.header_crc64 != expected_hcrc) goto fail;
+    if (hdr.numerics_version != LILA_ASI_NUMERICS_VERSION) goto fail;
+    if (hdr.arch_id != ASI_ARCH_HYBRID_QWEN35) goto fail;
+    if (memcmp(hdr.cart_identity_hash, s->cart->header.identity_hash, 24) != 0) goto fail;
+    if (memcmp(hdr.key_hash, expected_key_hash, 32) != 0) goto fail;
+    if (hdr.fp32_ref != (uint32_t)(s->fp32_ref ? 1u : 0u)) goto fail;
+    if (hdr.prefix_len == 0 || hdr.prefix_len > s->max_ctx) goto fail;
+
+    uint32_t exp_dn = 0, exp_fa = 0;
+    uint64_t exp_conv = 0, exp_ssm = 0, exp_k = 0, exp_v = 0;
+    qwen35_prefix_geometry(s, hdr.prefix_len, &exp_dn, &exp_fa, &exp_conv, &exp_ssm, &exp_k, &exp_v);
+    if (hdr.n_dn != exp_dn || hdr.n_fa != exp_fa ||
+        hdr.conv_bytes != exp_conv || hdr.ssm_bytes != exp_ssm ||
+        hdr.k_bytes != exp_k || hdr.v_bytes != exp_v)
+    {
+        goto fail;
+    }
+
+    if (exp_conv > 0)
+    {
+        new_conv = (float *)malloc((size_t)exp_conv);
+        if (!new_conv || fread(new_conv, 1, (size_t)exp_conv, fp) != (size_t)exp_conv) goto fail;
+    }
+    if (exp_ssm > 0)
+    {
+        new_ssm = (float *)malloc((size_t)exp_ssm);
+        if (!new_ssm || fread(new_ssm, 1, (size_t)exp_ssm, fp) != (size_t)exp_ssm) goto fail;
+    }
+    if (exp_k > 0)
+    {
+        new_k = (uint16_t *)malloc((size_t)exp_k);
+        if (!new_k || fread(new_k, 1, (size_t)exp_k, fp) != (size_t)exp_k) goto fail;
+    }
+    if (exp_v > 0)
+    {
+        new_v = (uint16_t *)malloc((size_t)exp_v);
+        if (!new_v || fread(new_v, 1, (size_t)exp_v, fp) != (size_t)exp_v) goto fail;
+    }
+
+    uint8_t extra = 0;
+    if (fread(&extra, 1, 1, fp) != 0 || ferror(fp)) goto fail;
+    fclose(fp);
+    fp = NULL;
+
+    uint64_t pcrc = 0;
+    if (exp_conv > 0) pcrc = asi_crc64_update(pcrc, (const uint8_t *)new_conv, (size_t)exp_conv);
+    if (exp_ssm > 0)  pcrc = asi_crc64_update(pcrc, (const uint8_t *)new_ssm,  (size_t)exp_ssm);
+    if (exp_k > 0)    pcrc = asi_crc64_update(pcrc, (const uint8_t *)new_k,    (size_t)exp_k);
+    if (exp_v > 0)    pcrc = asi_crc64_update(pcrc, (const uint8_t *)new_v,    (size_t)exp_v);
+    if (pcrc != hdr.payload_crc64) goto fail;
+
+    free(s->prefix_conv);
+    free(s->prefix_ssm);
+    free(s->prefix_k);
+    free(s->prefix_v);
+    s->prefix_conv = new_conv;
+    s->prefix_ssm  = new_ssm;
+    s->prefix_k    = new_k;
+    s->prefix_v    = new_v;
+    s->prefix_len  = hdr.prefix_len;
+    return qwen35_restore_prefix(s, out_n_tokens);
+
+fail:
+    if (fp) fclose(fp);
+    free(new_conv);
+    free(new_ssm);
+    free(new_k);
+    free(new_v);
+    return -1;
+}
+
 const AsiArchHandler g_asi_arch_hybrid_qwen35 = {
     .arch_id = ASI_ARCH_HYBRID_QWEN35,
     .name = "hybrid_qwen35",
@@ -2993,6 +3399,8 @@ const AsiArchHandler g_asi_arch_hybrid_qwen35 = {
     .reset_state = qwen35_reset_state,
     .save_prefix = qwen35_save_prefix,
     .restore_prefix = qwen35_restore_prefix,
+    .save_prefix_file = qwen35_save_prefix_file,
+    .load_prefix_file = qwen35_load_prefix_file,
 };
 
 const AsiArchHandler g_asi_arch_dense_transformer = {

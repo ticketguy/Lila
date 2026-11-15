@@ -59,6 +59,13 @@ int lila_asi_model_info(const LilaAsiModel *model, AsiV2ModelConfig *out_cfg)
     return 0;
 }
 
+int lila_asi_model_header(const LilaAsiModel *model, AsiV2Header *out_hdr)
+{
+    if (!model || !out_hdr) return -1;
+    *out_hdr = model->cart.header;
+    return 0;
+}
+
 int lila_asi_get_section(const LilaAsiModel *model,
                          uint32_t section_type,
                          const void **out_ptr,
@@ -131,6 +138,28 @@ int lila_asi_session_restore_prefix(LilaAsiSession *session, uint32_t *out_n_tok
     if (!session || !session->model || !session->model->handler) return -1;
     if (!session->model->handler->restore_prefix) return -1;
     return session->model->handler->restore_prefix(session->arch_session, out_n_tokens);
+}
+
+int lila_asi_session_save_prefix_file(const LilaAsiSession *session,
+                                      const uint8_t key_hash[32],
+                                      const char *filepath)
+{
+    if (!session || !session->model || !session->model->handler) return -1;
+    if (!session->model->handler->save_prefix_file) return -1;
+    return session->model->handler->save_prefix_file(session->arch_session, key_hash, filepath);
+}
+
+int lila_asi_session_load_prefix_file(LilaAsiSession *session,
+                                      const uint8_t expected_key_hash[32],
+                                      const char *filepath,
+                                      uint32_t *out_n_tokens)
+{
+    if (!session || !session->model || !session->model->handler) return -1;
+    if (!session->model->handler->load_prefix_file) return -1;
+    return session->model->handler->load_prefix_file(session->arch_session,
+                                                     expected_key_hash,
+                                                     filepath,
+                                                     out_n_tokens);
 }
 
 int lila_asi_eval_token(LilaAsiSession *session,

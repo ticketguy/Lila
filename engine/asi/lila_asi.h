@@ -9,6 +9,8 @@
 extern "C" {
 #endif
 
+#define LILA_ASI_NUMERICS_VERSION 2U
+
 typedef struct LilaAsiModel LilaAsiModel;
 typedef struct LilaAsiSession LilaAsiSession;
 
@@ -16,6 +18,7 @@ typedef struct LilaAsiSession LilaAsiSession;
 LilaAsiModel *lila_asi_open(const char *asi_path, char *err_buf, size_t err_cap);
 void lila_asi_close(LilaAsiModel *model);
 int lila_asi_model_info(const LilaAsiModel *model, AsiV2ModelConfig *out_cfg);
+int lila_asi_model_header(const LilaAsiModel *model, AsiV2Header *out_hdr);
 int lila_asi_get_section(const LilaAsiModel *model,
                          uint32_t section_type,
                          const void **out_ptr,
@@ -31,6 +34,13 @@ void lila_asi_session_free(LilaAsiSession *session);
 void lila_asi_session_reset(LilaAsiSession *session);
 int lila_asi_session_save_prefix(LilaAsiSession *session, uint32_t n_tokens);
 int lila_asi_session_restore_prefix(LilaAsiSession *session, uint32_t *out_n_tokens);
+int lila_asi_session_save_prefix_file(const LilaAsiSession *session,
+                                      const uint8_t key_hash[32],
+                                      const char *filepath);
+int lila_asi_session_load_prefix_file(LilaAsiSession *session,
+                                      const uint8_t expected_key_hash[32],
+                                      const char *filepath,
+                                      uint32_t *out_n_tokens);
 
 /* Inference */
 int lila_asi_eval_token(LilaAsiSession *session,

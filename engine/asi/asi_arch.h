@@ -44,6 +44,15 @@ typedef struct {
     /* Optional in-session prefix state snapshot/restore for instant repeat-turn TTFT. */
     int (*save_prefix)(AsiArchSession *session, uint32_t n_tokens);
     int (*restore_prefix)(AsiArchSession *session, uint32_t *out_n_tokens);
+
+    /* Optional disk-persisted prefix snapshot save/load (binary state cache). */
+    int (*save_prefix_file)(const AsiArchSession *session,
+                            const uint8_t key_hash[32],
+                            const char *filepath);
+    int (*load_prefix_file)(AsiArchSession *session,
+                            const uint8_t expected_key_hash[32],
+                            const char *filepath,
+                            uint32_t *out_n_tokens);
 } AsiArchHandler;
 
 /* Lookup a registered architecture handler by AsiV2ArchId. Returns NULL if unsupported. */

@@ -345,69 +345,7 @@ static inline void lila_q4k_unpack_scales_avx2(const uint8_t *sp, uint32_t *sc03
 #endif
 
 static inline float q4k_dot_q8k_simd(const uint8_t *row_blocks, const LilaQ8KBlock *qx, int blocks_per_row) {
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-    const __m512i mask_0f = _mm512_set1_epi8(0x0F);
-    float total_sum = 0.0f;
-
-    for (int b = 0; b < blocks_per_row; b++) {
-        const uint8_t *block = row_blocks + (size_t)b * Q4_K_BLOCK_SIZE;
-        uint16_t d_raw, dmin_raw;
-        memcpy(&d_raw, block, 2);
-        memcpy(&dmin_raw, block + 2, 2);
-        float d = fp16_to_fp32(d_raw);
-        float min = fp16_to_fp32(dmin_raw);
-
-        const uint8_t *scales_packed = block + 4;
-        const uint8_t *qs = block + 16;
-        const LilaQ8KBlock *xb = &qx[b];
-
-        __m512i sumi = _mm512_setzero_si512();
-        int32_t sum_mins = 0;
-
-        for (int half = 0; half < 2; half++) {
-            int is = half * 4;
-            int sb = half * 4;
-            uint8_t sc0, m0, sc1, m1, sc2, m2, sc3, m3;
-            get_scale_min_k4(is + 0, scales_packed, &sc0, &m0);
-            get_scale_min_k4(is + 1, scales_packed, &sc1, &m1);
-            get_scale_min_k4(is + 2, scales_packed, &sc2, &m2);
-            get_scale_min_k4(is + 3, scales_packed, &sc3, &m3);
-
-            __m512i qbits = _mm512_loadu_si512((const void *)(qs + half * 64));
-            __m512i q_lo = _mm512_and_si512(qbits, mask_0f);
-            __m512i q_hi = _mm512_and_si512(_mm512_srli_epi16(qbits, 4), mask_0f);
-
-            __m512i x_lo = _mm512_inserti64x4(
-                _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)(xb->qs + half * 128 + 0))),
-                _mm256_loadu_si256((const __m256i *)(xb->qs + half * 128 + 64)), 1);
-            __m512i x_hi = _mm512_inserti64x4(
-                _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)(xb->qs + half * 128 + 32))),
-                _mm256_loadu_si256((const __m256i *)(xb->qs + half * 128 + 96)), 1);
-
-#if defined(__AVX512VNNI__)
-            __m512i d_lo = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q_lo, x_lo);
-            __m512i d_hi = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q_hi, x_hi);
-            __m512i vsc_lo = _mm512_mask_blend_epi32(0xFF00, _mm512_set1_epi32((int32_t)sc0), _mm512_set1_epi32((int32_t)sc2));
-            __m512i vsc_hi = _mm512_mask_blend_epi32(0xFF00, _mm512_set1_epi32((int32_t)sc1), _mm512_set1_epi32((int32_t)sc3));
-            sumi = _mm512_add_epi32(sumi, _mm512_add_epi32(_mm512_mullo_epi32(d_lo, vsc_lo), _mm512_mullo_epi32(d_hi, vsc_hi)));
-#else
-            __m512i vsc_lo = _mm512_mask_blend_epi16(0xFFFF0000u, _mm512_set1_epi16((int16_t)sc0), _mm512_set1_epi16((int16_t)sc2));
-            __m512i vsc_hi = _mm512_mask_blend_epi16(0xFFFF0000u, _mm512_set1_epi16((int16_t)sc1), _mm512_set1_epi16((int16_t)sc3));
-            __m512i p_lo = _mm512_madd_epi16(_mm512_maddubs_epi16(q_lo, x_lo), vsc_lo);
-            __m512i p_hi = _mm512_madd_epi16(_mm512_maddubs_epi16(q_hi, x_hi), vsc_hi);
-            sumi = _mm512_add_epi32(sumi, _mm512_add_epi32(p_lo, p_hi));
-#endif
-
-            sum_mins += (int32_t)m0 * ((int32_t)xb->bsums[(sb + 0) * 2 + 0] + (int32_t)xb->bsums[(sb + 0) * 2 + 1])
-                      + (int32_t)m1 * ((int32_t)xb->bsums[(sb + 1) * 2 + 0] + (int32_t)xb->bsums[(sb + 1) * 2 + 1])
-                      + (int32_t)m2 * ((int32_t)xb->bsums[(sb + 2) * 2 + 0] + (int32_t)xb->bsums[(sb + 2) * 2 + 1])
-                      + (int32_t)m3 * ((int32_t)xb->bsums[(sb + 3) * 2 + 0] + (int32_t)xb->bsums[(sb + 3) * 2 + 1]);
-        }
-        float xd = xb->d;
-        total_sum += (d * xd) * (float)_mm512_reduce_add_epi32(sumi) - (min * xd) * (float)sum_mins;
-    }
-    return total_sum;
-#elif defined(__AVX2__)
+#if defined(__AVX2__)
     const __m256i mask_0f = _mm256_set1_epi8(0x0F);
     __m256 sum_vec = _mm256_setzero_ps();
     float bias = 0.0f;
@@ -718,84 +656,8 @@ static inline void dequant_q6k_row(float *out, const uint8_t *row_data, int hidd
     }
 }
 
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-static inline __m512i lila_scale4_epi32(int8_t s0, int8_t s1, int8_t s2, int8_t s3) {
-    return _mm512_set_epi32(
-        s3, s3, s3, s3, s2, s2, s2, s2, s1, s1, s1, s1, s0, s0, s0, s0);
-}
-static inline __m512i lila_scale4_epi16(int8_t s0, int8_t s1, int8_t s2, int8_t s3) {
-    uint32_t p0 = ((uint32_t)(uint16_t)(int16_t)s0 << 16) | (uint32_t)(uint16_t)(int16_t)s0;
-    uint32_t p1 = ((uint32_t)(uint16_t)(int16_t)s1 << 16) | (uint32_t)(uint16_t)(int16_t)s1;
-    uint32_t p2 = ((uint32_t)(uint16_t)(int16_t)s2 << 16) | (uint32_t)(uint16_t)(int16_t)s2;
-    uint32_t p3 = ((uint32_t)(uint16_t)(int16_t)s3 << 16) | (uint32_t)(uint16_t)(int16_t)s3;
-    return _mm512_set_epi32(
-        (int)p3, (int)p3, (int)p3, (int)p3, (int)p2, (int)p2, (int)p2, (int)p2,
-        (int)p1, (int)p1, (int)p1, (int)p1, (int)p0, (int)p0, (int)p0, (int)p0);
-}
-#endif
-
 static inline float q6k_dot_q8k_simd(const uint8_t *row_ptr, const LilaQ8KBlock *qx, int blocks_per_row) {
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-    const __m512i mask_0f = _mm512_set1_epi8(0x0F);
-    const __m512i mask_03 = _mm512_set1_epi8(0x03);
-    float total_sum = 0.0f;
-    for (int b = 0; b < blocks_per_row; b++) {
-        const uint8_t *block = row_ptr + (size_t)b * Q6_K_BLOCK_SIZE;
-        const uint8_t *ql = block;
-        const uint8_t *qh = block + 128;
-        const int8_t *scales = (const int8_t *)(block + 192);
-        uint16_t d_raw;
-        memcpy(&d_raw, block + 208, 2);
-        float d = fp16_to_fp32(d_raw);
-        const LilaQ8KBlock *xb = &qx[b];
-
-        __m512i sumi = _mm512_setzero_si512();
-        int32_t sum_bias = 0;
-
-        for (int half = 0; half < 2; half++) {
-            const uint8_t *ql_h = ql + half * 64;
-            const uint8_t *qh_h = qh + half * 32;
-            const int8_t  *sc_h = scales + half * 8;
-            int sb_base = half * 4;
-
-            __m512i ql64 = _mm512_loadu_si512((const void *)ql_h);
-            __m256i qh0 = _mm256_loadu_si256((const __m256i *)qh_h);
-            __m512i qh512 = _mm512_inserti64x4(_mm512_castsi256_si512(qh0), qh0, 1);
-
-            __m512i qh_01 = _mm512_slli_epi16(_mm512_and_si512(_mm512_mask_srli_epi16(qh512, 0xFFFF0000u, qh512, 2), mask_03), 4);
-            __m512i qh_23 = _mm512_slli_epi16(_mm512_and_si512(_mm512_mask_srli_epi16(_mm512_srli_epi16(qh512, 4), 0xFFFF0000u, qh512, 6), mask_03), 4);
-            __m512i u01 = _mm512_or_si512(_mm512_and_si512(ql64, mask_0f), qh_01);
-            __m512i u23 = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(ql64, 4), mask_0f), qh_23);
-
-            __m512i x01 = _mm512_loadu_si512((const void *)(xb->qs + sb_base * 32));
-            __m512i x23 = _mm512_loadu_si512((const void *)(xb->qs + (sb_base + 2) * 32));
-
-#if defined(__AVX512VNNI__)
-            __m512i d01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), u01, x01);
-            __m512i d23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), u23, x23);
-            sumi = _mm512_add_epi32(sumi, _mm512_mullo_epi32(d01, lila_scale4_epi32(sc_h[0], sc_h[1], sc_h[2], sc_h[3])));
-            sumi = _mm512_add_epi32(sumi, _mm512_mullo_epi32(d23, lila_scale4_epi32(sc_h[4], sc_h[5], sc_h[6], sc_h[7])));
-#else
-            __m512i p01 = _mm512_maddubs_epi16(u01, x01);
-            __m512i p23 = _mm512_maddubs_epi16(u23, x23);
-            sumi = _mm512_add_epi32(sumi, _mm512_madd_epi16(p01, lila_scale4_epi16(sc_h[0], sc_h[1], sc_h[2], sc_h[3])));
-            sumi = _mm512_add_epi32(sumi, _mm512_madd_epi16(p23, lila_scale4_epi16(sc_h[4], sc_h[5], sc_h[6], sc_h[7])));
-#endif
-
-            __m128i sc8 = _mm_loadl_epi64((const __m128i *)sc_h);
-            __m128i sc16 = _mm_cvtepi8_epi16(sc8);
-            __m128i bsums128 = _mm_loadu_si128((const __m128i *)(xb->bsums + sb_base * 2));
-            __m128i bprod32 = _mm_madd_epi16(sc16, bsums128);
-            __m128i bsum_hi = _mm_unpackhi_epi64(bprod32, bprod32);
-            __m128i bsum64 = _mm_add_epi32(bprod32, bsum_hi);
-            __m128i bsum32 = _mm_add_epi32(bsum64, _mm_shuffle_epi32(bsum64, _MM_SHUFFLE(1, 1, 1, 1)));
-            sum_bias += _mm_cvtsi128_si32(bsum32);
-        }
-        float xd = d * xb->d;
-        total_sum += xd * (float)(_mm512_reduce_add_epi32(sumi) - 32 * sum_bias);
-    }
-    return total_sum;
-#elif defined(__AVX2__)
+#if defined(__AVX2__)
     const __m256i mask_0f = _mm256_set1_epi8(0x0F);
     const __m256i mask_03 = _mm256_set1_epi8(0x03);
     __m256 sum_vec = _mm256_setzero_ps();
@@ -1111,7 +973,7 @@ static inline void q6k_matvec(float *out, const uint8_t *weight_data, const floa
     }
 }
 
-#if defined(__AVX2__) && !defined(__AVX512F__)
+#if defined(__AVX2__)
 static inline void lila_q4k_unpack_row_avx2(const uint8_t *row_ptr, int bpr,
                                             uint8_t *u_out, __m256i *vsc_out,
                                             __m256i *vmn16_out, float *d_out, float *m_out) {
@@ -1149,92 +1011,7 @@ static inline void q4k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
                                               int n_tokens, int row_start, int row_end,
                                               int total_rows, int blocks_per_row) {
     const size_t row_bytes = (size_t)blocks_per_row * Q4_K_BLOCK_SIZE;
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-    const __m512i mask_0f = _mm512_set1_epi8(0x0F);
-
-    for (int i = row_start; i < row_end; i++) {
-        const uint8_t *row_ptr = weight_data + (size_t)i * row_bytes;
-        if (i + 2 < row_end) {
-            LILA_PREFETCH(row_ptr + 2 * row_bytes);
-        }
-        for (int t0 = 0; t0 < n_tokens; t0 += 32) {
-            int nt = n_tokens - t0;
-            if (nt > 32) nt = 32;
-            float acc[32];
-            for (int t = 0; t < nt; t++) acc[t] = 0.0f;
-
-            for (int b = 0; b < blocks_per_row; b++) {
-                const uint8_t *block = row_ptr + (size_t)b * Q4_K_BLOCK_SIZE;
-                uint16_t d_raw, dmin_raw;
-                memcpy(&d_raw, block, 2);
-                memcpy(&dmin_raw, block + 2, 2);
-                float d = fp16_to_fp32(d_raw);
-                float min = fp16_to_fp32(dmin_raw);
-                const uint8_t *scales_packed = block + 4;
-                const uint8_t *qs = block + 16;
-
-                __m512i sumi[32];
-                int32_t mins[32];
-                for (int t = 0; t < nt; t++) {
-                    sumi[t] = _mm512_setzero_si512();
-                    mins[t] = 0;
-                }
-
-                for (int half = 0; half < 2; half++) {
-                    int is = half * 4;
-                    int sb = half * 4;
-                    uint8_t sc0, m0, sc1, m1, sc2, m2, sc3, m3;
-                    get_scale_min_k4(is + 0, scales_packed, &sc0, &m0);
-                    get_scale_min_k4(is + 1, scales_packed, &sc1, &m1);
-                    get_scale_min_k4(is + 2, scales_packed, &sc2, &m2);
-                    get_scale_min_k4(is + 3, scales_packed, &sc3, &m3);
-
-                    __m512i qbits = _mm512_loadu_si512((const void *)(qs + half * 64));
-                    __m512i q_lo = _mm512_and_si512(qbits, mask_0f);
-                    __m512i q_hi = _mm512_and_si512(_mm512_srli_epi16(qbits, 4), mask_0f);
-
-#if defined(__AVX512VNNI__)
-                    __m512i vsc_lo = _mm512_mask_blend_epi32(0xFF00, _mm512_set1_epi32((int32_t)sc0), _mm512_set1_epi32((int32_t)sc2));
-                    __m512i vsc_hi = _mm512_mask_blend_epi32(0xFF00, _mm512_set1_epi32((int32_t)sc1), _mm512_set1_epi32((int32_t)sc3));
-#else
-                    __m512i vsc_lo = _mm512_mask_blend_epi16(0xFFFF0000u, _mm512_set1_epi16((int16_t)sc0), _mm512_set1_epi16((int16_t)sc2));
-                    __m512i vsc_hi = _mm512_mask_blend_epi16(0xFFFF0000u, _mm512_set1_epi16((int16_t)sc1), _mm512_set1_epi16((int16_t)sc3));
-#endif
-
-                    for (int t = 0; t < nt; t++) {
-                        const LilaQ8KBlock *xb = qx_all + (size_t)b * n_tokens + (t0 + t);
-                        __m512i x_lo = _mm512_inserti64x4(
-                            _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)(xb->qs + half * 128 + 0))),
-                            _mm256_loadu_si256((const __m256i *)(xb->qs + half * 128 + 64)), 1);
-                        __m512i x_hi = _mm512_inserti64x4(
-                            _mm512_castsi256_si512(_mm256_loadu_si256((const __m256i *)(xb->qs + half * 128 + 32))),
-                            _mm256_loadu_si256((const __m256i *)(xb->qs + half * 128 + 96)), 1);
-#if defined(__AVX512VNNI__)
-                        __m512i d_lo = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q_lo, x_lo);
-                        __m512i d_hi = _mm512_dpbusd_epi32(_mm512_setzero_si512(), q_hi, x_hi);
-                        sumi[t] = _mm512_add_epi32(sumi[t], _mm512_add_epi32(_mm512_mullo_epi32(d_lo, vsc_lo), _mm512_mullo_epi32(d_hi, vsc_hi)));
-#else
-                        __m512i pl = _mm512_madd_epi16(_mm512_maddubs_epi16(q_lo, x_lo), vsc_lo);
-                        __m512i ph = _mm512_madd_epi16(_mm512_maddubs_epi16(q_hi, x_hi), vsc_hi);
-                        sumi[t] = _mm512_add_epi32(sumi[t], _mm512_add_epi32(pl, ph));
-#endif
-                        mins[t] += (int32_t)m0 * ((int32_t)xb->bsums[(sb + 0) * 2 + 0] + (int32_t)xb->bsums[(sb + 0) * 2 + 1])
-                                 + (int32_t)m1 * ((int32_t)xb->bsums[(sb + 1) * 2 + 0] + (int32_t)xb->bsums[(sb + 1) * 2 + 1])
-                                 + (int32_t)m2 * ((int32_t)xb->bsums[(sb + 2) * 2 + 0] + (int32_t)xb->bsums[(sb + 2) * 2 + 1])
-                                 + (int32_t)m3 * ((int32_t)xb->bsums[(sb + 3) * 2 + 0] + (int32_t)xb->bsums[(sb + 3) * 2 + 1]);
-                    }
-                }
-                for (int t = 0; t < nt; t++) {
-                    float xd = qx_all[(size_t)b * n_tokens + (t0 + t)].d;
-                    acc[t] += d * xd * (float)_mm512_reduce_add_epi32(sumi[t]) - min * xd * (float)mins[t];
-                }
-            }
-            for (int t = 0; t < nt; t++) {
-                out[(size_t)(t0 + t) * total_rows + i] = acc[t];
-            }
-        }
-    }
-#elif defined(__AVX2__)
+#if defined(__AVX2__)
     const __m256i mask_0f = _mm256_set1_epi8(0x0F);
 
     if (n_tokens >= 4 && blocks_per_row <= 16) {
@@ -1477,40 +1254,34 @@ static inline void q4k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
                     __m256i sumi11 = _mm256_setzero_si256();
                     __m256i sumi12 = _mm256_setzero_si256();
                     __m256i sumi13 = _mm256_setzero_si256();
-                    int32_t mins00 = 0, mins01 = 0, mins02 = 0, mins03 = 0;
-                    int32_t mins10 = 0, mins11 = 0, mins12 = 0, mins13 = 0;
+                    uint32_t sc03_0, sc47_0, sc03_1, sc47_1;
+                    __m256i vmn16_0, vmn16_1;
+                    lila_q4k_unpack_scales_avx2(sp0, &sc03_0, &sc47_0, &vmn16_0);
+                    lila_q4k_unpack_scales_avx2(sp1, &sc03_1, &sc47_1, &vmn16_1);
+                    __m256i vb0 = _mm256_loadu_si256((const __m256i *)xb0->bsums);
+                    __m256i vb1 = _mm256_loadu_si256((const __m256i *)xb1->bsums);
+                    __m256i vb2 = _mm256_loadu_si256((const __m256i *)xb2->bsums);
+                    __m256i vb3 = _mm256_loadu_si256((const __m256i *)xb3->bsums);
+                    int32_t mins00 = lila_hsum_i32_avx2(_mm256_madd_epi16(vmn16_0, vb0));
+                    int32_t mins01 = lila_hsum_i32_avx2(_mm256_madd_epi16(vmn16_0, vb1));
+                    int32_t mins02 = lila_hsum_i32_avx2(_mm256_madd_epi16(vmn16_0, vb2));
+                    int32_t mins03 = lila_hsum_i32_avx2(_mm256_madd_epi16(vmn16_0, vb3));
+                    int32_t mins10 = lila_hsum_i32_avx2(_mm256_madd_epi16(vmn16_1, vb0));
+                    int32_t mins11 = lila_hsum_i32_avx2(_mm256_madd_epi16(vmn16_1, vb1));
+                    int32_t mins12 = lila_hsum_i32_avx2(_mm256_madd_epi16(vmn16_1, vb2));
+                    int32_t mins13 = lila_hsum_i32_avx2(_mm256_madd_epi16(vmn16_1, vb3));
 
-                    int is = 0;
                     for (int sb = 0; sb < 8; sb += 2) {
-                        uint8_t sc1_0, m1_0, sc2_0, m2_0;
-                        uint8_t sc1_1, m1_1, sc2_1, m2_1;
-                        get_scale_min_k4(is + 0, sp0, &sc1_0, &m1_0);
-                        get_scale_min_k4(is + 1, sp0, &sc2_0, &m2_0);
-                        get_scale_min_k4(is + 0, sp1, &sc1_1, &m1_1);
-                        get_scale_min_k4(is + 1, sp1, &sc2_1, &m2_1);
+                        uint32_t sw0 = (sb < 4) ? sc03_0 : sc47_0;
+                        uint32_t sw1 = (sb < 4) ? sc03_1 : sc47_1;
+                        int sh = (sb & 2) ? 16 : 0;
+                        uint8_t sc1_0 = (uint8_t)(sw0 >> sh);
+                        uint8_t sc2_0 = (uint8_t)(sw0 >> (sh + 8));
+                        uint8_t sc1_1 = (uint8_t)(sw1 >> sh);
+                        uint8_t sc2_1 = (uint8_t)(sw1 >> (sh + 8));
 
                         int sb0_off = sb * 32;
                         int sb1_off = (sb + 1) * 32;
-                        int bs0 = sb * 2;
-                        int bs1 = (sb + 1) * 2;
-
-                        int32_t b0_lo = (int32_t)xb0->bsums[bs0] + (int32_t)xb0->bsums[bs0 + 1];
-                        int32_t b1_lo = (int32_t)xb1->bsums[bs0] + (int32_t)xb1->bsums[bs0 + 1];
-                        int32_t b2_lo = (int32_t)xb2->bsums[bs0] + (int32_t)xb2->bsums[bs0 + 1];
-                        int32_t b3_lo = (int32_t)xb3->bsums[bs0] + (int32_t)xb3->bsums[bs0 + 1];
-                        int32_t b0_hi = (int32_t)xb0->bsums[bs1] + (int32_t)xb0->bsums[bs1 + 1];
-                        int32_t b1_hi = (int32_t)xb1->bsums[bs1] + (int32_t)xb1->bsums[bs1 + 1];
-                        int32_t b2_hi = (int32_t)xb2->bsums[bs1] + (int32_t)xb2->bsums[bs1 + 1];
-                        int32_t b3_hi = (int32_t)xb3->bsums[bs1] + (int32_t)xb3->bsums[bs1 + 1];
-
-                        mins00 += (int32_t)m1_0 * b0_lo + (int32_t)m2_0 * b0_hi;
-                        mins01 += (int32_t)m1_0 * b1_lo + (int32_t)m2_0 * b1_hi;
-                        mins02 += (int32_t)m1_0 * b2_lo + (int32_t)m2_0 * b2_hi;
-                        mins03 += (int32_t)m1_0 * b3_lo + (int32_t)m2_0 * b3_hi;
-                        mins10 += (int32_t)m1_1 * b0_lo + (int32_t)m2_1 * b0_hi;
-                        mins11 += (int32_t)m1_1 * b1_lo + (int32_t)m2_1 * b1_hi;
-                        mins12 += (int32_t)m1_1 * b2_lo + (int32_t)m2_1 * b2_hi;
-                        mins13 += (int32_t)m1_1 * b3_lo + (int32_t)m2_1 * b3_hi;
 
                         __m256i xl0 = _mm256_loadu_si256((const __m256i *)(xb0->qs + sb0_off));
                         __m256i xl1 = _mm256_loadu_si256((const __m256i *)(xb1->qs + sb0_off));
@@ -1590,7 +1361,6 @@ static inline void q4k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
 
                         qs0 += 32;
                         qs1 += 32;
-                        is += 2;
                     }
 
                     float xd0 = xb0->d, xd1 = xb1->d, xd2 = xb2->d, xd3 = xb3->d;
@@ -1633,15 +1403,23 @@ static inline void q4k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
                     const uint8_t *qs0 = block0 + 16, *qs1 = block1 + 16;
                     const LilaQ8KBlock *xb = qx_all + (size_t)b * n_tokens + t;
 
+                    uint32_t sc03_0, sc47_0, sc03_1, sc47_1;
+                    __m256i vmn16_0, vmn16_1;
+                    lila_q4k_unpack_scales_avx2(sp0, &sc03_0, &sc47_0, &vmn16_0);
+                    lila_q4k_unpack_scales_avx2(sp1, &sc03_1, &sc47_1, &vmn16_1);
+                    __m256i vb = _mm256_loadu_si256((const __m256i *)xb->bsums);
+                    int32_t mins0 = lila_hsum_i32_avx2(_mm256_madd_epi16(vmn16_0, vb));
+                    int32_t mins1 = lila_hsum_i32_avx2(_mm256_madd_epi16(vmn16_1, vb));
+
                     __m256i sumi0 = _mm256_setzero_si256(), sumi1 = _mm256_setzero_si256();
-                    int32_t mins0 = 0, mins1 = 0;
-                    int is = 0;
                     for (int sb = 0; sb < 8; sb += 2) {
-                        uint8_t sc1_0, m1_0, sc2_0, m2_0, sc1_1, m1_1, sc2_1, m2_1;
-                        get_scale_min_k4(is + 0, sp0, &sc1_0, &m1_0);
-                        get_scale_min_k4(is + 1, sp0, &sc2_0, &m2_0);
-                        get_scale_min_k4(is + 0, sp1, &sc1_1, &m1_1);
-                        get_scale_min_k4(is + 1, sp1, &sc2_1, &m2_1);
+                        uint32_t sw0 = (sb < 4) ? sc03_0 : sc47_0;
+                        uint32_t sw1 = (sb < 4) ? sc03_1 : sc47_1;
+                        int sh = (sb & 2) ? 16 : 0;
+                        uint8_t sc1_0 = (uint8_t)(sw0 >> sh);
+                        uint8_t sc2_0 = (uint8_t)(sw0 >> (sh + 8));
+                        uint8_t sc1_1 = (uint8_t)(sw1 >> sh);
+                        uint8_t sc2_1 = (uint8_t)(sw1 >> (sh + 8));
 
                         __m256i xl = _mm256_loadu_si256((const __m256i *)(xb->qs + sb * 32));
                         __m256i xh = _mm256_loadu_si256((const __m256i *)(xb->qs + (sb + 1) * 32));
@@ -1666,13 +1444,8 @@ static inline void q4k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
                             _mm256_madd_epi16(_mm256_maddubs_epi16(ql1, xl), _mm256_set1_epi16((int16_t)sc1_1)),
                             _mm256_madd_epi16(_mm256_maddubs_epi16(qh1, xh), _mm256_set1_epi16((int16_t)sc2_1))));
 #endif
-                        int32_t bs_lo = (int32_t)xb->bsums[sb * 2 + 0] + (int32_t)xb->bsums[sb * 2 + 1];
-                        int32_t bs_hi = (int32_t)xb->bsums[(sb + 1) * 2 + 0] + (int32_t)xb->bsums[(sb + 1) * 2 + 1];
-                        mins0 += (int32_t)m1_0 * bs_lo + (int32_t)m2_0 * bs_hi;
-                        mins1 += (int32_t)m1_1 * bs_lo + (int32_t)m2_1 * bs_hi;
                         qs0 += 32;
                         qs1 += 32;
-                        is += 2;
                     }
                     float xd = xb->d;
                     sum_vec0 = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi0), _mm256_set1_ps(d0 * xd), sum_vec0);
@@ -1709,17 +1482,24 @@ static inline void q4k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
                     const LilaQ8KBlock *xb2 = xb0 + 2;
                     const LilaQ8KBlock *xb3 = xb0 + 3;
 
+                    uint32_t sc03, sc47;
+                    __m256i vmn16;
+                    lila_q4k_unpack_scales_avx2(scales_packed, &sc03, &sc47, &vmn16);
+
                     __m256i sumi0 = _mm256_setzero_si256();
                     __m256i sumi1 = _mm256_setzero_si256();
                     __m256i sumi2 = _mm256_setzero_si256();
                     __m256i sumi3 = _mm256_setzero_si256();
-                    int32_t mins0 = 0, mins1 = 0, mins2 = 0, mins3 = 0;
+                    int32_t mins0 = lila_hsum_i32_avx2(_mm256_madd_epi16(vmn16, _mm256_loadu_si256((const __m256i *)xb0->bsums)));
+                    int32_t mins1 = lila_hsum_i32_avx2(_mm256_madd_epi16(vmn16, _mm256_loadu_si256((const __m256i *)xb1->bsums)));
+                    int32_t mins2 = lila_hsum_i32_avx2(_mm256_madd_epi16(vmn16, _mm256_loadu_si256((const __m256i *)xb2->bsums)));
+                    int32_t mins3 = lila_hsum_i32_avx2(_mm256_madd_epi16(vmn16, _mm256_loadu_si256((const __m256i *)xb3->bsums)));
 
-                    int is = 0;
                     for (int sb = 0; sb < 8; sb += 2) {
-                        uint8_t sc1, m1, sc2, m2;
-                        get_scale_min_k4(is + 0, scales_packed, &sc1, &m1);
-                        get_scale_min_k4(is + 1, scales_packed, &sc2, &m2);
+                        uint32_t sw = (sb < 4) ? sc03 : sc47;
+                        int sh = (sb & 2) ? 16 : 0;
+                        uint8_t sc1 = (uint8_t)(sw >> sh);
+                        uint8_t sc2 = (uint8_t)(sw >> (sh + 8));
 #if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
                         __m256i vsc1 = _mm256_set1_epi32((int32_t)sc1);
                         __m256i vsc2 = _mm256_set1_epi32((int32_t)sc2);
@@ -1733,38 +1513,31 @@ static inline void q4k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
 
                         int sb0_off = sb * 32;
                         int sb1_off = (sb + 1) * 32;
-                        int bs0 = sb * 2;
-                        int bs1 = (sb + 1) * 2;
 
 #if defined(__AVXVNNI__) || (defined(__AVX512VNNI__) && defined(__AVX512VL__))
-                        #define LILA_Q4_T4_STEP(SUMI, MINS, XB) do { \
+                        #define LILA_Q4_T4_STEP(SUMI, XB) do { \
                             __m256i xl = _mm256_loadu_si256((const __m256i *)((XB)->qs + sb0_off)); \
                             __m256i xh = _mm256_loadu_si256((const __m256i *)((XB)->qs + sb1_off)); \
                             __m256i pl = _mm256_mullo_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), q_lo, xl), vsc1); \
                             __m256i ph = _mm256_mullo_epi32(_mm256_dpbusd_epi32(_mm256_setzero_si256(), q_hi, xh), vsc2); \
                             (SUMI) = _mm256_add_epi32((SUMI), _mm256_add_epi32(pl, ph)); \
-                            (MINS) += (int32_t)m1 * ((int32_t)(XB)->bsums[bs0] + (int32_t)(XB)->bsums[bs0 + 1]) \
-                                    + (int32_t)m2 * ((int32_t)(XB)->bsums[bs1] + (int32_t)(XB)->bsums[bs1 + 1]); \
                         } while (0)
 #else
-                        #define LILA_Q4_T4_STEP(SUMI, MINS, XB) do { \
+                        #define LILA_Q4_T4_STEP(SUMI, XB) do { \
                             __m256i xl = _mm256_loadu_si256((const __m256i *)((XB)->qs + sb0_off)); \
                             __m256i xh = _mm256_loadu_si256((const __m256i *)((XB)->qs + sb1_off)); \
                             __m256i pl = _mm256_madd_epi16(_mm256_maddubs_epi16(q_lo, xl), vsc1); \
                             __m256i ph = _mm256_madd_epi16(_mm256_maddubs_epi16(q_hi, xh), vsc2); \
                             (SUMI) = _mm256_add_epi32((SUMI), _mm256_add_epi32(pl, ph)); \
-                            (MINS) += (int32_t)m1 * ((int32_t)(XB)->bsums[bs0] + (int32_t)(XB)->bsums[bs0 + 1]) \
-                                    + (int32_t)m2 * ((int32_t)(XB)->bsums[bs1] + (int32_t)(XB)->bsums[bs1 + 1]); \
                         } while (0)
 #endif
-                        LILA_Q4_T4_STEP(sumi0, mins0, xb0);
-                        LILA_Q4_T4_STEP(sumi1, mins1, xb1);
-                        LILA_Q4_T4_STEP(sumi2, mins2, xb2);
-                        LILA_Q4_T4_STEP(sumi3, mins3, xb3);
+                        LILA_Q4_T4_STEP(sumi0, xb0);
+                        LILA_Q4_T4_STEP(sumi1, xb1);
+                        LILA_Q4_T4_STEP(sumi2, xb2);
+                        LILA_Q4_T4_STEP(sumi3, xb3);
                         #undef LILA_Q4_T4_STEP
 
                         qs += 32;
-                        is += 2;
                     }
 
                     float xd0 = xb0->d, xd1 = xb1->d, xd2 = xb2->d, xd3 = xb3->d;
@@ -1796,13 +1569,17 @@ static inline void q4k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
                     const uint8_t *qs = block + 16;
                     const LilaQ8KBlock *xb = qx_all + (size_t)b * n_tokens + t;
 
+                    uint32_t sc03, sc47;
+                    __m256i vmn16;
+                    lila_q4k_unpack_scales_avx2(scales_packed, &sc03, &sc47, &vmn16);
+
                     __m256i sumi = _mm256_setzero_si256();
-                    int32_t mins = 0;
-                    int is = 0;
+                    int32_t mins = lila_hsum_i32_avx2(_mm256_madd_epi16(vmn16, _mm256_loadu_si256((const __m256i *)xb->bsums)));
                     for (int sb = 0; sb < 8; sb += 2) {
-                        uint8_t sc1, m1, sc2, m2;
-                        get_scale_min_k4(is + 0, scales_packed, &sc1, &m1);
-                        get_scale_min_k4(is + 1, scales_packed, &sc2, &m2);
+                        uint32_t sw = (sb < 4) ? sc03 : sc47;
+                        int sh = (sb & 2) ? 16 : 0;
+                        uint8_t sc1 = (uint8_t)(sw >> sh);
+                        uint8_t sc2 = (uint8_t)(sw >> (sh + 8));
                         __m256i qbits = _mm256_loadu_si256((const __m256i *)qs);
                         __m256i q_lo = _mm256_and_si256(qbits, mask_0f);
                         __m256i q_hi = _mm256_and_si256(_mm256_srli_epi16(qbits, 4), mask_0f);
@@ -1816,10 +1593,7 @@ static inline void q4k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
                         __m256i ph = _mm256_madd_epi16(_mm256_maddubs_epi16(q_hi, xh), _mm256_set1_epi16((int16_t)sc2));
 #endif
                         sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(pl, ph));
-                        mins += (int32_t)m1 * ((int32_t)xb->bsums[sb * 2 + 0] + (int32_t)xb->bsums[sb * 2 + 1])
-                              + (int32_t)m2 * ((int32_t)xb->bsums[(sb + 1) * 2 + 0] + (int32_t)xb->bsums[(sb + 1) * 2 + 1]);
                         qs += 32;
-                        is += 2;
                     }
                     float xd = xb->d;
                     sum_vec = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi), _mm256_set1_ps(d * xd), sum_vec);
@@ -1965,7 +1739,7 @@ static inline void q4k_matmul_batch(float *out, const uint8_t *weight_data, cons
     }
 }
 
-#if defined(__AVX2__) && !defined(__AVX512F__)
+#if defined(__AVX2__)
 static inline void lila_q6k_unpack_row_avx2(const uint8_t *row_ptr, int bpr,
                                             uint8_t *u_out, __m256i *vsc_out,
                                             __m256i *vsc16_out, float *d_out) {
@@ -2008,93 +1782,7 @@ static inline void q6k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
                                               int n_tokens, int row_start, int row_end,
                                               int total_rows, int blocks_per_row) {
     const size_t row_bytes = (size_t)blocks_per_row * Q6_K_BLOCK_SIZE;
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-    const __m512i mask_0f = _mm512_set1_epi8(0x0F);
-    const __m512i mask_03 = _mm512_set1_epi8(0x03);
-
-    for (int i = row_start; i < row_end; i++) {
-        const uint8_t *row_ptr = weight_data + (size_t)i * row_bytes;
-        if (i + 2 < row_end) {
-            LILA_PREFETCH(row_ptr + 2 * row_bytes);
-        }
-        for (int t0 = 0; t0 < n_tokens; t0 += 32) {
-            int nt = n_tokens - t0;
-            if (nt > 32) nt = 32;
-            float acc[32];
-            for (int t = 0; t < nt; t++) acc[t] = 0.0f;
-
-            for (int b = 0; b < blocks_per_row; b++) {
-                const uint8_t *block = row_ptr + (size_t)b * Q6_K_BLOCK_SIZE;
-                const uint8_t *ql = block;
-                const uint8_t *qh = block + 128;
-                const int8_t *scales = (const int8_t *)(block + 192);
-                uint16_t d_raw;
-                memcpy(&d_raw, block + 208, 2);
-                float d = fp16_to_fp32(d_raw);
-
-                __m512i sumi[32];
-                int32_t sbias[32];
-                for (int t = 0; t < nt; t++) {
-                    sumi[t] = _mm512_setzero_si512();
-                    sbias[t] = 0;
-                }
-
-                for (int half = 0; half < 2; half++) {
-                    const uint8_t *ql_h = ql + half * 64;
-                    const uint8_t *qh_h = qh + half * 32;
-                    const int8_t  *sc_h = scales + half * 8;
-                    int sb_base = half * 4;
-
-                    __m512i ql64 = _mm512_loadu_si512((const void *)ql_h);
-                    __m256i qh0 = _mm256_loadu_si256((const __m256i *)qh_h);
-                    __m512i qh512 = _mm512_inserti64x4(_mm512_castsi256_si512(qh0), qh0, 1);
-
-                    __m512i qh_01 = _mm512_slli_epi16(_mm512_and_si512(_mm512_mask_srli_epi16(qh512, 0xFFFF0000u, qh512, 2), mask_03), 4);
-                    __m512i qh_23 = _mm512_slli_epi16(_mm512_and_si512(_mm512_mask_srli_epi16(_mm512_srli_epi16(qh512, 4), 0xFFFF0000u, qh512, 6), mask_03), 4);
-                    __m512i u01 = _mm512_or_si512(_mm512_and_si512(ql64, mask_0f), qh_01);
-                    __m512i u23 = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi16(ql64, 4), mask_0f), qh_23);
-
-#if defined(__AVX512VNNI__)
-                    __m512i vsc01 = lila_scale4_epi32(sc_h[0], sc_h[1], sc_h[2], sc_h[3]);
-                    __m512i vsc23 = lila_scale4_epi32(sc_h[4], sc_h[5], sc_h[6], sc_h[7]);
-#else
-                    __m512i vsc01 = lila_scale4_epi16(sc_h[0], sc_h[1], sc_h[2], sc_h[3]);
-                    __m512i vsc23 = lila_scale4_epi16(sc_h[4], sc_h[5], sc_h[6], sc_h[7]);
-#endif
-                    __m128i sc8 = _mm_loadl_epi64((const __m128i *)sc_h);
-                    __m128i sc16 = _mm_cvtepi8_epi16(sc8);
-
-                    for (int t = 0; t < nt; t++) {
-                        const LilaQ8KBlock *xb = qx_all + (size_t)b * n_tokens + (t0 + t);
-                        __m512i x01 = _mm512_loadu_si512((const void *)(xb->qs + sb_base * 32));
-                        __m512i x23 = _mm512_loadu_si512((const void *)(xb->qs + (sb_base + 2) * 32));
-#if defined(__AVX512VNNI__)
-                        __m512i d01 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), u01, x01);
-                        __m512i d23 = _mm512_dpbusd_epi32(_mm512_setzero_si512(), u23, x23);
-                        sumi[t] = _mm512_add_epi32(sumi[t], _mm512_add_epi32(_mm512_mullo_epi32(d01, vsc01), _mm512_mullo_epi32(d23, vsc23)));
-#else
-                        __m512i p01 = _mm512_madd_epi16(_mm512_maddubs_epi16(u01, x01), vsc01);
-                        __m512i p23 = _mm512_madd_epi16(_mm512_maddubs_epi16(u23, x23), vsc23);
-                        sumi[t] = _mm512_add_epi32(sumi[t], _mm512_add_epi32(p01, p23));
-#endif
-                        __m128i bsums128 = _mm_loadu_si128((const __m128i *)(xb->bsums + sb_base * 2));
-                        __m128i bprod32 = _mm_madd_epi16(sc16, bsums128);
-                        __m128i bsum64 = _mm_add_epi32(bprod32, _mm_unpackhi_epi64(bprod32, bprod32));
-                        __m128i bsum32 = _mm_add_epi32(bsum64, _mm_shuffle_epi32(bsum64, _MM_SHUFFLE(1, 1, 1, 1)));
-                        sbias[t] += _mm_cvtsi128_si32(bsum32);
-                    }
-                }
-                for (int t = 0; t < nt; t++) {
-                    float xd = d * qx_all[(size_t)b * n_tokens + (t0 + t)].d;
-                    acc[t] += xd * (float)(_mm512_reduce_add_epi32(sumi[t]) - 32 * sbias[t]);
-                }
-            }
-            for (int t = 0; t < nt; t++) {
-                out[(size_t)(t0 + t) * total_rows + i] = acc[t];
-            }
-        }
-    }
-#elif defined(__AVX2__)
+#if defined(__AVX2__)
     const __m256i mask_0f = _mm256_set1_epi8(0x0F);
     const __m256i mask_03 = _mm256_set1_epi8(0x03);
 
@@ -2605,7 +2293,6 @@ static inline void q6k_matmul_batch_q8k_range(float *out, const uint8_t *weight_
     for (int i = row_start; i < row_end; i++) {
         const uint8_t *row_ptr = weight_data + (size_t)i * row_bytes;
         for (int t = 0; t < n_tokens; t++) {
-            out[(size_t)t * total_rows + i] = q6k_dot_q8k_simd(row_ptr, qx_all + t, blocks_per_row);
             /* Note: qx_all is strided by n_tokens across blocks in batch mode */
             float sum = 0.0f;
             for (int b = 0; b < blocks_per_row; b++) {
@@ -2711,7 +2398,7 @@ static inline void q6k_repacked_matvec(float *out, const uint8_t *weight_data, c
         return;
     }
 #endif
-    (void)out; (void)weight_data; (void)vec; (void)rows; (void)cols;
+    (void)out; (void)weight_data; (void)vec; (void)rows; (void)cols; (void)blocks_per_row;
 }
 
 static inline void q6k_repacked_matmul_batch(float *out, const uint8_t *weight_data, const float *vecs,

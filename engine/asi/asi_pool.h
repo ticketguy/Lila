@@ -5,8 +5,13 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
+#include <dirent.h>
+#include <unistd.h>
+#endif
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
 #include <immintrin.h>
@@ -19,6 +24,8 @@ typedef void (*AsiTaskFn)(int tid, int n_threads, void *ctx);
 
 typedef struct {
     int n_threads;
+    int spin_limit;
+    int yield_limit;
     pthread_t *threads;
     pthread_mutex_t mu;
     pthread_cond_t cv_work;
@@ -55,12 +62,12 @@ static void *asi_pool_worker(void *arg)
                 return NULL;
             }
             int active = atomic_load_explicit(&p->active, memory_order_acquire);
-            if (active && spins < 2048)
+            if (active && spins < p->spin_limit)
             {
                 asi_cpu_pause();
                 spins++;
             }
-            else if (active && spins < 4096)
+            else if (active && spins < p->yield_limit)
             {
                 sched_yield();
                 spins++;
@@ -89,6 +96,69 @@ static void *asi_pool_worker(void *arg)
     }
 }
 
+static inline int asi_detect_physical_cores(void)
+{
+#ifdef __linux__
+    DIR *dir = opendir("/sys/devices/system/cpu");
+    if (dir)
+    {
+        char seen[512][32];
+        int n_seen = 0;
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL)
+        {
+            if (strncmp(ent->d_name, "cpu", 3) != 0) continue;
+            const char *p = ent->d_name + 3;
+            if (*p < '0' || *p > '9') continue;
+            int all_digits = 1;
+            for (const char *q = p; *q; q++)
+            {
+                if (*q < '0' || *q > '9') { all_digits = 0; break; }
+            }
+            if (!all_digits) continue;
+
+            char path[512];
+            int pn = snprintf(path, sizeof(path),
+                              "/sys/devices/system/cpu/%s/topology/thread_siblings_list",
+                              ent->d_name);
+            if (pn <= 0 || (size_t)pn >= sizeof(path)) continue;
+
+            FILE *f = fopen(path, "r");
+            if (!f) continue;
+            char buf[32];
+            if (fgets(buf, sizeof(buf), f))
+            {
+                size_t len = strlen(buf);
+                while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' || buf[len - 1] == ' '))
+                {
+                    buf[--len] = '\0';
+                }
+                if (len > 0)
+                {
+                    int dup = 0;
+                    for (int i = 0; i < n_seen; i++)
+                    {
+                        if (strcmp(seen[i], buf) == 0) { dup = 1; break; }
+                    }
+                    if (!dup && n_seen < 512)
+                    {
+                        memcpy(seen[n_seen], buf, len + 1);
+                        n_seen++;
+                    }
+                }
+            }
+            fclose(f);
+        }
+        closedir(dir);
+        if (n_seen > 0) return n_seen;
+    }
+    long n_onln = sysconf(_SC_NPROCESSORS_ONLN);
+    return (n_onln > 1) ? (int)(n_onln / 2) : 1;
+#else
+    return 1;
+#endif
+}
+
 static inline AsiThreadPool *asi_pool_create(int n_threads)
 {
     if (n_threads < 1) n_threads = 1;
@@ -96,6 +166,22 @@ static inline AsiThreadPool *asi_pool_create(int n_threads)
     if (!p) return NULL;
     memset(p, 0, sizeof(AsiThreadPool));
     p->n_threads = n_threads;
+
+    int phys = asi_detect_physical_cores();
+    p->spin_limit = (n_threads > phys) ? 64 : 2048;
+    p->yield_limit = (n_threads > phys) ? 128 : 4096;
+    const char *env_spin = getenv("LILA_ASI_SPIN_LIMIT");
+    if (env_spin && env_spin[0] != '\0')
+    {
+        char *endp = NULL;
+        long val = strtol(env_spin, &endp, 10);
+        if (endp != env_spin && *endp == '\0' && val >= 0)
+        {
+            p->spin_limit = (val > 1000000L) ? 1000000 : (int)val;
+            p->yield_limit = (p->spin_limit > 0) ? (p->spin_limit * 2) : 0;
+        }
+    }
+
     pthread_mutex_init(&p->mu, NULL);
     pthread_cond_init(&p->cv_work, NULL);
     atomic_init(&p->gen, 0);
@@ -171,7 +257,7 @@ static inline void asi_pool_run(AsiThreadPool *p, AsiTaskFn fn, void *ctx)
     int spins = 0;
     while (atomic_load_explicit(&p->done_count, memory_order_acquire) < p->n_threads - 1)
     {
-        if (spins < 2048)
+        if (spins < p->spin_limit)
         {
             asi_cpu_pause();
             spins++;
