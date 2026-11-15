@@ -1,7 +1,9 @@
 {
   "config": {
     "asi_path": "/tmp/qwen35_0.8b.asi",
+    "asi_sha256": "757731964e8a24950f3ae743be9df81ca5671f15b014aa45c31868131679e9f0",
     "gguf_path": "/home/ticket/workspaces/lila/models/Qwen3.5-0.8B-heretic-Q4_K_M-imatrix.gguf",
+    "gguf_sha256": "d9662c91079317aee661a1475d61412787696e0dcc5636c39648fb27d49e1edf",
     "n_ctx": 512,
     "n_threads": 2,
     "n_gen": 64,
