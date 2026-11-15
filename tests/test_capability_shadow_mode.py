@@ -51,10 +51,10 @@ class CapabilityShadowModeTests(unittest.TestCase):
         self.assertTrue(WORKSTATION_NAMES <= enabled_names)
         self.assertFalse(WORKSTATION_NAMES & disabled_names)
         self.assertEqual(enabled_names - WORKSTATION_NAMES, disabled_names)
-        self.assertEqual(len(first_items), 46 if first_setting else 40)
-        self.assertEqual(len(second_items), 46 if second_setting else 40)
-        self.assertEqual(sum(item.availability_observations["legacy_prompt_visible"] for item in first_items), 43 if first_setting else 37)
-        self.assertEqual(sum(item.availability_observations["legacy_prompt_visible"] for item in second_items), 43 if second_setting else 37)
+        self.assertEqual(len(first_items), 47 if first_setting else 41)
+        self.assertEqual(len(second_items), 47 if second_setting else 41)
+        self.assertEqual(sum(item.availability_observations["legacy_prompt_visible"] for item in first_items), 44 if first_setting else 38)
+        self.assertEqual(sum(item.availability_observations["legacy_prompt_visible"] for item in second_items), 44 if second_setting else 38)
 
         first_by_name = {item.display_name: item for item in first_items}
         second_by_name = {item.display_name: item for item in second_items}

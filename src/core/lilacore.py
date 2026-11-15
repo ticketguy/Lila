@@ -246,6 +246,12 @@ class LilaCore:
             print(f"🌸 Harness unavailable: {self._harness_error}")
             print("Tool execution remains disabled.")
 
+        if self._llm is not None and callable(getattr(type(self._llm), "warm_prefix", None)):
+            try:
+                self._llm.warm_prefix(self._build_system_prompt())
+            except Exception:
+                pass
+
         print("\U0001f338 Lila is awake.")
 
     def _notify_activity(self, message: str):
