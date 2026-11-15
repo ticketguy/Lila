@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import math
 import mmap
@@ -37,6 +38,14 @@ from typing import Dict, List, Optional, Sequence, Tuple
 DEFAULT_ASI_PATH = "/tmp/qwen35_0.8b.asi"
 DEFAULT_GGUF_PATH = "/home/ticket/workspaces/lila/models/Qwen3.5-0.8B-heretic-Q4_K_M-imatrix.gguf"
 DEFAULT_LIB_PATH = str(Path(__file__).resolve().parent.parent / "asi" / "liblila_asi.so")
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 N_CTX = 2048
 N_THREADS = 2
@@ -709,11 +718,15 @@ def main() -> int:
         print(json.dumps(res))
         return 0
 
+    asi_sha256 = _sha256_file(args.asi)
+    gguf_sha256 = _sha256_file(args.gguf)
     toks = _tokenize_once(args.gguf)
     tokens_json = json.dumps(toks)
     print("=== Strict Apples-to-Apples Benchmark: Lila ASI vs llama.cpp ===")
     print(f"ASI model   : {args.asi}")
+    print(f"ASI sha256  : {asi_sha256}")
     print(f"GGUF model  : {args.gguf}")
+    print(f"GGUF sha256 : {gguf_sha256}")
     print(
         f"Settings    : n_ctx={args.n_ctx}, n_threads={args.n_threads}, "
         f"n_threads_batch={args.n_threads}, n_batch={args.n_batch}, "
@@ -795,7 +808,9 @@ def main() -> int:
         payload = {
             "config": {
                 "asi_path": args.asi,
+                "asi_sha256": asi_sha256,
                 "gguf_path": args.gguf,
+                "gguf_sha256": gguf_sha256,
                 "lib_path": args.lib,
                 "n_ctx": args.n_ctx,
                 "n_threads": args.n_threads,

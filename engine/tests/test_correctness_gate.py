@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import gc
+import hashlib
 import json
 import os
 import statistics
@@ -37,6 +38,14 @@ ASI_PATH = "/tmp/qwen35_0.8b.asi"
 N_CTX = 512
 N_THREADS = 2
 N_GEN = 32
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 CORPUS: List[Tuple[str, str]] = [
     (
@@ -659,8 +668,12 @@ def main() -> int:
     results: List[Dict[str, object]] = []
     tf_summary: Optional[Dict[str, object]] = None
     vocab_compared: Optional[int] = None
+    asi_sha256 = _sha256_file(args.asi)
+    gguf_sha256 = _sha256_file(args.gguf)
 
     try:
+        print(f"ASI sha256  : {asi_sha256}")
+        print(f"GGUF sha256 : {gguf_sha256}")
         print(f"Loading ASI model: {args.asi} (n_ctx={args.n_ctx}, n_threads={args.n_threads})")
         asi = AsiLlamaAdapter(args.asi, n_ctx=args.n_ctx, n_threads=args.n_threads)
         print(f"Loading llama.cpp model: {args.gguf} (n_ctx={args.n_ctx}, n_threads={args.n_threads})")
@@ -872,7 +885,9 @@ def main() -> int:
 
         config_payload: Dict[str, object] = {
             "asi_path": args.asi,
+            "asi_sha256": asi_sha256,
             "gguf_path": args.gguf,
+            "gguf_sha256": gguf_sha256,
             "n_ctx": args.n_ctx,
             "n_threads": args.n_threads,
             "n_gen": n_gen,
