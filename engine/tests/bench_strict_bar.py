@@ -21,13 +21,14 @@ import argparse
 import ctypes
 import json
 import math
+import mmap
 import random
 import statistics
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 DEFAULT_ASI_PATH = "/tmp/qwen35_0.8b.asi"
 DEFAULT_GGUF_PATH = "/home/ticket/workspaces/lila/models/Qwen3.5-0.8B-heretic-Q4_K_M-imatrix.gguf"
@@ -116,13 +117,31 @@ class _AsiV2ModelConfig(ctypes.Structure):
     ]
 
 
-def _get_rss_mb() -> float:
+def _get_mem_mb() -> Tuple[float, float]:
+    """Return (VmRSS_MiB, VmHWM_MiB) from /proc/self/status."""
+    rss_mb = 0.0
+    hwm_mb = 0.0
     with open("/proc/self/status", "r", encoding="utf-8") as f:
         for line in f:
             if line.startswith("VmRSS:"):
-                kb = int(line.split()[1])
-                return kb / 1024.0
-    return 0.0
+                rss_mb = int(line.split()[1]) / 1024.0
+            elif line.startswith("VmHWM:"):
+                hwm_mb = int(line.split()[1]) / 1024.0
+    return rss_mb, hwm_mb
+
+
+def _prepopulate_file(path: str) -> None:
+    """Advise MADV_WILLNEED and touch one byte per 4 KiB page to warm page cache."""
+    with open(path, "rb") as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            if hasattr(mm, "madvise") and hasattr(mmap, "MADV_WILLNEED"):
+                mm.madvise(mmap.MADV_WILLNEED)
+            size = len(mm)
+            acc = 0
+            for off in range(0, size, 4096):
+                acc ^= mm[off]
+            if acc == -1:  # never true; keeps loop from being elided
+                raise RuntimeError("unreachable")
 
 
 def _bind_asi_lib(lib_path: str) -> ctypes.CDLL:
@@ -179,7 +198,11 @@ def run_asi_trial(
     n_threads: int,
     n_batch: int,
     n_gen: int,
+    prepopulate: bool = False,
 ) -> Dict:
+    if prepopulate:
+        _prepopulate_file(asi_path)
+
     lib = _bind_asi_lib(lib_path)
     err = ctypes.create_string_buffer(256)
 
@@ -260,7 +283,7 @@ def run_asi_trial(
     long_s = time.perf_counter() - t0
     long_prefill_tps = len(long_ids) / long_s
 
-    rss_mb = _get_rss_mb()
+    rss_mb, vm_hwm_mb = _get_mem_mb()
 
     lib.lila_asi_session_free(sess)
     lib.lila_asi_close(model)
@@ -274,6 +297,7 @@ def run_asi_trial(
         "t2_dec": t2_dec,
         "long_prefill_tps": long_prefill_tps,
         "rss_mb": rss_mb,
+        "vm_hwm_mb": vm_hwm_mb,
         "t2_eval_tokens": t2_eval_count,
         "t2_pos_before": pos_before_t2,
         "t1_first_tok": t1_gen[0],
@@ -290,8 +314,12 @@ def run_llama_trial(
     n_threads: int,
     n_batch: int,
     n_gen: int,
+    prepopulate: bool = False,
 ) -> Dict:
     from llama_cpp import Llama
+
+    if prepopulate:
+        _prepopulate_file(gguf_path)
 
     t_load0 = time.perf_counter()
     llm = Llama(
@@ -353,7 +381,7 @@ def run_llama_trial(
     long_s = time.perf_counter() - t0
     long_prefill_tps = len(long_ids) / long_s
 
-    rss_mb = _get_rss_mb()
+    rss_mb, vm_hwm_mb = _get_mem_mb()
     llm.close()
 
     return {
@@ -365,6 +393,7 @@ def run_llama_trial(
         "t2_dec": t2_dec,
         "long_prefill_tps": long_prefill_tps,
         "rss_mb": rss_mb,
+        "vm_hwm_mb": vm_hwm_mb,
         "t2_eval_tokens": t2_eval_count,
         "t2_pos_before": n_before_t2,
         "t1_first_tok": t1_gen[0],
@@ -464,6 +493,7 @@ def _run_worker_subprocess(
     n_threads: int,
     n_batch: int,
     n_gen: int,
+    prepopulate: bool = False,
 ) -> Dict:
     cmd = [
         sys.executable,
@@ -487,6 +517,8 @@ def _run_worker_subprocess(
         "--n-gen",
         str(n_gen),
     ]
+    if prepopulate:
+        cmd.append("--prepopulate")
     proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
     for line in reversed(proc.stdout.strip().splitlines()):
         line = line.strip()
@@ -505,6 +537,16 @@ def main() -> int:
     parser.add_argument("--n-threads", type=int, default=N_THREADS)
     parser.add_argument("--n-batch", type=int, default=N_BATCH)
     parser.add_argument("--n-gen", type=int, default=N_GEN)
+    parser.add_argument(
+        "--prepopulate",
+        action="store_true",
+        help="Advise MADV_WILLNEED and touch model file pages before loading (warmed load)",
+    )
+    parser.add_argument(
+        "--json-out",
+        default=None,
+        help="Export raw per-pair numbers and summary statistics to JSON at PATH",
+    )
     parser.add_argument("--worker", choices=["asi", "llama"], default=None, help=argparse.SUPPRESS)
     parser.add_argument("--tokens-json", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -515,11 +557,13 @@ def main() -> int:
             res = run_asi_trial(
                 args.asi, args.lib, toks["t1"], toks["t2"], toks["long"],
                 args.n_ctx, args.n_threads, args.n_batch, args.n_gen,
+                prepopulate=args.prepopulate,
             )
         else:
             res = run_llama_trial(
                 args.gguf, toks["t1"], toks["t2"], toks["long"],
                 args.n_ctx, args.n_threads, args.n_batch, args.n_gen,
+                prepopulate=args.prepopulate,
             )
         print(json.dumps(res))
         return 0
@@ -532,7 +576,8 @@ def main() -> int:
     print(
         f"Settings    : n_ctx={args.n_ctx}, n_threads={args.n_threads}, "
         f"n_threads_batch={args.n_threads}, n_batch={args.n_batch}, "
-        f"use_mmap=True, flash_attn=False, temp=0.0 (greedy), n_gen={args.n_gen}, N={args.n}"
+        f"use_mmap=True, flash_attn=False, temp=0.0 (greedy), n_gen={args.n_gen}, "
+        f"N={args.n}, prepopulate={args.prepopulate}"
     )
     print(
         f"Token counts: T1={len(toks['t1'])} toks, T2_delta={len(toks['t2'])} toks, "
@@ -544,10 +589,12 @@ def main() -> int:
     w_asi = _run_worker_subprocess(
         "asi", args.asi, args.gguf, args.lib, tokens_json,
         args.n_ctx, args.n_threads, args.n_batch, args.n_gen,
+        prepopulate=args.prepopulate,
     )
     w_llama = _run_worker_subprocess(
         "llama", args.asi, args.gguf, args.lib, tokens_json,
         args.n_ctx, args.n_threads, args.n_batch, args.n_gen,
+        prepopulate=args.prepopulate,
     )
     print(
         f"[KV/Prefix Reuse Verified] "
@@ -562,10 +609,12 @@ def main() -> int:
         r_asi = _run_worker_subprocess(
             "asi", args.asi, args.gguf, args.lib, tokens_json,
             args.n_ctx, args.n_threads, args.n_batch, args.n_gen,
+            prepopulate=args.prepopulate,
         )
         r_llama = _run_worker_subprocess(
             "llama", args.asi, args.gguf, args.lib, tokens_json,
             args.n_ctx, args.n_threads, args.n_batch, args.n_gen,
+            prepopulate=args.prepopulate,
         )
         assert r_asi["t2_eval_tokens"] == len(toks["t2"])
         assert r_llama["t2_eval_tokens"] == len(toks["t2"])
@@ -575,10 +624,12 @@ def main() -> int:
             f"  pair {idx:2d}/{args.n}: "
             f"ASI(t1_ttft={r_asi['t1_ttft']:.3f}s, t1_dec={r_asi['t1_dec']:.2f}, "
             f"t2_ttft={r_asi['t2_ttft']:.3f}s, t2_dec={r_asi['t2_dec']:.2f}, "
-            f"long={r_asi['long_prefill_tps']:.2f}, rss={r_asi['rss_mb']:.1f}MB) | "
+            f"long={r_asi['long_prefill_tps']:.2f}, rss={r_asi['rss_mb']:.1f}MB, "
+            f"hwm={r_asi['vm_hwm_mb']:.1f}MB) | "
             f"llama(t1_ttft={r_llama['t1_ttft']:.3f}s, t1_dec={r_llama['t1_dec']:.2f}, "
             f"t2_ttft={r_llama['t2_ttft']:.3f}s, t2_dec={r_llama['t2_dec']:.2f}, "
-            f"long={r_llama['long_prefill_tps']:.2f}, rss={r_llama['rss_mb']:.1f}MB)"
+            f"long={r_llama['long_prefill_tps']:.2f}, rss={r_llama['rss_mb']:.1f}MB, "
+            f"hwm={r_llama['vm_hwm_mb']:.1f}MB)"
         )
 
     metrics = [
@@ -588,6 +639,7 @@ def main() -> int:
         ("t2_dec", "tok/s", "higher", True),
         ("long_prefill_tps", "tok/s", "higher", True),
         ("rss_mb", "MiB", "lower", True),
+        ("vm_hwm_mb", "MiB", "lower", False),
         ("load_s", "s", "lower", False),
     ]
 
@@ -602,6 +654,7 @@ def main() -> int:
     print("-" * len(header))
 
     all_primary_pass = True
+    summary_export: Dict[str, Dict] = {}
     for key, unit, direction, is_primary in metrics:
         ax = [r[key] for r in asi_runs]
         lx = [r[key] for r in llama_runs]
@@ -619,12 +672,68 @@ def main() -> int:
         if is_primary and not passed:
             all_primary_pass = False
 
-        bar_str = ("PASS" if passed else "FAIL") + ("" if is_primary else " (sec)")
+        verdict = "PASS" if passed else "FAIL"
+        bar_str = verdict + ("" if is_primary else " (sec)")
         a_str = f"{a_med:.3f} [{a_min:.3f}..{a_max:.3f}] ({a_ci[0]:.3f}..{a_ci[1]:.3f})"
         l_str = f"{l_med:.3f} [{l_min:.3f}..{l_max:.3f}] ({l_ci[0]:.3f}..{l_ci[1]:.3f})"
         print(f"{key:<18} {unit:<6} {direction:<7} {a_str:<38} {l_str:<38} {pval:<9.4g} {bar_str}")
 
-    print(f"\nOVERALL PRIMARY BAR: {'PASS' if all_primary_pass else 'FAIL'}")
+        summary_export[key] = {
+            "unit": unit,
+            "direction": direction,
+            "primary": is_primary,
+            "asi": {
+                "median": a_med,
+                "min": a_min,
+                "max": a_max,
+                "ci95_lo": a_ci[0],
+                "ci95_hi": a_ci[1],
+            },
+            "llama": {
+                "median": l_med,
+                "min": l_min,
+                "max": l_max,
+                "ci95_lo": l_ci[0],
+                "ci95_hi": l_ci[1],
+            },
+            "mwu_p": pval,
+            "bar_verdict": verdict,
+        }
+
+    overall_verdict = "PASS" if all_primary_pass else "FAIL"
+    print(f"\nOVERALL PRIMARY BAR: {overall_verdict}")
+
+    if args.json_out:
+        out_path = Path(args.json_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "config": {
+                "asi_path": args.asi,
+                "gguf_path": args.gguf,
+                "lib_path": args.lib,
+                "n_ctx": args.n_ctx,
+                "n_threads": args.n_threads,
+                "n_threads_batch": args.n_threads,
+                "n_batch": args.n_batch,
+                "n_gen": args.n_gen,
+                "n_pairs": args.n,
+                "prepopulate": args.prepopulate,
+                "token_counts": {
+                    "t1": len(toks["t1"]),
+                    "t2": len(toks["t2"]),
+                    "long": len(toks["long"]),
+                },
+            },
+            "pairs": [
+                {"pair": i + 1, "asi": a, "llama": l}
+                for i, (a, l) in enumerate(zip(asi_runs, llama_runs))
+            ],
+            "summary": summary_export,
+            "overall_primary_bar": overall_verdict,
+        }
+        out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        print(f"Exported JSON results to: {out_path}")
+
     return 0
 
 

@@ -7,7 +7,9 @@ Correctness & numerical parity gate:
 
 from __future__ import annotations
 
+import argparse
 import ctypes
+import json
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -141,13 +143,26 @@ def _llama_generate(llama: Llama, prompt_ids: List[int], n_gen: int) -> List[int
 
 
 def main() -> int:
-    print(f"Loading ASI model: {ASI_PATH} (n_ctx={N_CTX}, n_threads={N_THREADS})")
-    asi = AsiLlamaAdapter(ASI_PATH, n_ctx=N_CTX, n_threads=N_THREADS)
-    print(f"Loading llama.cpp model: {GGUF_PATH} (n_ctx={N_CTX}, n_threads={N_THREADS})")
+    parser = argparse.ArgumentParser(description="ASI vs llama.cpp correctness & numerical parity gate")
+    parser.add_argument("--asi", default=ASI_PATH, help=f"Path to ASI model (default: {ASI_PATH})")
+    parser.add_argument("--gguf", default=GGUF_PATH, help=f"Path to GGUF model (default: {GGUF_PATH})")
+    parser.add_argument("--n-ctx", type=int, default=N_CTX, help=f"Context length (default: {N_CTX})")
+    parser.add_argument("--n-threads", type=int, default=N_THREADS, help=f"Thread count (default: {N_THREADS})")
+    parser.add_argument("--n-gen", type=int, default=N_GEN, help=f"Greedy tokens to generate per prompt (default: {N_GEN})")
+    parser.add_argument("--json-out", default=None, help="Export correctness gate results and corpus summary to JSON at PATH")
+    args = parser.parse_args()
+
+    n_gen = args.n_gen
+    if n_gen <= 0:
+        raise ValueError(f"--n-gen must be positive, got {n_gen}")
+
+    print(f"Loading ASI model: {args.asi} (n_ctx={args.n_ctx}, n_threads={args.n_threads})")
+    asi = AsiLlamaAdapter(args.asi, n_ctx=args.n_ctx, n_threads=args.n_threads)
+    print(f"Loading llama.cpp model: {args.gguf} (n_ctx={args.n_ctx}, n_threads={args.n_threads})")
     llama = Llama(
-        model_path=GGUF_PATH,
-        n_ctx=N_CTX,
-        n_threads=N_THREADS,
+        model_path=args.gguf,
+        n_ctx=args.n_ctx,
+        n_threads=args.n_threads,
         logits_all=True,
         verbose=False,
     )
@@ -156,9 +171,9 @@ def main() -> int:
     try:
         for name, prompt in CORPUS:
             prompt_ids = asi.tokenizer.encode(prompt)
-            logits_tok, gen_tok = _asi_generate_token_by_token(asi, prompt_ids, N_GEN)
-            logits_bat, gen_bat = _asi_generate_batch(asi, prompt_ids, N_GEN)
-            gen_llama = _llama_generate(llama, prompt_ids, N_GEN)
+            logits_tok, gen_tok = _asi_generate_token_by_token(asi, prompt_ids, n_gen)
+            logits_bat, gen_bat = _asi_generate_batch(asi, prompt_ids, n_gen)
+            gen_llama = _llama_generate(llama, prompt_ids, n_gen)
 
             rel_l2 = _rel_l2(logits_tok, logits_bat)
             bt_first_div = _first_divergence(gen_tok, gen_bat)
@@ -166,21 +181,24 @@ def main() -> int:
 
             bat_vs_llama_first_div = _first_divergence(gen_bat, gen_llama)
             bat_vs_llama_agree = sum(1 for a, b in zip(gen_bat, gen_llama) if a == b)
-            bat_vs_llama_pct = 100.0 * bat_vs_llama_agree / N_GEN
+            bat_vs_llama_pct = 100.0 * bat_vs_llama_agree / n_gen
 
             tok_vs_llama_first_div = _first_divergence(gen_tok, gen_llama)
             tok_vs_llama_agree = sum(1 for a, b in zip(gen_tok, gen_llama) if a == b)
-            tok_vs_llama_pct = 100.0 * tok_vs_llama_agree / N_GEN
+            tok_vs_llama_pct = 100.0 * tok_vs_llama_agree / n_gen
 
             results.append(
                 {
                     "name": name,
                     "prompt_len": len(prompt_ids),
+                    "n_gen": n_gen,
                     "rel_l2": rel_l2,
                     "bt_first_div": bt_first_div,
                     "bt_agree": bt_agree,
+                    "bat_vs_llama_agree": bat_vs_llama_agree,
                     "bat_vs_llama_pct": bat_vs_llama_pct,
                     "bat_vs_llama_first_div": bat_vs_llama_first_div,
+                    "tok_vs_llama_agree": tok_vs_llama_agree,
                     "tok_vs_llama_pct": tok_vs_llama_pct,
                     "tok_vs_llama_first_div": tok_vs_llama_first_div,
                     "text_asi_bat": asi.tokenizer.decode(gen_bat),
@@ -192,7 +210,16 @@ def main() -> int:
         asi.close()
         del llama
 
-    print("\n=== Correctness Gate Results (N=32 greedy tokens, temperature=0.0) ===")
+    total_tokens = len(results) * n_gen
+    total_bt_agree = sum(int(r["bt_agree"]) for r in results)
+    total_bat_vs_llama_agree = sum(int(r["bat_vs_llama_agree"]) for r in results)
+    total_tok_vs_llama_agree = sum(int(r["tok_vs_llama_agree"]) for r in results)
+
+    corpus_bt_pct = 100.0 * total_bt_agree / total_tokens if total_tokens else 0.0
+    corpus_bat_vs_llama_pct = 100.0 * total_bat_vs_llama_agree / total_tokens if total_tokens else 0.0
+    corpus_tok_vs_llama_pct = 100.0 * total_tok_vs_llama_agree / total_tokens if total_tokens else 0.0
+
+    print(f"\n=== Correctness Gate Results (N={n_gen} greedy tokens, temperature=0.0) ===")
     header = (
         f"{'Prompt':<10} {'Len':>3} | "
         f"{'ASI B/T L2':>10} {'B/T Div':>7} {'B/T Agree':>9} | "
@@ -207,10 +234,15 @@ def main() -> int:
         t_div = str(r["tok_vs_llama_first_div"]) if r["tok_vs_llama_first_div"] is not None else "none"
         print(
             f"{r['name']:<10} {r['prompt_len']:>3} | "
-            f"{r['rel_l2']:>10.6f} {bt_div:>7} {r['bt_agree']:>6}/{N_GEN} | "
+            f"{r['rel_l2']:>10.6f} {bt_div:>7} {r['bt_agree']:>6}/{n_gen} | "
             f"{r['bat_vs_llama_pct']:>13.1f}% {b_div:>4} | "
             f"{r['tok_vs_llama_pct']:>13.1f}% {t_div:>4}"
         )
+
+    print(f"\n=== Corpus Greedy Top-1 Agreement ({len(results)} prompts x {n_gen} = {total_tokens} tokens) ===")
+    print(f"  ASI(batch) vs llama.cpp : {total_bat_vs_llama_agree}/{total_tokens} ({corpus_bat_vs_llama_pct:.2f}%)")
+    print(f"  ASI(token) vs llama.cpp : {total_tok_vs_llama_agree}/{total_tokens} ({corpus_tok_vs_llama_pct:.2f}%)")
+    print(f"  ASI(batch) vs ASI(token): {total_bt_agree}/{total_tokens} ({corpus_bt_pct:.2f}%)")
 
     print("\n=== Decoded Outputs ===")
     for r in results:
@@ -218,6 +250,32 @@ def main() -> int:
         print(f"  ASI(batch): {r['text_asi_bat']!r}")
         print(f"  ASI(token): {r['text_asi_tok']!r}")
         print(f"  llama.cpp : {r['text_llama']!r}")
+
+    if args.json_out:
+        out_path = Path(args.json_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "config": {
+                "asi_path": args.asi,
+                "gguf_path": args.gguf,
+                "n_ctx": args.n_ctx,
+                "n_threads": args.n_threads,
+                "n_gen": n_gen,
+                "n_prompts": len(results),
+            },
+            "prompts": results,
+            "summary": {
+                "total_tokens": total_tokens,
+                "bt_agree_tokens": total_bt_agree,
+                "bt_agree_pct": corpus_bt_pct,
+                "bat_vs_llama_agree_tokens": total_bat_vs_llama_agree,
+                "bat_vs_llama_agree_pct": corpus_bat_vs_llama_pct,
+                "tok_vs_llama_agree_tokens": total_tok_vs_llama_agree,
+                "tok_vs_llama_agree_pct": corpus_tok_vs_llama_pct,
+            },
+        }
+        out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        print(f"\nExported JSON results to: {out_path}")
 
     return 0
 
