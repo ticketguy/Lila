@@ -6,15 +6,40 @@ Drop-in compatible with llama_cpp.Llama.create_chat_completion().
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import re
+import struct
 import threading
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
+
+try:
+    from .private_storage import restrictive_umask, secure_private_directory
+except ImportError:
+    from src.core.private_storage import restrictive_umask, secure_private_directory
 
 _SEC_TOKENIZER = 0x04
 _SEC_CHAT_TEMPLATE = 0x09
+_DEFAULT_PREFIX_CACHE_MAX_FILES = 8
+
+
+class _AsiV2Header(ctypes.Structure):
+    _fields_ = [
+        ("magic", ctypes.c_uint32),
+        ("version", ctypes.c_uint32),
+        ("arch_id", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("n_sections", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("total_size", ctypes.c_uint64),
+        ("section_table_offset", ctypes.c_uint64),
+        ("identity_hash", ctypes.c_uint8 * 24),
+    ]
+
+
+assert ctypes.sizeof(_AsiV2Header) == 64
 
 
 class _AsiV2ModelConfig(ctypes.Structure):
@@ -173,6 +198,7 @@ class AsiLlamaAdapter:
         n_ctx: int = 4096,
         n_threads: int = 0,
         lib_path: Optional[str] = None,
+        prefix_cache_dir: Optional[Union[str, Path]] = None,
         **_: object,
     ):
         so = Path(lib_path) if lib_path else _default_lib_path()
@@ -180,6 +206,8 @@ class AsiLlamaAdapter:
             raise FileNotFoundError(f"liblila_asi.so not found at {so}")
 
         self._lib = ctypes.CDLL(str(so))
+        self._has_model_header = False
+        self._supports_prefix_file = False
         self._bind_abi()
 
         err = ctypes.create_string_buffer(256)
@@ -189,6 +217,12 @@ class AsiLlamaAdapter:
 
         self._cfg = _AsiV2ModelConfig()
         self._lib.lila_asi_model_info(self._model, ctypes.byref(self._cfg))
+
+        self._model_hdr = _AsiV2Header()
+        if self._has_model_header:
+            if self._lib.lila_asi_model_header(self._model, ctypes.byref(self._model_hdr)) != 0:
+                self._model_hdr = _AsiV2Header()
+                self._supports_prefix_file = False
 
         sec_ptr = ctypes.c_void_p()
         sec_sz = ctypes.c_size_t()
@@ -208,10 +242,25 @@ class AsiLlamaAdapter:
             self._lib.lila_asi_close(self._model)
             raise RuntimeError(f"lila_asi_session_create failed: {err.value.decode('utf-8', 'replace')}")
 
+        raw_cache_dir: Optional[Union[str, Path]] = prefix_cache_dir
+        if raw_cache_dir is None and os.environ.get("LILA_ASI_DISABLE_DISK_PREFIX") != "1":
+            env_cache_dir = os.environ.get("LILA_ASI_PREFIX_CACHE_DIR", "").strip()
+            raw_cache_dir = env_cache_dir or None
+        elif isinstance(raw_cache_dir, str):
+            raw_cache_dir = raw_cache_dir.strip() or None
+
+        self._prefix_cache_dir: Optional[Path] = (
+            Path(os.path.abspath(Path(raw_cache_dir).expanduser()))
+            if raw_cache_dir is not None
+            else None
+        )
+
         self._logits = (ctypes.c_float * self._cfg.vocab_size)()
         self._rng = ctypes.c_uint64(0x9E3779B97F4A7C15)
         self._cached_prefix_ids: Optional[List[int]] = None
         self._cached_prefix_text: Optional[str] = None
+        self.last_prefix_cache_hit: Optional[str] = None
+        self.prefix_cache_stats: Dict[str, int] = {"ram": 0, "disk": 0, "miss": 0}
         self._lock = threading.Lock()
 
     def _bind_abi(self) -> None:
@@ -246,6 +295,37 @@ class AsiLlamaAdapter:
         ]
         lib.lila_asi_sample.restype = ctypes.c_int32
 
+        self._has_model_header = hasattr(lib, "lila_asi_model_header")
+        if self._has_model_header:
+            lib.lila_asi_model_header.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(_AsiV2Header),
+            ]
+            lib.lila_asi_model_header.restype = ctypes.c_int
+
+        has_save_prefix_file = hasattr(lib, "lila_asi_session_save_prefix_file")
+        if has_save_prefix_file:
+            lib.lila_asi_session_save_prefix_file.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_char_p,
+            ]
+            lib.lila_asi_session_save_prefix_file.restype = ctypes.c_int
+
+        has_load_prefix_file = hasattr(lib, "lila_asi_session_load_prefix_file")
+        if has_load_prefix_file:
+            lib.lila_asi_session_load_prefix_file.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint8),
+                ctypes.c_char_p,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+            lib.lila_asi_session_load_prefix_file.restype = ctypes.c_int
+
+        self._supports_prefix_file = bool(
+            self._has_model_header and has_save_prefix_file and has_load_prefix_file
+        )
+
     def close(self) -> None:
         self._cached_prefix_ids = None
         self._cached_prefix_text = None
@@ -271,14 +351,227 @@ class AsiLlamaAdapter:
         parts.append("<|im_start|>assistant\n")
         return "".join(parts)
 
-    def _save_prefix_locked(self, sys_text: str, sys_ids: List[int]) -> None:
+    @staticmethod
+    def _fp32_ref_flag() -> int:
+        raw = (os.environ.get("LILA_ASI_FP32_REF") or "").strip().lower()
+        if raw in ("1", "true", "yes"):
+            return 1
+        try:
+            return 1 if raw and int(raw) != 0 else 0
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def _max_prefix_cache_files() -> int:
+        raw = (os.environ.get("LILA_ASI_PREFIX_CACHE_MAX_FILES") or "").strip()
+        if not raw:
+            return _DEFAULT_PREFIX_CACHE_MAX_FILES
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return _DEFAULT_PREFIX_CACHE_MAX_FILES
+
+    def _compute_prefix_key_hash(self, sys_ids: Sequence[int], sys_text: str = "") -> bytes:
+        """Compute the 32-byte SHA-256 cache key for a model, fp32_ref mode, text, and token sequence."""
+        ids = [int(t) for t in sys_ids]
+        fp32_ref = self._fp32_ref_flag()
+        packed_ids = struct.pack(f"<{len(ids)}i", *ids) if ids else b""
+        payload = (
+            b"ASIPFX02"
+            + bytes(self._model_hdr.identity_hash)
+            + struct.pack("<III", int(self._model_hdr.arch_id), fp32_ref, len(ids))
+            + sys_text.encode("utf-8")
+            + packed_ids
+        )
+        return hashlib.sha256(payload).digest()
+
+    def _record_prefix_hit(self, kind: str) -> None:
+        self.last_prefix_cache_hit = kind
+        if kind in self.prefix_cache_stats:
+            self.prefix_cache_stats[kind] += 1
+
+    @staticmethod
+    def _prune_prefix_cache(
+        cache_dir: Path,
+        max_files: int,
+        keep_path: Optional[Path] = None,
+    ) -> None:
+        """Evict oldest regular .asip snapshot files beyond max_files."""
+        if max_files < 1:
+            return
+        try:
+            entries = []
+            for p in cache_dir.iterdir():
+                if p.suffix != ".asip" or p.is_symlink() or not p.is_file():
+                    continue
+                try:
+                    st = p.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                is_keep = 1 if (keep_path is not None and p == keep_path) else 0
+                entries.append((is_keep, st.st_mtime_ns, p.name, p))
+            if len(entries) <= max_files:
+                return
+            entries.sort(key=lambda item: (item[0], item[1], item[2]))
+            to_remove = len(entries) - max_files
+            for _, _, _, victim in entries[:to_remove]:
+                try:
+                    victim.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def _eval_and_save_ram_prefix_locked(self, ids: List[int], sys_text: str) -> bool:
+        """Reset session, prefill prefix token IDs, and snapshot into session RAM."""
         self._lib.lila_asi_session_reset(self._session)
-        sys_arr = (ctypes.c_int32 * len(sys_ids))(*sys_ids)
-        if self._lib.lila_asi_eval_batch(self._session, sys_arr, len(sys_ids), 0, self._logits) != 0:
+        sys_arr = (ctypes.c_int32 * len(ids))(*ids)
+        if self._lib.lila_asi_eval_batch(self._session, sys_arr, len(ids), 0, self._logits) != 0:
             raise RuntimeError("lila_asi_eval_batch(prefix) failed")
-        if self._lib.lila_asi_session_save_prefix(self._session, len(sys_ids)) == 0:
-            self._cached_prefix_ids = sys_ids
+        if self._lib.lila_asi_session_save_prefix(self._session, len(ids)) == 0:
+            self._cached_prefix_ids = list(ids)
             self._cached_prefix_text = sys_text
+            return True
+        return False
+
+    def _save_prefix_file_locked(self, target: Path, key_arr: ctypes.Array) -> bool:
+        """Write current RAM prefix snapshot to target with 0600 permissions, rejecting symlinks."""
+        if target.is_symlink():
+            return False
+        with restrictive_umask():
+            rc = self._lib.lila_asi_session_save_prefix_file(
+                self._session,
+                key_arr,
+                str(target).encode("utf-8"),
+            )
+        if rc != 0:
+            return False
+        if not target.is_symlink() and target.is_file():
+            os.chmod(target, 0o600)
+        return True
+
+    def _load_prefix_file_locked(
+        self,
+        target: Path,
+        key_arr: ctypes.Array,
+        ids: List[int],
+        sys_text: str,
+    ) -> Optional[int]:
+        """Load and validate a disk prefix snapshot into session RAM and live state."""
+        if target.is_symlink() or not target.is_file():
+            return None
+        out_n = ctypes.c_uint32(0)
+        rc = self._lib.lila_asi_session_load_prefix_file(
+            self._session,
+            key_arr,
+            str(target).encode("utf-8"),
+            ctypes.byref(out_n),
+        )
+        if rc != 0 or int(out_n.value) != len(ids):
+            return None
+        restored_n = ctypes.c_uint32(0)
+        self._lib.lila_asi_session_restore_prefix(self._session, ctypes.byref(restored_n))
+        self._cached_prefix_ids = list(ids)
+        self._cached_prefix_text = sys_text
+        self._record_prefix_hit("disk")
+        return int(out_n.value)
+
+    def _try_load_prefix_cache_file(
+        self,
+        sys_text: str,
+        ids: List[int],
+    ) -> Tuple[bool, Optional[Path], Optional[ctypes.Array]]:
+        """Try loading a cached disk prefix snapshot; return (loaded, cache_path, key_arr)."""
+        if self._prefix_cache_dir is None or not self._supports_prefix_file:
+            return False, None, None
+        try:
+            cache_dir = secure_private_directory(self._prefix_cache_dir)
+            key_hash = self._compute_prefix_key_hash(ids, sys_text)
+            key_arr = (ctypes.c_uint8 * 32).from_buffer_copy(key_hash)
+            cache_path = cache_dir / f"prefix_{key_hash[:16].hex()}.asip"
+            if self._load_prefix_file_locked(cache_path, key_arr, ids, sys_text) is not None:
+                try:
+                    os.utime(cache_path, None)
+                except OSError:
+                    pass
+                return True, cache_path, key_arr
+            return False, cache_path, key_arr
+        except Exception:
+            return False, None, None
+
+    def _save_prefix_locked(self, sys_text: str, sys_ids: Sequence[int]) -> None:
+        ids = [int(t) for t in sys_ids]
+        if not ids:
+            return
+
+        loaded, cache_path, key_arr = self._try_load_prefix_cache_file(sys_text, ids)
+        if loaded:
+            return
+
+        saved_ram = self._eval_and_save_ram_prefix_locked(ids, sys_text)
+        self._record_prefix_hit("miss")
+
+        if saved_ram and cache_path is not None and key_arr is not None:
+            try:
+                if self._save_prefix_file_locked(cache_path, key_arr):
+                    self._prune_prefix_cache(
+                        cache_path.parent,
+                        self._max_prefix_cache_files(),
+                        keep_path=cache_path,
+                    )
+            except Exception:
+                pass
+
+    def save_prefix_snapshot(
+        self,
+        filepath: Union[str, Path],
+        token_ids: Sequence[int],
+        sys_text: str = "",
+    ) -> bool:
+        """Evaluate (if needed) and save a prefix snapshot for token_ids + sys_text to filepath."""
+        ids = [int(t) for t in token_ids]
+        if not ids:
+            return False
+        target = Path(filepath).expanduser()
+        with self._lock:
+            if not self._session or not self._model:
+                raise RuntimeError("AsiLlamaAdapter is closed")
+            if not self._supports_prefix_file or target.is_symlink():
+                return False
+            try:
+                if self._cached_prefix_ids != ids:
+                    if not self._eval_and_save_ram_prefix_locked(ids, sys_text):
+                        return False
+                key_hash = self._compute_prefix_key_hash(ids, sys_text)
+                key_arr = (ctypes.c_uint8 * 32).from_buffer_copy(key_hash)
+                with restrictive_umask():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                return self._save_prefix_file_locked(target, key_arr)
+            except Exception:
+                return False
+
+    def load_prefix_snapshot(
+        self,
+        filepath: Union[str, Path],
+        token_ids: Sequence[int],
+        sys_text: str = "",
+    ) -> Optional[int]:
+        """Load and validate a prefix snapshot from filepath into the session."""
+        ids = [int(t) for t in token_ids]
+        if not ids:
+            return None
+        target = Path(filepath).expanduser()
+        with self._lock:
+            if not self._session or not self._model:
+                raise RuntimeError("AsiLlamaAdapter is closed")
+            if not self._supports_prefix_file:
+                return None
+            try:
+                key_hash = self._compute_prefix_key_hash(ids, sys_text)
+                key_arr = (ctypes.c_uint8 * 32).from_buffer_copy(key_hash)
+                return self._load_prefix_file_locked(target, key_arr, ids, sys_text)
+            except Exception:
+                return None
 
     def warm_prefix(self, system_prompt: str, role: str = "system") -> int:
         """Pre-evaluate and snapshot the system prompt prefix so Turn 1 skips system prefill."""
@@ -289,12 +582,14 @@ class AsiLlamaAdapter:
             if not self._session or not self._model:
                 raise RuntimeError("AsiLlamaAdapter is closed")
             if self._cached_prefix_text == sys_text and self._cached_prefix_ids:
+                self._record_prefix_hit("ram")
                 return len(self._cached_prefix_ids)
             sys_ids = self.tokenizer.encode(sys_text)
             if not sys_ids:
                 return 0
             if self._cached_prefix_ids == sys_ids:
                 self._cached_prefix_text = sys_text
+                self._record_prefix_hit("ram")
                 return len(sys_ids)
             self._save_prefix_locked(sys_text, sys_ids)
             return len(sys_ids)
@@ -351,6 +646,7 @@ class AsiLlamaAdapter:
                 ):
                     self._cached_prefix_text = sys_text
                     prefix_len = len(sys_ids)
+                    self._record_prefix_hit("ram")
                 else:
                     self._save_prefix_locked(sys_text, sys_ids)
                     prefix_len = len(sys_ids)

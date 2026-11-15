@@ -410,10 +410,20 @@ class LilaCore:
 
             asi_path = os.environ.get("LILA_ASI_PATH") or str(self.gguf_path)
             print(f"   Loading ASI v2: {asi_path}")
+            prefix_cache_dir = (
+                None
+                if os.environ.get("LILA_ASI_DISABLE_DISK_PREFIX") == "1"
+                else (
+                    Path(self.memory_dir) / "prefix_cache"
+                    if getattr(self, "memory_dir", None) is not None
+                    else None
+                )
+            )
             self._llm = AsiLlamaAdapter(
                 model_path=asi_path,
                 n_ctx=getattr(self, "n_ctx", 4096),
                 n_threads=getattr(self, "n_threads", 2),
+                prefix_cache_dir=prefix_cache_dir,
             )
             self._vision_enabled = False
             print("   Done (Lila ASI v2 native runtime)")
