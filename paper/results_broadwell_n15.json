@@ -16,6 +16,26 @@
       "t1": 53,
       "t2": 27,
       "long": 939
+    },
+    "hardware_passport": {
+      "arch": "x86_64",
+      "os": "Linux",
+      "release": "6.18.58.1-microsoft-standard-WSL2",
+      "hostname": "ticketlab",
+      "vendor_id": "GenuineIntel",
+      "cpu_model": "Intel(R) Core(TM) i5-5300U CPU @ 2.30GHz",
+      "physical_cores": 2,
+      "logical_cpus": 4,
+      "bench_threads": 2,
+      "isa_tier": "AVX2 + FMA",
+      "simd_flags": [
+        "avx2",
+        "fma",
+        "f16c"
+      ],
+      "hypervisor": true,
+      "ram_total_gib": 5.727,
+      "ram_avail_gib": 4.376
     }
   },
   "pairs": [

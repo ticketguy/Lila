@@ -9,6 +9,12 @@
     "n_gen": 64,
     "n_prompts": 5,
     "teacher_forced": true,
+    "determinism_runs": 5,
+    "determinism_threads": [
+      1,
+      2
+    ],
+    "strict": true,
     "vocab_compared": 248320
   },
   "prompts": [
@@ -17,6 +23,7 @@
       "prompt_len": 15,
       "n_gen": 64,
       "rel_l2": 0.0,
+      "bt_max_abs_diff": 0.0,
       "bt_first_div": null,
       "bt_agree": 64,
       "bat_vs_llama_agree": 27,
@@ -83,6 +90,7 @@
       "prompt_len": 23,
       "n_gen": 64,
       "rel_l2": 0.0,
+      "bt_max_abs_diff": 0.0,
       "bt_first_div": null,
       "bt_agree": 64,
       "bat_vs_llama_agree": 56,
@@ -121,6 +129,7 @@
       "prompt_len": 17,
       "n_gen": 64,
       "rel_l2": 0.0,
+      "bt_max_abs_diff": 0.0,
       "bt_first_div": null,
       "bt_agree": 64,
       "bat_vs_llama_agree": 30,
@@ -159,6 +168,7 @@
       "prompt_len": 50,
       "n_gen": 64,
       "rel_l2": 0.0,
+      "bt_max_abs_diff": 0.0,
       "bt_first_div": null,
       "bt_agree": 64,
       "bat_vs_llama_agree": 61,
@@ -279,6 +289,7 @@
       "prompt_len": 59,
       "n_gen": 64,
       "rel_l2": 0.0,
+      "bt_max_abs_diff": 0.0,
       "bt_first_div": null,
       "bt_agree": 64,
       "bat_vs_llama_agree": 64,
@@ -317,6 +328,15 @@
     "total_tokens": 320,
     "bt_agree_tokens": 320,
     "bt_agree_pct": 100.0,
+    "bt_max_abs_diff": 0.0,
+    "bt_max_rel_l2": 0.0,
+    "batch_vs_token": {
+      "total_positions": 320,
+      "agree_positions": 320,
+      "agree_pct": 100.0,
+      "max_abs_diff": 0.0,
+      "max_rel_l2": 0.0
+    },
     "bat_vs_llama_agree_tokens": 238,
     "bat_vs_llama_agree_pct": 74.375,
     "tok_vs_llama_agree_tokens": 238,
@@ -343,6 +363,7 @@
         "min": 0.021016468664685813,
         "max": 0.34274348017668066
       },
+      "fp32_ref_rel_l2_ratio": 0.9951794128749859,
       "flips_asi_vs_llama": {
         "count": 4,
         "asi_matched_ref_count": 1,
@@ -398,5 +419,208 @@
         }
       }
     }
+  },
+  "determinism": {
+    "passed": true,
+    "skipped": false,
+    "runs": 5,
+    "required_runs": 5,
+    "threads": [
+      1,
+      2
+    ],
+    "n_gen_per_prompt": 32,
+    "prompts": [
+      "factual",
+      "tool_use"
+    ],
+    "per_thread": {
+      "1": {
+        "n_threads": 1,
+        "runs": 5,
+        "n_runs": 5,
+        "passed": true,
+        "all_identical": true,
+        "prompts": {
+          "factual": {
+            "identical": true,
+            "n_unique": 1,
+            "n_tokens": 32,
+            "sha256": "1f118f986237206116a3e68a054ffc510e7299367926205ebd6de27e87e64f28",
+            "first_mismatch_run": null,
+            "token_ids_prefix": [
+              248068,
+              271,
+              248069,
+              271,
+              760,
+              6511,
+              314,
+              9338,
+              369,
+              2972,
+              57590,
+              159034,
+              271,
+              46162,
+              303,
+              279
+            ]
+          },
+          "tool_use": {
+            "identical": true,
+            "n_unique": 1,
+            "n_tokens": 32,
+            "sha256": "9c1ed37382f2530c696317fd60c5555a9dba4822235280178db635e7af22f85b",
+            "first_mismatch_run": null,
+            "token_ids_prefix": [
+              248068,
+              271,
+              248069,
+              271,
+              27,
+              13766,
+              62,
+              6450,
+              85806,
+              591,
+              763,
+              328,
+              447,
+              62,
+              14764,
+              487
+            ]
+          }
+        }
+      },
+      "2": {
+        "n_threads": 2,
+        "runs": 5,
+        "n_runs": 5,
+        "passed": true,
+        "all_identical": true,
+        "prompts": {
+          "factual": {
+            "identical": true,
+            "n_unique": 1,
+            "n_tokens": 32,
+            "sha256": "1f118f986237206116a3e68a054ffc510e7299367926205ebd6de27e87e64f28",
+            "first_mismatch_run": null,
+            "token_ids_prefix": [
+              248068,
+              271,
+              248069,
+              271,
+              760,
+              6511,
+              314,
+              9338,
+              369,
+              2972,
+              57590,
+              159034,
+              271,
+              46162,
+              303,
+              279
+            ]
+          },
+          "tool_use": {
+            "identical": true,
+            "n_unique": 1,
+            "n_tokens": 32,
+            "sha256": "9c1ed37382f2530c696317fd60c5555a9dba4822235280178db635e7af22f85b",
+            "first_mismatch_run": null,
+            "token_ids_prefix": [
+              248068,
+              271,
+              248069,
+              271,
+              27,
+              13766,
+              62,
+              6450,
+              85806,
+              591,
+              763,
+              328,
+              447,
+              62,
+              14764,
+              487
+            ]
+          }
+        }
+      }
+    },
+    "cross_thread_comparison": {
+      "baseline_threads": 1,
+      "compared_threads": [
+        2
+      ],
+      "all_threads_agree": true,
+      "per_thread_vs_baseline": {
+        "2": {
+          "exact_match": true,
+          "prompts": {
+            "factual": {
+              "exact_match": true,
+              "agree_tokens": 32,
+              "n_tokens": 32,
+              "first_divergence": null
+            },
+            "tool_use": {
+              "exact_match": true,
+              "agree_tokens": 32,
+              "n_tokens": 32,
+              "first_divergence": null
+            }
+          }
+        }
+      }
+    },
+    "detail": "PASS"
+  },
+  "g0_verdict": {
+    "passed": true,
+    "strict": true,
+    "checks": {
+      "batch_vs_token": {
+        "passed": true,
+        "total_positions": 320,
+        "agree_positions": 320,
+        "agree_pct": 100.0,
+        "max_rel_l2": 0.0,
+        "rel_l2_zero": true,
+        "max_abs_diff": 0.0,
+        "detail": "PASS"
+      },
+      "teacher_forced": {
+        "passed": true,
+        "total_positions": 320,
+        "agree_positions": 316,
+        "agree_pct": 98.75,
+        "detail": "PASS"
+      },
+      "fp32_ref": {
+        "passed": true,
+        "fp32_ref_diff_detected": true,
+        "asi_rel_l2_mean": 0.047385340058307884,
+        "llama_rel_l2_mean": 0.04761487169576368,
+        "fp32_ref_rel_l2_ratio": 0.9951794128749859,
+        "detail": "PASS"
+      },
+      "determinism": {
+        "passed": true,
+        "runs": 5,
+        "threads": [
+          1,
+          2
+        ],
+        "detail": "PASS"
+      }
+    },
+    "failures": []
   }
 }

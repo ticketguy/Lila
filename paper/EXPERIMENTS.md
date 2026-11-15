@@ -35,7 +35,7 @@
 ## Trial 04 — `dot2` vs. `dot1` on `lm_head` & Multi-Threaded Matvec
 
 - **Context:** Evaluating 2-row `dot2` kernels (`q4k_dot2_q8k_avx2`, `q6k_dot2_q8k_avx2`) vs. 1-row `dot1` (`q4k_dot_q8k_simd`, `q6k_dot_q8k_simd`) on the 248k-row `lm_head` and layer projections.
-- **Observation:** In [`asi_arch.c`](file:///home/ticket/workspaces/lila/source/engine/asi/asi_arch.c#L313-L375), `asi_matvec_worker` uses `dot2` when `n_threads <= 1` (reusing `qx` loads across two rows per block), whereas when `n_threads > 1` it switches to `dot1` with atomic dynamic chunking (`chunk_rows = 512` for `rows >= 16384`, `64` otherwise) and explicit `LILA_PREFETCH` (`+ 2 * rb` and `+ 2 * rb + 64`) to avoid contention and register pressure across threads.
+- **Observation (Historical Trial 04):** In [`asi_arch.c`](file:///home/ticket/workspaces/lila/source/engine/asi/asi_arch.c#L313-L375), `asi_matvec_worker` initially used `dot2` only for `q4k` when `n_threads <= 1` (reusing `qx` loads across two rows per block), whereas when `n_threads > 1` it switched to `dot1` with atomic dynamic chunking (`chunk_rows = 512` for `rows >= 16384`, `64` otherwise) and explicit `LILA_PREFETCH` (`+ 2 * rb` and `+ 2 * rb + 64`) to avoid contention and register pressure across threads. Although `q6k_dot2_q8k_avx2` was defined in [`q4k.h`](file:///home/ticket/workspaces/lila/source/engine/runtime/q4k.h) during Trial 04, it was not yet wired into `asi_matvec_range`. In **Trial 10 (`v2.2`)**, `q6k_dot2_q8k_avx2` was wired into `asi_matvec_range` alongside `q4k_dot2_q8k_avx2`, and after multi-threaded ablation both `LILA_ASI_Q6K_DOT2=1` and `LILA_ASI_Q4K_DOT2=1` became the defaults across thread counts.
 
 ---
 
@@ -114,4 +114,92 @@
     - `t2_dec`: ASI `13.062 [10.792..14.722]` vs llama `12.889 [10.098..13.918]` (`p=0.3615`, `PARITY`).
     - `rss_mb` (`616.266` vs `978.223 MiB`, `p=3.341e-06`), `vm_hwm_mb` (`638.824` vs `1406.730 MiB`, `p=3.375e-06`), `load_s` (`0.053` vs `2.182 s`, `p=3.392e-06`), and `load_open_s` (`0.027` vs `2.156 s`, `p=3.392e-06`): `PASS` with non-overlapping ranges.
     - `OVERALL PRIMARY BAR`: `FAIL` (due to decode parity and narrow min-max overlaps on TTFT/prefill).
+
+---
+
+## Trial 10 — ASI v2.2: Roofline Reconciliation, SMT-Aware Pool, Disk Prefix Snapshot (`ASIPFX02`), AVX-512 Bit-Exact Reduction, and G0/G1 Claim Gate
+
+- **Context:** Reconciling earlier isolated L3 `bench_dot` expectations against full-model DRAM-bound decode (`bench_roofline.c`), tuning multi-threaded `dot2` kernels and SMT spin-backoff (`asi_pool.h`), adding crash-safe persistent prefix snapshots (`ASIPFX02`) wired into `AsiLlamaAdapter` and `LilaCore._boot_gguf()`, aligning AVX-512 kernel reductions to bit-exact AVX2 semantics (`q4k.h`, `asi_arch.c`), and enforcing structured correctness (`G0`) and statistical performance (`G1`) gates via [`claim_check.py`](file:///home/ticket/workspaces/lila/source/engine/tests/claim_check.py).
+- **1. Roofline & Active Weight Byte Breakdown ([`bench_roofline.c`](file:///home/ticket/workspaces/lila/source/engine/tests/bench_roofline.c), [`roofline_broadwell.json`](file:///home/ticket/workspaces/lila/source/paper/roofline_broadwell.json)):**
+  - **Host hardware:** Idle Broadwell laptop CPU (`Intel(R) Core(TM) i5-5300U CPU @ 2.30GHz`, 2 physical cores / 4 logical CPUs, 3 MiB L3 cache, DDR3-1600, `/tmp/qwen35_0.8b.asi`).
+  - **Synthetic DRAM & STREAM ceilings (`256 MiB` AVX2 read-only, `80 MiB` STREAM arrays):**
+    - `avx2_dram_read_only`: **1T** median `11.53 GB/s` (`11.5327`, best `11.9750`, mean `10.9163`); **2T** median `12.08 GB/s` (`12.0802`, best `13.5898`, mean `10.3338`).
+    - `stream_copy` / `stream_triad`: **1T** median `7.84` (`7.8436`, best `9.2414`) / `9.66 GB/s` (`9.6645`, best `10.3629`); **2T** median `8.26` (`8.2615`, best `8.7441`) / `5.70 GB/s` (`5.6979`, best `9.4184` Triad).
+  - **Isolated `Q4_K` / `Q6_K` `dot1` vs. `dot2` kernels (`L3 = 2 MiB` vs. `DRAM = 64 MiB`):**
+
+| Benchmark Kernel | Size / Locality | 1T Med GB/s (`best`) | 1T Med GFLOP/s (`best`) | 2T Med GB/s (`best`) | 2T Med GFLOP/s (`best`) |
+|---|---|---|---|---|---|
+| `l3_q4k_dot1` | 2 MiB (L3) | `7.60` (`8.12`) | `27.00` (`28.88`) | `11.82` (`14.54`) | `42.02` (`51.71`) |
+| `l3_q4k_dot2` | 2 MiB (L3) | `7.80` (`8.35`) | `27.74` (`29.69`) | `11.05` (`13.72`) | `39.30` (`48.77`) |
+| `l3_q6k_dot1` | 2 MiB (L3) | `7.56` (`8.73`) | `18.43` (`21.28`) | `12.71` (`15.52`) | `30.98` (`37.84`) |
+| `l3_q6k_dot2` | 2 MiB (L3) | `7.43` (`8.21`) | `18.11` (`20.01`) | `14.01` (`15.28`) | `34.17` (`37.26`) |
+| `dram_q4k_dot1` | 64 MiB (DRAM) | `5.78` (`6.68`) | `20.56` (`23.74`) | `11.06` (`11.16`) | `39.31` (`39.69`) |
+| `dram_q4k_dot2` | 64 MiB (DRAM) | `3.82` (`4.30`) | `13.59` (`15.30`) | `3.90` (`7.54`) | `13.86` (`26.82`) |
+| `dram_q6k_dot1` | 64 MiB (DRAM) | `6.60` (`6.86`) | `16.09` (`16.72`) | `5.85` (`7.60`) | `14.27` (`18.52`) |
+| `dram_q6k_dot2` | 64 MiB (DRAM) | `5.73` (`6.07`) | `13.98` (`14.80`) | `6.36` (`6.77`) | `15.51` (`16.51`) |
+
+  - **Reconciling `bench_dot` vs. full-model decode:** Isolated `bench_dot` operates over `~2 MiB` of `Q4_K` weights resident inside the 3 MiB L3 cache (`~27–42 GFLOP/s`), whereas real `Qwen3.5-0.8B` (`hybrid_qwen35`, `320` tensors, `file_size_bytes = 642,277,376`, `repacked_tensors = 0`, `tied_embeddings = true`, `vocab_size = 248320`, `n_embd = 1024`, `n_layers = 24`) streams **`518,335,744 B` (`518.34 MB`)** of active decode weights from DRAM on every generated token:
+    - **`Q6_K`: `297,185,280 B` (`297.19 MB`, `57.3345%`)** — dominated by tied `token_embd`/`lm_head` at **`208,588,800 B` (`208.59 MB`, `40.2420%` of all active decode bytes)**, plus `attn_qkv` (`51,609,600 B`, `9.9568%`), `ffn_down` (`36,126,720 B`, `6.9698%`), and `other` (`860,160 B`, `0.1659%`).
+    - **`Q4_K`: `219,156,480 B` (`219.16 MB`, `42.2808%`)** — `attn_qkv` (`28,311,552 B`, `5.4620%`), `ffn_down` (`24,772,608 B`, `4.7793%`), and `other` (`166,072,320 B`, `32.0395%`).
+    - **`F32`: `1,993,984 B` (`1.99 MB`, `0.3847%`)**.
+  - **Full-model `bench_roofline` decode (`n_tokens = 32`):**
+    - **1T:** `7.11 tok/s` (`7.1084`, `eval_tok_s = 7.1281`), `140.68 ms/tok` (`140.6782`), effective bandwidth `3.68 GB/s` (`3.6845`), **`31.9%`** (`31.9487%`) of `avx2_dram_read_only` (`46.9750%` of `stream_copy`), vs. pure-DRAM roofline `22.25 tok/s` and isolated-kernel prediction `109.18 ms/tok` (`9.16 tok/s`, leaving `31.50 ms` / `22.39%` non-matvec/dispatch residual).
+    - **2T:** `10.38 tok/s` (`10.3835`, `eval_tok_s = 10.4251`), `96.31 ms/tok` (`96.3069`), effective bandwidth `5.38 GB/s` (`5.3821`), **`44.6%`** (`44.5534%`) of `avx2_dram_read_only` (`65.1473%` of `stream_copy`), vs. pure-DRAM roofline `23.31 tok/s` (`pred_matvec_ms = 102.94 ms`, `9.71 tok/s`, where the `3.90 GB/s` isolated `dram_q4k_dot2` synthetic microbenchmark slightly over-penalized real 2T decode).
+- **2. `3 × 32`-Token Full-Model `dot1`/`dot2` Ablation & Per-Stage Decode Profile (Idle Broadwell CPU):**
+  - Matrix ablation across `LILA_ASI_Q6K_DOT2` and `LILA_ASI_Q4K_DOT2` in `AsiRuntimeConfig` ([`asi_arch.c`](file:///home/ticket/workspaces/lila/source/engine/asi/asi_arch.c)):
+
+| `LILA_ASI_Q6K_DOT2` | `LILA_ASI_Q4K_DOT2` | 1T Med `[min..max]` (`tok/s`) | 2T Med `[min..max]` (`tok/s`) | Notes |
+|---|---|---|---|---|
+| `0` (`dot1`) | `0` (`dot1`) | `7.83 [5.46..8.91]` | `8.88 [7.95..10.89]` | Baseline `dot1` on both weight formats |
+| `0` (`dot1`) | `1` (`dot2`) | `8.29 [7.76..8.30]` | `12.19 [9.22..12.81]` | `Q4_K` `dot2` only |
+| `1` (`dot2`) | `0` (`dot1`) | `8.01 [7.96..8.82]` | `11.37 [9.63..14.13]` | `Q6_K` `dot2` wired into `asi_matvec_range` |
+| **`1` (`dot2`)** | **`1` (`dot2`)** | **`8.14 [8.09..9.24]`** | **`13.58 [13.49..13.63]`** | **New v2.2 default (`+52.9%` median 2T vs `dot1/dot1`, tight `0.14 tok/s` spread)** |
+
+  - **Per-token decode stage profile (`LILA_ASI_PROFILE=1` at 2T with `dot2=1/1`, `~68 ms/tok` total):**
+    - `lm_head` (`248,320 × 1024` `Q6_K`): `~23–26 ms` (`~36%`)
+    - `ffn` (SwiGLU gate/up/down): `~18–21 ms` (`~29%`)
+    - `dn_proj` (DeltaNet projections): `~13–16 ms` (`~22%`)
+    - `ssm` (Conv1D + DeltaNet recurrence): `~3.2–4.0 ms` (`~5%`)
+    - `fa_proj` (Full-attention projections): `~2.7–3.7 ms` (`~5%`)
+    - `fa_gqa` (Grouped-query attention + KV cache): `~0.10 ms` (`<0.2%`)
+    - `norm` (RMSNorms + `Q8_K` quantization): `~0.06 ms` (`<0.1%`)
+  - Enabling `dot2` for both `Q6_K` and `Q4_K` cuts redundant `Q8_K` vector loads across `lm_head`, `ffn`, and `dn_proj` (together `~87%` of decode latency), lifting 2T median decode on idle Broadwell from `8.88` to `13.58 tok/s` with minimal variance (`[13.49..13.63]`).
+- **3. SMT-Aware Thread Pool (`AsiThreadPool` in [`asi_pool.h`](file:///home/ticket/workspaces/lila/source/engine/asi/asi_pool.h)):**
+  - Added `asi_detect_physical_cores()` parsing `/sys/devices/system/cpu/cpu*/topology/thread_siblings_list` (with `sysconf(_SC_NPROCESSORS_ONLN) / 2` fallback) and `LILA_ASI_SPIN_LIMIT` runtime override (`yield_limit = 2 * spin_limit`).
+  - When `n_threads > physical_cores` (e.g., 1-core / 2-SMT cloud VMs such as Google Colab Xeon), the pool automatically uses `spin_limit = 64` / `yield_limit = 128` to yield the hyperthread instead of starving its sibling; when `n_threads <= physical_cores`, it retains `spin_limit = 2048` / `yield_limit = 4096`.
+- **4. Disk-Persisted Prefix Snapshot (`ASIPFX02`, [`lila_asi.h`](file:///home/ticket/workspaces/lila/source/engine/asi/lila_asi.h), [`lila_asi.c`](file:///home/ticket/workspaces/lila/source/engine/asi/lila_asi.c), [`asi_arch.c`](file:///home/ticket/workspaces/lila/source/engine/asi/asi_arch.c), [`asi_backend.py`](file:///home/ticket/workspaces/lila/source/src/core/asi_backend.py), [`lilacore.py`](file:///home/ticket/workspaces/lila/source/src/core/lilacore.py)):**
+  - Introduced `LILA_ASI_NUMERICS_VERSION` (`2U`), a 144-byte `_Static_assert`-checked `AsiPrefixSnapshotHeader` with magic `"ASIPFX02"`, independent **CRC-64 ECMA** checksums over header (`header_crc64`) and payload (`payload_crc64`), and crash-safe atomic writes (`<filepath>.tmp.<pid>` -> `fflush` -> `fsync` -> `rename`).
+  - Wired automatic `.asip` disk prefix caching (`prefix_<hex16>.asip`, keyed via `_compute_prefix_key_hash` over `b"ASIPFX02"`, model `identity_hash`, `arch_id`, `fp32_ref`, token count, UTF-8 `sys_text`, and prompt token IDs) into `AsiLlamaAdapter` (`0o700` directory, `0o600` files via `restrictive_umask()`, LRU eviction controlled by `LILA_ASI_PREFIX_CACHE_MAX_FILES=8`, configurable via `LILA_ASI_PREFIX_CACHE_DIR` / `LILA_ASI_DISABLE_DISK_PREFIX`) and connected `LilaCore._boot_gguf()` to `Path(self.memory_dir) / "prefix_cache"`.
+  - **Verification:** `test_asi_v2` reported `Disk prefix round-trip diff=0.000000 (memcmp=0)` alongside corruption/tamper rejection; `qualify_asi_backend.py` reported `ALL 6 ASI QUALIFICATION CHECKS PASSED` (including disk cache persistence `hit_b='disk'` and cache invalidation `mut_hit='miss'`).
+- **5. AVX-512 Bit-Exact Reduction & Multi-ISA Compile Audit ([`q4k.h`](file:///home/ticket/workspaces/lila/source/engine/runtime/q4k.h), [`asi_arch.c`](file:///home/ticket/workspaces/lila/source/engine/asi/asi_arch.c)):**
+  - Aligned `#if defined(__AVX512F__)` dot and batched GEMM reductions in `q4k.h` and `asi_arch.c` with the `#if defined(__AVX2__)` bit-exact 8-lane `__m256 sum_vec` + `lila_hsum_f32_avx2` accumulation tree and shared `tile_out` unpack path (`lila_q4k_unpack_row_avx2` / `lila_q6k_unpack_row_avx2`).
+  - Replaced branchy `get_scale_min_k4` inner-loop logic in `Q4_K` kernels with `lila_q4k_unpack_scales_avx2`.
+  - **Verification:** Clean compilation verified across AVX2 (`-mavx2 -mfma -mf16c`), AVX-512 (`-mavx512f -mavx512bw -mavx512dq -mavx512vl`), AVX-512-VNNI (`-mavx512vnni`), non-`F16C` (`fp16_to_fp32` software fallback), pure scalar fallback, and `ASan+UBSan+LSan`. Note: AVX-512 and ARM64 NEON execution remains **compile/audit-verified only** pending runs on physical AVX-512 and ARM64 hardware.
+- **6. G0 Correctness Gate (`N_GEN = 64`, 320 Positions, [`correctness_broadwell_n64.json`](file:///home/ticket/workspaces/lila/source/paper/correctness_broadwell_n64.json)):**
+  - `.asi` SHA-256 `757731964e8a24950f3ae743be9df81ca5671f15b014aa45c31868131679e9f0`, GGUF SHA-256 `d9662c91079317aee661a1475d61412787696e0dcc5636c39648fb27d49e1edf`, `n_ctx = 512`, `n_threads = 2`, `n_gen = 64`, `5` prompts (`320` token positions), `vocab_compared = 248320`.
+  - **G0 Sub-Checks (all `PASS`):**
+    - `batch_vs_token`: **`320/320` (`100.0%`)**, `max_abs_diff = 0.0`, `max_rel_l2 = 0.0`.
+    - `teacher_forced`: `ASI vs llama.cpp = 316/320 (98.75%)`, `ASI vs FP32-Ref = 315/320 (98.44%)` (`98.4375%`), `llama.cpp vs FP32-Ref = 316/320 (98.75%)`.
+    - `fp32_ref`: `ASI Rel-L2 mean = 0.047385` (`median = 0.038031`, `max = 0.404697`) vs `llama.cpp mean = 0.047615` (`median = 0.038385`, `max = 0.342743`), **`ratio = 0.9952 <= 1.05`** (`0.995179`); all `4` ASI-vs-llama flips (`ASI==Ref: 1`, `Llama==Ref: 2`, `Neither==Ref: 1`) occurred at near-tie `FP32-Ref` margins (`0.050007..0.094835`, max `0.0948`).
+    - `determinism`: **5-subprocess determinism `PASS`** at both `threads=1` and `threads=2` (`32` tokens on `factual` and `tool_use`), with exact `32/32` cross-thread agreement (`factual` SHA-256 `1f118f986237206116a3e68a054ffc510e7299367926205ebd6de27e87e64f28`, `tool_use` SHA-256 `9c1ed37382f2530c696317fd60c5555a9dba4822235280178db635e7af22f85b`).
+- **7. G1 Performance Gate & Claim Verdict ([`claim_check.py`](file:///home/ticket/workspaces/lila/source/engine/tests/claim_check.py), [`claim_verdict_broadwell.json`](file:///home/ticket/workspaces/lila/source/paper/claim_verdict_broadwell.json)) & Cross-Machine Context:**
+  - Formal G1 evaluation on Broadwell (`results_broadwell_n15.json`, `N = 15`, `n_threads = 2`) under `claim_check.py` (requiring `N >= 15`, `WIN` = median gain `>= 3%`, MWU `p < 0.01`, tail within `10%` at `p5`/`p95`; `STRONG WIN` = `WIN` + non-overlapping `[min..max]`):
+
+| Metric | Dir | Role | ASI `med [min..max]` (`p5/p95`) | `llama.cpp` `med [min..max]` (`p5/p95`) | Gain% | TailR | MWU *p* | G1 Verdict |
+|---|---|---|---|---|---|---|---|---|
+| `t1_ttft` (s) | lower | primary | `0.908 [0.862..1.208]` (`0.864/1.128`) | `1.094 [1.027..1.810]` (`1.031/1.604`) | `+17.1%` | `0.703` | `0.00105` | **`WIN`** |
+| `t1_dec` (tok/s) | higher | primary | `13.808 [9.232..15.030]` (`9.378/14.968`) | `13.477 [9.162..14.280]` (`10.426/14.278`) | `+2.5%` | `0.900` | `0.3401` | `PARITY` |
+| `t2_ttft` (s) | lower | primary | `0.487 [0.459..0.953]` (`0.459/0.844`) | `0.607 [0.559..0.839]` (`0.563/0.794`) | `+19.9%` | `1.063` | `0.003691` | **`WIN`** |
+| `t2_dec` (tok/s) | higher | primary | `13.062 [10.792..14.722]` (`11.283/14.494`) | `12.889 [10.098..13.918]` (`11.540/13.852`) | `+1.3%` | `0.978` | `0.3615` | `PARITY` |
+| `long_prefill_tps` | higher | primary | `52.799 [44.701..55.541]` (`45.090/54.864`) | `46.213 [40.022..50.272]` (`40.436/49.912`) | `+14.3%` | `1.115` | `0.0003609` | **`WIN`** |
+| `rss_mb` (MiB) | lower | memory | `616.266 [616.188..616.469]` (`616.198/616.428`) | `978.223 [978.105..978.410]` (`978.119/978.399`) | `+37.0%` | `0.630` | `3.341e-06` | **`STRONG WIN`** |
+| `vm_hwm_mb` (MiB) | lower | secondary | `638.824 [638.602..638.988]` (`638.648/638.955`) | `1406.730 [1406.504..1406.844]` (`1406.586/1406.836`) | `+54.6%` | `0.454` | `3.375e-06` | **`STRONG WIN`** |
+| `load_s` (s) | lower | secondary | `0.053 [0.052..0.100]` (`0.052/0.084`) | `2.182 [1.991..3.216]` (`1.994/3.112`) | `+97.5%` | `0.027` | `3.392e-06` | **`STRONG WIN`** |
+| `load_open_s` (s) | lower | secondary | `0.027 [0.026..0.048]` (`0.027/0.035`) | `2.156 [1.966..3.192]` (`1.969/3.081`) | `+98.7%` | `0.011` | `3.392e-06` | **`STRONG WIN`** |
+
+  - **Broadwell Verdict (`claim_verdict_broadwell.json`):** `G1 Tier: BEATS` (`3` primary `WIN`s, `0` losses, `rss_mb` `STRONG WIN`), `overall_passed = true`, exact allowed claim string: `"Beats llama.cpp on Intel(R) Core(TM) i5-5300U CPU @ 2.30GHz (2 threads)"`. Note honestly that the 15 raw pairs in `results_broadwell_n15.json` were captured on the pre-v2.2 build before `dot2=1` defaults (`LILA_ASI_Q6K_DOT2=1`, `LILA_ASI_Q4K_DOT2=1`), SMT spin-backoff, and `/proc/stat` `steal_jiffies` telemetry (`has_telemetry = false`).
+  - **Cross-Machine Colab Xeon Run (`N = 10`, commit `4e73276`, `Intel(R) Xeon(R) CPU @ 2.20GHz`, 1 physical core / 2 logical CPUs, AVX2+FMA, same `d9662c91` GGUF):**
+    - Medians across the 10 interleaved pairs: `load_s = 0.086 s` (`[0.082..0.091]`) vs `1.015 s` (`[0.976..1.722]`), `t1_ttft = 1.036 s` (`[1.027..1.642]`) vs `1.136 s` (`[1.132..2.210]`), `t1_dec = 12.90 tok/s` (`12.895`, `[8.06..13.04]`) vs `13.80 tok/s` (`[6.44..13.88]`), `t2_ttft = 0.552 s` (`0.5515`, `[0.538..0.927]`) vs `0.654 s` (`0.6535`, `[0.629..0.734]`), `t2_dec = 12.73 tok/s` (`[4.45..12.92]`) vs `13.64 tok/s` (`[6.87..13.87]`), `long_prefill_tps = 44.38 tok/s` (`44.375`, `[41.95..47.29]`) vs `41.03 tok/s` (`41.025`, `[40.82..44.10]`), steady-state `rss_mb = 619.8` vs `1107.9 MiB` (`1107.85`), and peak `vm_hwm_mb = 619.8` vs `1381.7 MiB`.
+    - Because commit `4e73276` was pre-v2.2 (`N = 10 < 15`, prior to `dot2=1` defaults, SMT spin-backoff `spin_limit=64` / `yield_limit=128`, and `/proc/stat` steal-time logging), it does not qualify for formal G1 certification; [`colab_asi_benchmark.ipynb`](file:///home/ticket/workspaces/lila/source/engine/tests/colab_asi_benchmark.ipynb) is updated for `N = 15`, `threads = 1, 2`, `N_GEN = 64` G0 check, `claim_check.py`, and `steal_jiffies` logging as the next cloud verification run.
+
 

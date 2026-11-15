@@ -1,0 +1,302 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=0.7in]{geometry}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{listings}
+\usepackage{hyperref}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    urlcolor=blue,
+    citecolor=blue,
+    pdftitle={ASI: A Portable, CPU-Optimized Inference Runtime for Quantized Language Models (v2.2)},
+    pdfauthor={Sammie (ticketguy) and Gemini 4 Hydrogen Engineering Agents}
+}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    columns=fullflexible,
+    keepspaces=true
+}
+
+\title{\textbf{ASI: A Portable, CPU-Optimized Inference Runtime for Quantized Language Models}\\[0.4em]
+\large Lila-ASI Technical Report \#1 (v2.2)}
+
+\author{Sammie (\texttt{ticketguy}) and the Gemini 4 Hydrogen Engineering Agents\\[0.4em]
+\small Primary Evaluation Hardware: ThinkPad T450s (\texttt{Intel(R) Core(TM) i5-5300U CPU @ 2.30GHz}, 2C/4T, 3\,MiB L3, AVX2/FMA/F16C, DDR3-1600)\\
+\small Cross-Machine Reference: Google Colab CPU VM (\texttt{Intel(R) Xeon(R) CPU @ 2.20GHz}, 1C/2T SMT, AVX2/FMA)\\
+\small Implementation: \texttt{source/engine/asi/} and \texttt{source/engine/runtime/q4k.h}}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Local-first AI agents running on commodity laptops operate under tight memory, thermal, and startup-latency budgets without discrete GPUs. We present \textbf{ASI (Active System Image)}, a standalone C11/SIMD inference runtime and portable binary cartridge format (\texttt{.asi} v2) engineered for CPU-only execution and integrated into the Lila agent host via \texttt{AsiLlamaAdapter} and \texttt{LilaCore.\_boot\_gguf()}. ASI separates model distribution from execution using a 4\,KiB page-aligned, \texttt{mmap}-able cartridge (\texttt{AsiV2Header}, \texttt{AsiV2SectionEntry}, \texttt{AsiV2TensorEntry}) and executes hybrid state-space/attention architectures---specifically Qwen3.5 Gated DeltaNet + Grouped-Query Attention (\texttt{ASI\_ARCH\_HYBRID\_QWEN35})---with persistent scratch arenas, an SMT-aware spin-then-sleep thread pool (\texttt{AsiThreadPool}), integer-SIMD 2-row \texttt{dot2} and 1$\times$ row-unpack GEMM kernels (\texttt{Q4\_K} $\times$ \texttt{Q8\_K} and \texttt{Q6\_K} $\times$ \texttt{Q8\_K}), and crash-safe disk-persisted system-prefix snapshots (\texttt{ASIPFX02}).
+
+In ASI v2.2 on \texttt{Intel(R) Core(TM) i5-5300U CPU @ 2.30GHz} (\texttt{Qwen3.5-0.8B} \texttt{Q4\_K\_M}, 2 threads), we integrate an automated \textbf{G0 correctness gate} (\texttt{correctness\_broadwell\_n64.json}), a hardware \textbf{roofline and active-weight audit} (\texttt{roofline\_broadwell.json}), and a statistical \textbf{G1 performance claim gate} (\texttt{claim\_verdict\_broadwell.json}). Under G0 across 320 positions (\texttt{N\_GEN=64} over 5 prompts), \texttt{ASI(Q8\_K)} achieves \textbf{320/320 (100.0\%)} batch-vs-token parity (\texttt{0.0} relative $L_2$), \textbf{316/320 (98.75\%)} teacher-forced top-1 agreement with \texttt{llama.cpp}, \textbf{315/320 (98.44\%)} agreement and lower mean logit relative $L_2$ error against unquantized \texttt{FP32-Ref} than \texttt{llama.cpp} (\texttt{0.047385} vs.\ \texttt{0.047615}, ratio $0.9952 \le 1.05$, all 4 flips at near-tie \texttt{FP32-Ref} margins $\le 0.0948$), and 5-subprocess determinism (\texttt{PASS} at 1 and 2 threads with \texttt{32/32} cross-thread agreement). Roofline measurements reconcile isolated 2\,MiB L3 kernel throughput ($\sim$27--42\,GFLOP/s) with full-model decode (518.34\,MB active weights streamed per token, 57.33\% \texttt{Q6\_K} including 40.24\% in tied \texttt{token\_embd}/\texttt{lm\_head}, against a 11.53/12.08\,GB/s DRAM read-only ceiling) and justify enabling \texttt{LILA\_ASI\_Q6K\_DOT2=1} and \texttt{LILA\_ASI\_Q4K\_DOT2=1} by default, lifting idle 2T $3\times 32$-token decode from 8.88 to 13.58\,tok/s. Under G1 (\texttt{claim\_check.py} over $N=15$ prepopulated pairs), ASI achieves tier \textbf{BEATS} with the verified claim \emph{``Beats llama.cpp on Intel(R) Core(TM) i5-5300U CPU @ 2.30GHz (2 threads)''}: \texttt{WIN} on Turn-1 TTFT (0.908 vs.\ 1.094\,s, $+17.1\%$, $p=0.00105$), Turn-2 TTFT (0.487 vs.\ 0.607\,s, $+19.9\%$, $p=0.003691$), and 939-token prefill (52.799 vs.\ 46.213\,tok/s, $+14.3\%$, $p=0.0003609$), statistical \texttt{PARITY} on Turn-1/Turn-2 decode, and non-overlapping \texttt{STRONG WIN} on RSS (616.266 vs.\ 978.223\,MiB, $-37.0\%$, $p=3.341\times 10^{-6}$), peak HWM (638.824 vs.\ 1406.730\,MiB, $-54.6\%$), and load time (0.053 vs.\ 2.182\,s, $-97.5\%$). Both the $N=15$ Broadwell capture and a companion $N=10$ Colab Xeon run (\texttt{4e73276}) predate v2.2 \texttt{dot2=1} defaults and SMT spin-backoff, and AVX-512/NEON kernels are compile- and audit-verified only.
+\end{abstract}
+
+\section{Introduction, Motivation, and Contributions}
+
+Deploying an interactive local assistant such as Lila on an older, CPU-only laptop (2 physical cores / 4 logical CPUs, DDR3-1600, no GPU) exposes three coupled bottlenecks that server-oriented inference engines rarely optimize simultaneously:
+
+\begin{enumerate}
+    \item \textbf{Cold-start and memory-footprint overhead:} Parsing unstructured metadata, eagerly duplicating weight buffers, and allocating transient per-call scratch memory inflate resident set size (RSS) and startup latency.
+    \item \textbf{Turn-to-turn system-prompt re-evaluation:} Agentic workloads prepend long system instructions and tool schemas (often 800+ tokens) on every turn; without persistent prefix state across restarts or sessions, scarce CPU cycles are wasted recomputing identical hybrid DeltaNet and KV caches.
+    \item \textbf{Host-engine coupling and uncalibrated microbenchmarks:} Bundling tokenizer, tensor layouts, and orchestration inside a monolithic runtime complicates numerical auditing, while isolated L3-resident kernel benchmarks can severely mispredict DRAM-bound decode throughput without hardware roofline reconciliation.
+\end{enumerate}
+
+ASI v2.2 contributes four engineering advances:
+\begin{itemize}
+    \item \textbf{Zero-Copy \texttt{.asi} v2 Cartridge and C11 ABI:} A 4\,KiB page-aligned format (\texttt{source/engine/asi/asi\_v2.h}) with 64-byte aligned weights (\texttt{MAP\_PRIVATE} / \texttt{MapViewOfFile}) and a minimal C ABI (\texttt{source/engine/asi/lila\_asi.h}) integrated into \texttt{source/src/core/asi\_backend.py} and \texttt{source/src/core/lilacore.py}.
+    \item \textbf{Crash-Safe Disk Prefix Snapshot (\texttt{ASIPFX02}) and SMT-Aware Pool:} Atomic \texttt{.asip} prefix caching (\texttt{AsiPrefixSnapshotHeader}, dual CRC-64 ECMA checksums, \texttt{<filepath>.tmp.<pid>} rename, \texttt{0o700}/\texttt{0o600} permissions, LRU pruning) paired with topology-aware \texttt{AsiThreadPool} spin-backoff (\texttt{asi\_pool.h}) for SMT-oversubscribed VMs.
+    \item \textbf{Roofline-Reconciled Kernels and Bit-Exact AVX-512 Alignment:} DRAM-vs-L3 characterization explaining full-model bottlenecks (57.33\% \texttt{Q6\_K} bytes, 40.24\% in tied \texttt{token\_embd}/\texttt{lm\_head}), default \texttt{dot2} \texttt{Q4\_K}/\texttt{Q6\_K} matvec execution in \texttt{asi\_arch.c}, branchless scale unpacking (\texttt{lila\_q4k\_unpack\_scales\_avx2}), and bit-exact 8-lane reduction across AVX2 and AVX-512 paths in \texttt{q4k.h}.
+    \item \textbf{Automated G0 Correctness and G1 Claim Gates:} Disciplined verification via \texttt{test\_correctness\_gate.py}, \texttt{bench\_roofline.c}, and \texttt{claim\_check.py} separating verified Broadwell results from pre-v2.2 captures and compile-only ISA tiers.
+\end{itemize}
+
+\section{The \texttt{.asi} v2 Cartridge Format}
+
+The \texttt{.asi} v2 specification is defined in \texttt{source/engine/asi/asi\_v2.h} and implemented in \texttt{asi\_v2.c}, \texttt{asi\_v2.py}, and \texttt{gguf\_to\_asi\_v2.py}. All on-disk structures are little-endian and enforced at compile time with \texttt{\_Static\_assert}.
+
+\subsection{File Header and Section Directory}
+\begin{itemize}
+    \item \textbf{Header (\texttt{AsiV2Header}, 64\,bytes):} Stores \texttt{magic = 0x41534921u} (\texttt{"ASI!"}), \texttt{version = 2u}, \texttt{arch\_id} (\texttt{AsiV2ArchId}: \texttt{1 = dense\_llama}, \texttt{2 = hybrid\_qwen35}, \texttt{3 = dense\_gemma}, \texttt{4 = dense\_qwen2}, \texttt{5 = dense\_qwen3}), capability \texttt{flags} (\texttt{ASI\_V2\_FLAG\_HAS\_VISION}, \texttt{HAS\_AUDIO}, \texttt{HAS\_ADAPTERS}, \texttt{HAS\_SIGNATURE}, \texttt{HAS\_CHAT\_TEMPLATE}), \texttt{n\_sections}, \texttt{total\_size}, \texttt{section\_table\_offset}, and a 24-byte \texttt{identity\_hash} (first 24 bytes of SHA-256 over section payloads in \texttt{write\_asi\_v2}).
+    \item \textbf{Section Table (\texttt{AsiV2SectionEntry}, 32\,bytes/entry):} Each entry (\texttt{ASI\_SEC\_MODEL\_CONFIG = 0x01}, \texttt{ASI\_SEC\_WEIGHTS = 0x02}, \texttt{ASI\_SEC\_TOKENIZER = 0x04}, \texttt{ASI\_SEC\_METADATA = 0x08}, \texttt{ASI\_SEC\_CHAT\_TEMPLATE = 0x09}, \texttt{ASI\_SEC\_VISION = 0x0A}, etc.) has a 4\,KiB page-aligned \texttt{offset} (\texttt{ASI\_V2\_PAGE\_SIZE = 4096u}), \texttt{size}, and 64-bit \texttt{checksum}. Legacy sections (\texttt{0x05}, \texttt{0x06}) are ignored in the v2 load path; the Lila host retains sole ownership of tools and permissions.
+\end{itemize}
+
+\subsection{Integrity Verification and Lazy \texttt{mmap}}
+Checksums use \textbf{CRC-64 ECMA} (\texttt{0x42F0E1EBA9EA3693ULL} in \texttt{asi\_v2\_crc64}). During \texttt{asi\_v2\_validate\_memory}, small metadata, config, chat-template, and tokenizer sections are always CRC-64 verified on open, whereas bulk binary sections (\texttt{ASI\_SEC\_WEIGHTS}, \texttt{ASI\_SEC\_VISION}, \texttt{ASI\_SEC\_AUDIO}) skip eager CRC-64 scanning unless \texttt{LILA\_ASI\_VERIFY\_CRC=1} is set. Preserving lazy \texttt{mmap} avoids hundreds of megabytes of cold disk reads during \texttt{lila\_asi\_open}.
+
+\subsection{Model Config and 64-Byte Aligned Weights Directory}
+\begin{itemize}
+    \item \textbf{\texttt{AsiV2ModelConfig} (96\,bytes):} Captures dense and hybrid SSM hyperparameters (\texttt{n\_layers}, \texttt{hidden\_size}, \texttt{intermediate\_size}, \texttt{n\_heads}, \texttt{n\_kv\_heads}, \texttt{head\_dim}, \texttt{vocab\_size}, \texttt{max\_seq\_len}, \texttt{rope\_dim}, \texttt{rope\_theta}, \texttt{rms\_norm\_eps}, \texttt{embed\_scale}, \texttt{full\_attention\_interval}, \texttt{ssm\_conv\_kernel}, \texttt{ssm\_state\_size}, \texttt{ssm\_group\_count}, \texttt{ssm\_inner\_size}, \texttt{ssm\_time\_step\_rank}).
+    \item \textbf{\texttt{ASI\_SEC\_WEIGHTS}:} Opens with a 16-byte \texttt{AsiV2WeightsHeader} (\texttt{n\_tensors}, \texttt{flags}, \texttt{data\_offset}) followed by \texttt{n\_tensors} $\times$ 80-byte \texttt{AsiV2TensorEntry} descriptors. In \texttt{pack\_weights\_section}, \texttt{data\_offset} and every tensor payload size are rounded to 64-byte boundaries (\texttt{(n + 63) \& ~63}) so SIMD weight reads start cache-line aligned.
+    \item \textbf{Optional AVX2 \texttt{Q6\_K} Repacking (\texttt{ASI\_TENSOR\_LAYOUT\_AVX2\_REPACK}):} \texttt{gguf\_to\_asi\_v2.py} supports \texttt{asi\_v2\_repack\_q6k} into 288-byte \texttt{LilaQ6KRepackedBlock} structs (\texttt{u6[256]}, \texttt{scales[16]}, FP32 \texttt{d}, \texttt{pad[12]}); all benchmarked artifacts here use standard unpacked GGML layouts (\texttt{repacked\_tensors = 0}).
+\end{itemize}
+
+\section{Runtime Architecture (v2.2)}
+
+\subsection{Public C ABI and Host Integration}
+\texttt{lila\_asi.h} and \texttt{lila\_asi.c} export model lifecycle (\texttt{lila\_asi\_open}, \texttt{lila\_asi\_close}, \texttt{lila\_asi\_model\_info}, \texttt{lila\_asi\_model\_header}, \texttt{lila\_asi\_get\_section}), session lifecycle (\texttt{lila\_asi\_session\_create}, \texttt{free}, \texttt{reset}), inference (\texttt{lila\_asi\_eval\_token}, \texttt{lila\_asi\_eval\_batch}, \texttt{lila\_asi\_sample}), and both memory-resident (\texttt{lila\_asi\_session\_save\_prefix} / \texttt{restore\_prefix}) and disk-backed (\texttt{lila\_asi\_session\_save\_prefix\_file} / \texttt{load\_prefix\_file}) prefix snapshots versioned by \texttt{LILA\_ASI\_NUMERICS\_VERSION} (\texttt{2U}). On the host side, \texttt{AsiLlamaAdapter} (\texttt{source/src/core/asi\_backend.py}) extracts zero-copy tokenizer and chat-template sections, manages prefix caching, and integrates into \texttt{LilaCore.\_boot\_gguf()} (\texttt{source/src/core/lilacore.py}).
+
+\subsection{SMT-Aware Thread Pool (\texttt{asi\_pool.h})}
+\texttt{AsiThreadPool} eliminates OpenMP barrier latency on tight per-layer dispatches and places hot synchronization atomics (\texttt{fn}, \texttt{gen}, \texttt{done\_count}, \texttt{active}, \texttt{sleeping}, \texttt{shutdown}) on distinct 64-byte cache lines (\texttt{\_Alignas(64)}). In v2.2, \texttt{asi\_detect\_physical\_cores()} parses \texttt{/sys/devices/system/cpu/cpu*/topology/thread\_siblings\_list} (with \texttt{sysconf(\_SC\_NPROCESSORS\_ONLN)/2} fallback) to adapt spin-backoff to SMT topology:
+\begin{itemize}
+    \item \textbf{Dedicated physical cores (\texttt{n\_threads <= physical\_cores}):} Workers spin with \texttt{asi\_cpu\_pause()} up to \texttt{spin\_limit = 2048} iterations and \texttt{sched\_yield()} up to \texttt{yield\_limit = 4096} before sleeping on \texttt{pthread\_cond\_wait}.
+    \item \textbf{SMT oversubscription (\texttt{n\_threads > physical\_cores}):} On 1-core / 2-SMT cloud VMs (e.g., Google Colab Xeon), spinning starves the hyperthread sibling; ASI drops automatically to \texttt{spin\_limit = 64} and \texttt{yield\_limit = 128}.
+    \item \textbf{Manual override:} \texttt{LILA\_ASI\_SPIN\_LIMIT} overrides \texttt{spin\_limit} explicitly with \texttt{yield\_limit = 2 * spin\_limit}.
+\end{itemize}
+
+\subsection{Hybrid Qwen3.5 Execution and \texttt{AsiRuntimeConfig} (\texttt{asi\_arch.c})}
+\texttt{asi\_arch.c} executes \texttt{g\_asi\_arch\_hybrid\_qwen35} across \texttt{QWEN35\_LAYER\_DELTANET} (1D causal convolution via AVX2 \texttt{\_MM\_TRANSPOSE4\_PS} + \texttt{lila\_expf\_avx2} in \texttt{asi\_conv1d\_worker} plus tiled recurrent DeltaNet updates) and \texttt{QWEN35\_LAYER\_FULL\_ATTN} (gated Q/K/V attention, Q/K RMSNorm, partial RoPE, grouped GQA KV reuse in \texttt{asi\_kv\_prep\_batch\_worker}/\texttt{asi\_full\_attn\_batch\_worker}, FP16 KV caches). During prefill, \texttt{qwen35\_forward\_batch} processes chunks up to \texttt{chunk\_max = 512} tokens using parallel \texttt{asi\_norm\_quant\_pool} and 64-byte aligned scratch (\texttt{ensure\_batch\_scratch}), while \texttt{q4k\_matmul\_batch\_q8k\_range} and \texttt{q6k\_matmul\_batch\_q8k\_range} unpack each weight row once per chunk into L1d and accumulate into a contiguous \texttt{tile\_out} transpose buffer.
+
+During decode, \texttt{asi\_matvec\_range} now wires both \texttt{q4k\_dot2\_q8k\_avx2} and \texttt{q6k\_dot2\_q8k\_avx2} controlled by \texttt{AsiRuntimeConfig}:
+
+\begin{lstlisting}[caption={ASI v2.2 runtime tuning, prefix cache, and audit environment variables.}]
+LILA_ASI_Q6K_DOT2=1                # Default 1 in v2.2 (2-row Q6_K dot2)
+LILA_ASI_Q4K_DOT2=1                # Default 1 in v2.2 (2-row Q4_K dot2)
+LILA_ASI_MATVEC_CHUNK=64           # Dynamic atomic row chunk (general matvec)
+LILA_ASI_LMHEAD_CHUNK=512          # Dynamic atomic row chunk (248k-row lm_head)
+LILA_ASI_FUSED_CHUNK=32            # Batch chunk size for fused projections
+LILA_ASI_BATCH_CHUNK_MAX=512       # Max chunk tokens in qwen35_forward_batch
+LILA_ASI_SPIN_LIMIT                # Override AsiThreadPool spin_limit (yield=2x)
+LILA_ASI_PREFIX_CACHE_MAX_FILES=8  # LRU cap on .asip disk prefix snapshots
+LILA_ASI_PREFIX_CACHE_DIR          # Custom directory (host sets memory_dir/prefix_cache)
+LILA_ASI_DISABLE_DISK_PREFIX       # Disable automatic disk snapshot persistence
+LILA_ASI_VERIFY_CRC=1              # Force eager CRC-64 check on bulk weight blobs
+LILA_ASI_FP32_REF=1                # Bypass Q8_K quantization for FP32-Ref auditing
+LILA_ASI_PROFILE=1                 # Emit per-stage decode latency ([PROF token pos=...])
+\end{lstlisting}
+
+\subsection{Crash-Safe Disk-Persisted Prefix Snapshot (\texttt{ASIPFX02})}
+To persist evaluated system prompts across cold subprocess restarts:
+\begin{itemize}
+    \item \textbf{Validated Binary Format:} \texttt{AsiPrefixSnapshotHeader} (144\,bytes, \texttt{\_Static\_assert}-checked in \texttt{asi\_arch.c}) carries magic \texttt{"ASIPFX02"}, \texttt{LILA\_ASI\_NUMERICS\_VERSION} (\texttt{2U}), model geometry/identity binding, and independent \textbf{CRC-64 ECMA} checksums \texttt{header\_crc64} and \texttt{payload\_crc64} protecting serialized DeltaNet and KV states.
+    \item \textbf{Atomic Write Protocol:} \texttt{lila\_asi\_session\_save\_prefix\_file} writes \texttt{<filepath>.tmp.<pid>}, calls \texttt{fflush} and \texttt{fsync}, and atomically promotes via \texttt{rename}. \texttt{lila\_asi\_session\_load\_prefix\_file} validates magic, version, header CRC-64, and payload CRC-64 before mutating live session buffers.
+    \item \textbf{Private LRU Host Cache:} \texttt{AsiLlamaAdapter.\_compute\_prefix\_key\_hash} hashes \texttt{b"ASIPFX02"}, cartridge \texttt{identity\_hash}, \texttt{arch\_id}, \texttt{fp32\_ref}, token count, UTF-8 system text, and integer token IDs into \texttt{prefix\_<hex16>.asip}. Cache directories are created with \texttt{0o700} (\texttt{secure\_private\_directory}) and snapshots with \texttt{0o600} (\texttt{restrictive\_umask()}), bounded by LRU eviction (\texttt{LILA\_ASI\_PREFIX\_CACHE\_MAX\_FILES=8}) and wired into \texttt{LilaCore.\_boot\_gguf()} at \texttt{Path(self.memory\_dir) / "prefix\_cache"}.
+\end{itemize}
+
+\section{Quantization and SIMD Kernel Design}
+
+All quantized dot products and batched GEMMs reside in \texttt{source/engine/runtime/q4k.h}.
+
+\subsection{Activation Quantization (\texttt{LilaQ8KBlock}) and 2-Row \texttt{dot2} Reuse}
+FP32 activations are quantized dynamically into 256-element \texttt{LilaQ8KBlock} structs containing symmetric scale $d = \max_{0 \le i < 256}|x_i| / 127$, \texttt{int8\_t qs[256]}, and 16 sub-block sums \texttt{int16\_t bsums[16]}. In batched prefill, \texttt{quantize\_vec\_q8k\_strided} stores activations in block-major, token-strided order (\texttt{qx\_all + (size\_t)b * n\_tokens + tok}) so one weight block feeds 4 tokens simultaneously. In single-token decode, \texttt{q4k\_dot2\_q8k\_avx2} and \texttt{q6k\_dot2\_q8k\_avx2} keep \texttt{qx[b]} resident in registers across two adjacent weight rows (\texttt{row}, \texttt{row+1}), halving activation load traffic across DRAM-heavy \texttt{lm\_head}, \texttt{ffn}, and \texttt{dn\_proj} layers.
+
+\subsection{AVX-512 Bit-Exact Reduction, Branchless Scales, and ISA Compile Audit}
+In v2.2, \texttt{\#if defined(\_\_AVX512F\_\_)} kernels in \texttt{q4k.h} and \texttt{asi\_arch.c} were refactored to fold their 256-bit lanes into the bit-exact 8-lane \texttt{\_\_m256 sum\_vec} + \texttt{lila\_hsum\_f32\_avx2} reduction tree and shared \texttt{tile\_out} unpack (\texttt{lila\_q4k\_unpack\_row\_avx2}, \texttt{lila\_q6k\_unpack\_row\_avx2}) used by \texttt{\#if defined(\_\_AVX2\_\_)}. Additionally, branchy \texttt{get\_scale\_min\_k4} indexing inside \texttt{Q4\_K} inner loops was replaced by \texttt{lila\_q4k\_unpack\_scales\_avx2}. Table~\ref{tab:isa_matrix} summarizes ISA coverage across physical execution and compile audits.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+Kernel / ISA Path & Key Instructions / Fallback & Verification Status \\
+\midrule
+AVX2 + FMA + F16C (\texttt{\_\_AVX2\_\_}) & \texttt{\_mm256\_maddubs\_epi16}, \texttt{\_mm256\_fmadd\_ps}, \texttt{\_cvtsh\_ss} & \textbf{Hardware-verified} (\texttt{i5-5300U}) \\
+AVX-512F/BW/DQ/VL (\texttt{\_\_AVX512F\_\_}) & Bit-exact \texttt{\_\_m256 sum\_vec} + \texttt{lila\_hsum\_f32\_avx2} & \textbf{Compile/audit-verified} (needs HW run) \\
+AVX-512-VNNI / AVX-VNNI & \texttt{\_mm512\_dpbusd\_epi32}, \texttt{\_mm256\_dpbusd\_epi32} & \textbf{Compile/audit-verified} (needs HW run) \\
+Non-\texttt{F16C} \& Scalar Fallback & Software \texttt{fp16\_to\_fp32}, scalar dot/GEMM & \textbf{Compile-verified} + \texttt{ASan+UBSan+LSan} \\
+ARM64 NEON / DotProd (\texttt{\_\_aarch64\_\_}) & \texttt{vdotq\_s32} / \texttt{vmull\_s8} & \textbf{Audit/code-verified} (needs ARM64 HW) \\
+\bottomrule
+\end{tabular}
+\caption{Multi-ISA kernel inventory and v2.2 verification status in \texttt{q4k.h} and \texttt{asi\_arch.c}.}
+\label{tab:isa_matrix}
+\end{table}
+
+\section{Correctness and G0 Claim Gate}
+
+Quantized integer-SIMD divergence must be audited end-to-end across all 24 layers because tight top-1/top-2 logit ties can branch greedy trajectories. ASI v2.2 combines unit checks with the automated \textbf{G0 gate} in \texttt{claim\_check.py}:
+
+\begin{enumerate}
+    \item \textbf{Unit and Snapshot Integrity (\texttt{test\_quant\_kernels.c}, \texttt{test\_asi\_v2.c}):} Validates \texttt{Q4\_K}/\texttt{Q6\_K} matvec relative $L_2 < 0.01$ vs.\ scalar FP32 dequantization, cartridge metadata and CRC-64 corruption rejection, and \texttt{ASIPFX02} disk prefix round-trip equality (\texttt{memcmp == 0}) plus tamper rejection.
+    \item \textbf{Host Integration (\texttt{qualify\_asi\_backend.py}):} Executes 6 end-to-end checks on \texttt{AsiLlamaAdapter} and \texttt{LilaDaemon}: batch-vs-token parity, multi-turn tool calls, cancellation/session isolation, disk prefix cache persistence (\texttt{hit\_b='disk'}) and invalidation (\texttt{mut\_hit='miss'}) with 5-cycle RSS check, mTLS \texttt{/chat}, and controlled latencies.
+    \item \textbf{Formal G0 Correctness Gate (\texttt{test\_correctness\_gate.py}, \texttt{claim\_check.py}):} Evaluates \texttt{Qwen3.5-0.8B} (\texttt{n\_ctx=512}, \texttt{n\_threads=2}, \texttt{N\_GEN=64} over 5 prompts = 320 positions) across \texttt{ASI(token)}, \texttt{ASI(batch)}, \texttt{llama.cpp}, and \texttt{ASI(FP32-Ref)} (\texttt{LILA\_ASI\_FP32\_REF=1}). Let $\mathrm{RelL2}(z, z_{\mathrm{ref}}) = \|z - z_{\mathrm{ref}}\|_2 / (\|z_{\mathrm{ref}}\|_2 + \epsilon)$ over the 248,320-token vocabulary logits; passing G0 requires:
+\end{enumerate}
+
+\begin{equation}
+\label{eq:g0_gate}
+\mathrm{Agree}_{\mathrm{batch,tok}} = 100\%,\quad
+\mathrm{Agree}_{\mathrm{TF}} \ge 98.0\%,\quad
+R_{\mathrm{FP32}} = \frac{\overline{\mathrm{RelL2}}(\mathrm{ASI}, \mathrm{FP32\text{-}Ref})}{\overline{\mathrm{RelL2}}(\mathrm{llama.cpp}, \mathrm{FP32\text{-}Ref})} \le 1.05,
+\end{equation}
+over $\ge 320$ positions, alongside $\ge 5$ independent subprocess determinism runs at \texttt{threads=1,2} with zero intra- or cross-thread token divergence.
+
+\section{Experimental Methodology, Roofline Harness, and G1 Gate}
+
+\subsection{Benchmark Hygiene (\texttt{bench\_strict\_bar.py})}
+Both Broadwell and Colab evaluations share the exact GGUF (\texttt{Qwen3.5-0.8B-heretic-Q4\_K\_M-imatrix.gguf}, SHA-256 \texttt{d9662c91079317aee661a1475d61412787696e0dcc5636c39648fb27d49e1edf}) and \texttt{.asi} cartridge (SHA-256 \texttt{757731964e8a24950f3ae743be9df81ca5671f15b014aa45c31868131679e9f0}, 642,277,376\,B). Prompts (\texttt{T1\_PROMPT}: 53 tokens; \texttt{T2\_DELTA}: 27 tokens; \texttt{LONG\_PROMPT}: 939 tokens) are tokenized once into matching \texttt{int32} token-ID arrays, executed under matched parameters (\texttt{n\_ctx=2048}, \texttt{n\_threads=n\_threads\_batch=2}, \texttt{n\_batch=512}, \texttt{use\_mmap=True}, \texttt{flash\_attn=False}, greedy sampling, verified \texttt{t2\_eval\_tokens == 27}) in interleaved subprocess pairs after 1 discarded warmup per engine, with mandatory \texttt{-{}-prepopulate} (\texttt{madvise(MADV\_WILLNEED)} + 4\,KiB page touch).
+
+\subsection{Hardware Roofline Harness (\texttt{bench\_roofline.c})}
+\texttt{bench\_roofline} measures 256\,MiB AVX2 sequential read-only bandwidth ($BW_{\mathrm{DRAM\text{-}RO}}$), 80\,MiB STREAM Copy/Triad, isolated L3 (2\,MiB) and DRAM (64\,MiB) \texttt{Q4\_K}/\texttt{Q6\_K} \texttt{dot1}/\texttt{dot2} throughput, exact active decode bytes $W_{\mathrm{active}}$, and 32-token full-model decode against the DRAM-bound roofline:
+\begin{equation}
+\label{eq:roofline}
+T_{\mathrm{dram}} = \frac{W_{\mathrm{active}}}{BW_{\mathrm{DRAM\text{-}RO}}},\qquad
+\mathrm{TPS}_{\mathrm{roof}} = \frac{1}{T_{\mathrm{dram}}},\qquad
+U_{\mathrm{RO}} = \frac{W_{\mathrm{active}} \cdot \mathrm{TPS}_{\mathrm{meas}}}{BW_{\mathrm{DRAM\text{-}RO}}} \times 100\%.
+\end{equation}
+
+\subsection{Formal G1 Statistical Claim Gate (\texttt{claim\_check.py})}
+To distinguish validated speedups from zero-overlap thresholds, \texttt{claim\_check.py} enforces statistical criteria over $N \ge 15$ pairs with two-sided Mann--Whitney $U$ ($p$), 2,000-resample 95\% bootstrap CIs, and $p_5/p_{95}$ tail ratios:
+\begin{equation}
+\label{eq:g1_rules}
+g_{\downarrow} = \frac{m_{\mathrm{llama}} - m_{\mathrm{ASI}}}{m_{\mathrm{llama}}},\quad
+g_{\uparrow} = \frac{m_{\mathrm{ASI}} - m_{\mathrm{llama}}}{m_{\mathrm{llama}}},\quad
+\mathrm{TailR}_{\downarrow} = \frac{p_{95,\mathrm{ASI}}}{p_{95,\mathrm{llama}}} \le 1.10,\quad
+\mathrm{TailR}_{\uparrow} = \frac{p_{5,\mathrm{ASI}}}{p_{5,\mathrm{llama}}} \ge 0.90.
+\end{equation}
+A metric earns \textbf{\texttt{WIN}} if $N \ge 15$, $g \ge 0.03$, $p < 0.01$, and its tail ratio passes; it earns \textbf{\texttt{STRONG WIN}} if additionally $[\min_{\mathrm{ASI}}, \max_{\mathrm{ASI}}]$ and $[\min_{\mathrm{llama}}, \max_{\mathrm{llama}}]$ do not overlap. Overall tier \textbf{\texttt{BEATS}} requires $\ge 1$ primary \texttt{WIN} (\texttt{t1\_ttft}, \texttt{t1\_dec}, \texttt{t2\_ttft}, \texttt{t2\_dec}, or \texttt{long\_prefill\_tps}), $0$ primary losses, and a \texttt{WIN}/\texttt{STRONG WIN} on \texttt{rss\_mb}. \texttt{claim\_check.py} and \texttt{colab\_asi\_benchmark.ipynb} also record \texttt{/proc/stat} \texttt{steal\_jiffies} telemetry to expose hypervisor preemption on shared VMs.
+
+\section{Experimental Results, Roofline Reconciliation, and Ablations}
+
+\subsection{Roofline Reconciliation and Active Weight Breakdown (\texttt{roofline\_broadwell.json})}
+Earlier isolated \texttt{bench\_dot} tests operated on $\sim$2\,MiB of \texttt{Q4\_K} weights resident inside the 3\,MiB Broadwell L3 cache (27--42\,GFLOP/s). By contrast, \texttt{bench\_roofline} shows that full-model \texttt{Qwen3.5-0.8B} (\texttt{320} tensors, \texttt{repacked\_tensors=0}, \texttt{tied\_embeddings=true}, \texttt{vocab\_size=248320}, \texttt{n\_embd=1024}, \texttt{n\_layers=24}) streams \textbf{$W_{\mathrm{active}} = 518{,}335{,}744$\,B (518.34\,MB)} from DRAM per generated token:
+\begin{itemize}
+    \item \textbf{\texttt{Q6\_K}: 297,185,280\,B (297.19\,MB, 57.3345\%)} --- led by tied \texttt{token\_embd}/\texttt{lm\_head} at \textbf{208,588,800\,B (208.59\,MB, 40.2420\% of all active bytes)}, plus \texttt{attn\_qkv} (51,609,600\,B, 9.9568\%), \texttt{ffn\_down} (36,126,720\,B, 6.9698\%), and \texttt{other} (860,160\,B, 0.1659\%).
+    \item \textbf{\texttt{Q4\_K}: 219,156,480\,B (219.16\,MB, 42.2808\%)} --- \texttt{attn\_qkv} (28,311,552\,B, 5.4620\%), \texttt{ffn\_down} (24,772,608\,B, 4.7793\%), and \texttt{other} (166,072,320\,B, 32.0395\%).
+    \item \textbf{\texttt{F32}: 1,993,984\,B (1.99\,MB, 0.3847\%)}.
+\end{itemize}
+
+\begin{table}[h]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Benchmark / Metric & Locality / Unit & 1T Median (\emph{best}) & 2T Median (\emph{best}) \\
+\midrule
+\texttt{avx2\_dram\_read\_only} & 256\,MiB DRAM (GB/s) & 11.53 (11.98) & 12.08 (13.59) \\
+\texttt{stream\_copy} / \texttt{triad} & 80\,MiB DRAM (GB/s) & 7.84 (9.24) / 9.66 (10.36) & 8.26 (8.74) / 5.70 (9.42) \\
+\texttt{l3\_q4k\_dot1} / \texttt{dot2} & 2\,MiB L3 (GB/s; GFLOP/s) & 7.60 (27.00) / 7.80 (27.74) & 11.82 (42.02) / 11.05 (39.30) \\
+\texttt{l3\_q6k\_dot1} / \texttt{dot2} & 2\,MiB L3 (GB/s; GFLOP/s) & 7.56 (18.43) / 7.43 (18.11) & 12.71 (30.98) / 14.01 (34.17) \\
+\texttt{dram\_q4k\_dot1} / \texttt{dot2} & 64\,MiB DRAM (GB/s) & 5.78 (6.68) / 3.82 (4.30) & 11.06 (11.16) / 3.90 (7.54) \\
+\texttt{dram\_q6k\_dot1} / \texttt{dot2} & 64\,MiB DRAM (GB/s) & 6.60 (6.86) / 5.73 (6.07) & 5.85 (7.60) / 6.36 (6.77) \\
+Full \texttt{bench\_roofline} (32\,tok) & 518.34\,MB/tok & 7.11\,tok/s (140.68\,ms, 3.68\,GB/s, 31.9\% RO) & 10.38\,tok/s (96.31\,ms, 5.38\,GB/s, 44.6\% RO) \\
+\bottomrule
+\end{tabular}
+\caption{Broadwell (\texttt{i5-5300U}) hardware memory ceilings, isolated L3 vs.\ DRAM kernels (parentheses show median GFLOP/s for L3 kernels and best GB/s for DRAM/STREAM), and full-model decode reconciliation (\texttt{roofline\_broadwell.json}).}
+\label{tab:roofline}
+\end{table}
+
+Table~\ref{tab:roofline} bounds pure DRAM-limited decode at 23.31\,tok/s (2T) and 22.25\,tok/s (1T). At 1T, isolated DRAM matvec rates predict 109.18\,ms/tok (9.16\,tok/s; 47.5\% \texttt{Q6\_K}, 52.5\% \texttt{Q4\_K}) plus a 31.50\,ms/tok (22.4\%) non-matvec/dispatch residual; at 2T, the 3.90\,GB/s isolated \texttt{dram\_q4k\_dot2} microbenchmark slightly over-penalizes real multi-threaded decode (9.71\,tok/s predicted vs.\ 10.38\,tok/s measured).
+
+\subsection{\texorpdfstring{$3 \times 32$}{3x32}-Token \texttt{dot1}/\texttt{dot2} Ablation and Per-Stage Decode Profile}
+Table~\ref{tab:dot2_ablation} summarizes $3 \times 32$-token full-model decode ablations on idle Broadwell after wiring \texttt{q6k\_dot2\_q8k\_avx2} into \texttt{asi\_matvec\_range}. Enabling \texttt{dot2} on both \texttt{Q6\_K} and \texttt{Q4\_K} improves 2T median decode by \textbf{$+52.9\%$} (8.88 to 13.58\,tok/s) and tightens spread to 0.14\,tok/s. Under \texttt{LILA\_ASI\_PROFILE=1} at 2T (\texttt{dot2=1/1}, $\sim$68\,ms/tok), stage latency breaks down as: \texttt{lm\_head} ($248{,}320 \times 1024$ \texttt{Q6\_K}) $\approx$ 23--26\,ms ($\sim$36\%), \texttt{ffn} $\approx$ 18--21\,ms ($\sim$29\%), \texttt{dn\_proj} $\approx$ 13--16\,ms ($\sim$22\%), \texttt{ssm} $\approx$ 3.2--4.0\,ms ($\sim$5\%), \texttt{fa\_proj} $\approx$ 2.7--3.7\,ms ($\sim$5\%), \texttt{fa\_gqa} $\approx$ 0.10\,ms ($<0.2\%$), and \texttt{norm} $\approx$ 0.06\,ms ($<0.1\%$).
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}cccll@{}}
+\toprule
+\texttt{Q6K\_DOT2} & \texttt{Q4K\_DOT2} & 1T Med \texttt{[min..max]} (tok/s) & 2T Med \texttt{[min..max]} (tok/s) & Notes \\
+\midrule
+0 & 0 & \texttt{7.83 [5.46..8.91]} & \texttt{8.88 [7.95..10.89]} & Baseline \texttt{dot1} on both formats \\
+0 & 1 & \texttt{8.29 [7.76..8.30]} & \texttt{12.19 [9.22..12.81]} & \texttt{Q4\_K} \texttt{dot2} only \\
+1 & 0 & \texttt{8.01 [7.96..8.82]} & \texttt{11.37 [9.63..14.13]} & \texttt{Q6\_K} \texttt{dot2} only \\
+\textbf{1} & \textbf{1} & \textbf{\texttt{8.14 [8.09..9.24]}} & \textbf{\texttt{13.58 [13.49..13.63]}} & \textbf{v2.2 default ($+52.9\%$ 2T vs.\ 0/0)} \\
+\bottomrule
+\end{tabular}
+\caption{$3 \times 32$-token full-model decode \texttt{dot1}/\texttt{dot2} ablation on idle Broadwell (\texttt{i5-5300U}).}
+\label{tab:dot2_ablation}
+\end{table}
+
+\subsection{Qualification and G0 Correctness Results (\texttt{correctness\_broadwell\_n64.json})}
+\begin{itemize}
+    \item \textbf{Snapshot \& Host Qualification:} \texttt{test\_asi\_v2} passed CRC-64 checks and \texttt{ASIPFX02} verification (\texttt{Disk prefix round-trip diff=0.000000 (memcmp=0)} plus tamper rejection). \texttt{qualify\_asi\_backend.py} reported \texttt{ALL 6 ASI QUALIFICATION CHECKS PASSED}, including disk cache persistence (\texttt{hit\_b='disk'}) and mutation invalidation (\texttt{mut\_hit='miss'}).
+    \item \textbf{G0 Gate (\texttt{N\_GEN=64}, 320 positions, \texttt{vocab\_compared=248320}):}
+    \begin{itemize}
+        \item \texttt{batch\_vs\_token}: \textbf{320/320 (100.0\%)}, \texttt{max\_abs\_diff = 0.0}, \texttt{max\_rel\_l2 = 0.0} (\texttt{PASS}). Free-running greedy vs.\ \texttt{llama.cpp} is \texttt{238/320 (74.38\%)} (\texttt{tool\_use}: 100.0\%, \texttt{multiturn}: 95.3\% [div 34], \texttt{math}: 87.5\% [div 23], \texttt{code}: 46.9\% [div 29], \texttt{factual}: 42.2\% [div 24]).
+        \item \texttt{teacher\_forced}: \textbf{\texttt{ASI vs llama.cpp = 316/320 (98.75\%)}}, \textbf{\texttt{ASI vs FP32-Ref = 315/320 (98.44\%)}}, \texttt{llama.cpp vs FP32-Ref = 316/320 (98.75\%)} (\texttt{PASS}).
+        \item \texttt{fp32\_ref}: \texttt{ASI} Rel-$L_2$ mean \texttt{0.047385} (median \texttt{0.038031}, max \texttt{0.404697}) vs.\ \texttt{llama.cpp} mean \texttt{0.047615} (median \texttt{0.038385}, max \texttt{0.342743}), ratio \textbf{$R_{\mathrm{FP32}} = 0.9952 \le 1.05$} (\texttt{PASS}). All 4 flips (\texttt{ASI==Ref: 1}, \texttt{Llama==Ref: 2}, \texttt{Neither==Ref: 1}) occurred at near-tie \texttt{FP32-Ref} margins \texttt{0.050007..0.094835} (max \texttt{0.0948}).
+        \item \texttt{determinism}: \textbf{\texttt{PASS}} across 5 subprocesses at \texttt{threads=1,2} (32 tokens on \texttt{factual} and \texttt{tool\_use}) with exact \texttt{32/32} cross-thread agreement (\texttt{factual} SHA-256 \texttt{1f118f986237206116a3e68a054ffc510e7299367926205ebd6de27e87e64f28}, \texttt{tool\_use} SHA-256 \texttt{9c1ed37382f2530c696317fd60c5555a9dba4822235280178db635e7af22f85b}).
+    \end{itemize}
+\end{itemize}
+
+\subsection{G1 Claim Verdict (\texttt{claim\_verdict\_broadwell.json}) and Cross-Machine Context}
+Table~\ref{tab:g1_broadwell} reports the formal \texttt{claim\_check.py} evaluation on \texttt{results\_broadwell\_n15.json} ($N=15$, 2 threads). ASI achieves \textbf{\texttt{G1 Tier: BEATS}} (3 primary \texttt{WIN}s, 0 losses, \texttt{rss\_mb} \texttt{STRONG WIN}), \texttt{overall\_passed = true}, and allowed claim \emph{``Beats llama.cpp on Intel(R) Core(TM) i5-5300U CPU @ 2.30GHz (2 threads)''}. Note that the 15 raw pairs in \texttt{results\_broadwell\_n15.json} were captured on the pre-v2.2 build before \texttt{dot2=1} defaults, SMT spin-backoff, and \texttt{steal\_jiffies} telemetry (\texttt{has\_telemetry = false}).
+
+\begin{table}[h]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lllrrrl@{}}
+\toprule
+Metric (unit, dir, role) & ASI \texttt{med} / \texttt{[min..max]} (\texttt{p5/p95}) & \texttt{llama.cpp} \texttt{med} / \texttt{[min..max]} (\texttt{p5/p95}) & Gain & TailR & MWU $p$ & Verdict \\
+\midrule
+\texttt{t1\_ttft} (s, $\downarrow$, prim) & \shortstack[l]{\texttt{0.908}\\\scriptsize\texttt{[0.862..1.208]} \texttt{(0.864/1.128)}} & \shortstack[l]{\texttt{1.094}\\\scriptsize\texttt{[1.027..1.810]} \texttt{(1.031/1.604)}} & $+17.1\%$ & \texttt{0.703} & \texttt{0.00105} & \textbf{\texttt{WIN}} \\
+\texttt{t1\_dec} (tok/s, $\uparrow$, prim) & \shortstack[l]{\texttt{13.808}\\\scriptsize\texttt{[9.232..15.030]} \texttt{(9.378/14.968)}} & \shortstack[l]{\texttt{13.477}\\\scriptsize\texttt{[9.162..14.280]} \texttt{(10.426/14.278)}} & $+2.5\%$ & \texttt{0.900} & \texttt{0.3401} & \texttt{PARITY} \\
+\texttt{t2\_ttft} (s, $\downarrow$, prim) & \shortstack[l]{\texttt{0.487}\\\scriptsize\texttt{[0.459..0.953]} \texttt{(0.459/0.844)}} & \shortstack[l]{\texttt{0.607}\\\scriptsize\texttt{[0.559..0.839]} \texttt{(0.563/0.794)}} & $+19.9\%$ & \texttt{1.063} & \texttt{0.003691} & \textbf{\texttt{WIN}} \\
+\texttt{t2\_dec} (tok/s, $\uparrow$, prim) & \shortstack[l]{\texttt{13.062}\\\scriptsize\texttt{[10.792..14.722]} \texttt{(11.283/14.494)}} & \shortstack[l]{\texttt{12.889}\\\scriptsize\texttt{[10.098..13.918]} \texttt{(11.540/13.852)}} & $+1.3\%$ & \texttt{0.978} & \texttt{0.3615} & \texttt{PARITY} \\
+\texttt{long\_prefill\_tps} ($\uparrow$, prim) & \shortstack[l]{\texttt{52.799}\\\scriptsize\texttt{[44.701..55.541]} \texttt{(45.090/54.864)}} & \shortstack[l]{\texttt{46.213}\\\scriptsize\texttt{[40.022..50.272]} \texttt{(40.436/49.912)}} & $+14.3\%$ & \texttt{1.115} & \texttt{0.0003609} & \textbf{\texttt{WIN}} \\
+\texttt{rss\_mb} (MiB, $\downarrow$, mem) & \shortstack[l]{\texttt{616.266}\\\scriptsize\texttt{[616.188..616.469]} \texttt{(616.198/616.428)}} & \shortstack[l]{\texttt{978.223}\\\scriptsize\texttt{[978.105..978.410]} \texttt{(978.119/978.399)}} & $+37.0\%$ & \texttt{0.630} & \texttt{3.341e-06} & \textbf{\texttt{STRONG WIN}} \\
+\texttt{vm\_hwm\_mb} (MiB, $\downarrow$, sec) & \shortstack[l]{\texttt{638.824}\\\scriptsize\texttt{[638.602..638.988]} \texttt{(638.648/638.955)}} & \shortstack[l]{\texttt{1406.730}\\\scriptsize\texttt{[1406.504..1406.844]} \texttt{(1406.586/1406.836)}} & $+54.6\%$ & \texttt{0.454} & \texttt{3.375e-06} & \textbf{\texttt{STRONG WIN}} \\
+\texttt{load\_s} (s, $\downarrow$, sec) & \shortstack[l]{\texttt{0.053}\\\scriptsize\texttt{[0.052..0.100]} \texttt{(0.052/0.084)}} & \shortstack[l]{\texttt{2.182}\\\scriptsize\texttt{[1.991..3.216]} \texttt{(1.994/3.112)}} & $+97.5\%$ & \texttt{0.027} & \texttt{3.392e-06} & \textbf{\texttt{STRONG WIN}} \\
+\texttt{load\_open\_s} (s, $\downarrow$, sec) & \shortstack[l]{\texttt{0.027}\\\scriptsize\texttt{[0.026..0.048]} \texttt{(0.027/0.035)}} & \shortstack[l]{\texttt{2.156}\\\scriptsize\texttt{[1.966..3.192]} \texttt{(1.969/3.081)}} & $+98.7\%$ & \texttt{0.011} & \texttt{3.392e-06} & \textbf{\texttt{STRONG WIN}} \\
+\bottomrule
+\end{tabular}
+\caption{Formal G1 gate results on Broadwell \texttt{i5-5300U} ($N=15$, 2 threads, \texttt{claim\_verdict\_broadwell.json}).}
+\label{tab:g1_broadwell}
+\end{table}
+
+On Google Colab Xeon (\texttt{Intel(R) Xeon(R) CPU @ 2.20GHz}, 1 physical core / 2 SMT threads, AVX2+FMA, commit \texttt{4e73276}, $N=10$ pre-v2.2 pairs on the identical \texttt{d9662c91} GGUF), ASI achieved lower load latency (0.086 vs.\ 1.015\,s), faster Turn-1 TTFT (1.036 vs.\ 1.136\,s) and Turn-2 TTFT (0.552 vs.\ 0.654\,s), higher 939-token prefill (44.38 vs.\ 41.03\,tok/s), and lower memory (RSS 619.8 vs.\ 1107.9\,MiB; peak HWM 619.8 vs.\ 1381.7\,MiB), alongside SMT tail dips (\texttt{min=4.45/8.06\,tok/s}) on decode (12.90 vs.\ 13.80 and 12.73 vs.\ 13.64\,tok/s). Because \texttt{4e73276} had $N=10 < 15$ and predated v2.2's SMT spin-backoff (\texttt{spin\_limit=64}), \texttt{dot2=1} defaults, and \texttt{steal\_jiffies} telemetry, \texttt{colab\_asi\_benchmark.ipynb} is prepared for a full $N=15$, \texttt{threads=1,2} v2.2 cloud rerun.
+
+\section{Honest Limitations and Future Work}
+
+\begin{enumerate}
+    \item \textbf{Pre-v2.2 $N=15$ / $N=10$ Captures:} Both \texttt{results\_broadwell\_n15.json} (\texttt{G1 Tier: BEATS}) and Colab $N=10$ (\texttt{4e73276}) predate v2.2 (\texttt{dot2=1} defaults, SMT spin-backoff, and \texttt{/proc/stat} \texttt{steal\_jiffies} telemetry). Full $N=15$ G1 re-runs on Broadwell and Colab Xeon via \texttt{colab\_asi\_benchmark.ipynb} remain the immediate empirical priority.
+    \item \textbf{Compile-Only Wide-SIMD and ARM64 Paths:} Only AVX2 + FMA + F16C has been executed on physical silicon; AVX-512, AVX-512-VNNI, non-\texttt{F16C}, and ARM64 NEON branches are compile/audit-verified only and require execution on Sapphire Rapids/Zen~4 and ARM64 hardware.
+    \item \textbf{DRAM Ceiling and \texttt{lm\_head} Dominance:} On Broadwell (12.08\,GB/s DRAM-RO), 518.34\,MB/tok limits pure DRAM-bound decode to 23.31\,tok/s, with \texttt{lm\_head} consuming 40.24\% of active bytes ($\sim$36\% of decode latency).
+    \item \textbf{Lazy \texttt{mmap} Cold-Fault Tradeoff:} Skipping \texttt{LILA\_ASI\_VERIFY\_CRC=1} keeps \texttt{lila\_asi\_open} near 27\,ms, but without \texttt{-{}-prepopulate}, cold page faults shift into Turn-1 TTFT.
+    \item \textbf{Dense Architecture Dispatch:} \texttt{g\_asi\_arch\_hybrid\_qwen35} is complete and G0-verified, whereas \texttt{g\_asi\_arch\_dense\_transformer} currently registers \texttt{NULL} handlers in \texttt{asi\_arch.c}.
+\end{enumerate}
+
+\end{document}
