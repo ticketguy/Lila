@@ -1651,8 +1651,46 @@ static void asi_conv1d_worker(int tid, int n_threads, void *vctx)
     uint32_t k_conv = ctx->k_conv;
     uint32_t conv_hist = ctx->conv_hist;
     uint32_t qkv_dim = ctx->qkv_dim;
+    uint32_t B = ctx->B;
 
-    for (uint32_t t = 0; t < ctx->B; ++t)
+    if (conv_hist == 3 && k_conv == 4 && B >= 2)
+    {
+        float *cs0 = ctx->conv_state;
+        float *cs1 = ctx->conv_state + qkv_dim;
+        float *cs2 = ctx->conv_state + 2 * qkv_dim;
+        for (uint32_t t_tile = 0; t_tile < B; t_tile += 32)
+        {
+            uint32_t t_end = t_tile + 32;
+            if (t_end > B) t_end = B;
+            for (uint32_t ch = ch_start; ch < ch_end; ++ch)
+            {
+                const float *w = ctx->conv_w + (size_t)ch * 4;
+                float w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
+                float s0 = cs0[ch], s1 = cs1[ch], s2 = cs2[ch];
+                float *qp = ctx->qkvb + (size_t)t_tile * qkv_dim + ch;
+                for (uint32_t t = t_tile; t < t_end; ++t, qp += qkv_dim)
+                {
+                    float x = *qp;
+                    float sum = w3 * x + w0 * s0 + w1 * s1 + w2 * s2;
+                    s0 = s1;
+                    s1 = s2;
+                    s2 = x;
+                    *qp = sum;
+                }
+                cs0[ch] = s0;
+                cs1[ch] = s1;
+                cs2[ch] = s2;
+            }
+            for (uint32_t t = t_tile; t < t_end; ++t)
+            {
+                float *qkv = ctx->qkvb + (size_t)t * qkv_dim;
+                fast_silu_inplace_vec(qkv + ch_start, ch_end - ch_start);
+            }
+        }
+        return;
+    }
+
+    for (uint32_t t = 0; t < B; ++t)
     {
         float *qkv = ctx->qkvb + (size_t)t * qkv_dim;
         for (uint32_t ch = ch_start; ch < ch_end; ++ch)
@@ -2013,7 +2051,7 @@ static int qwen35_forward_batch(AsiArchSession *s,
         return qwen35_forward_token(s, token_ids[0], pos_start, out_last_logits);
     }
 
-    const uint32_t chunk_max = 128;
+    const uint32_t chunk_max = 512;
     uint32_t done = 0;
     asi_pool_begin(s->pool);
     while (done < n_tokens)
