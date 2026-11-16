@@ -610,6 +610,262 @@ fail_sessions:
     return 1;
 }
 
+static int32_t spec_argmax(const float *v, uint32_t n)
+{
+    uint32_t best = 0;
+    float bv = v[0];
+    for (uint32_t i = 1; i < n; ++i)
+    {
+        if (v[i] > bv)
+        {
+            bv = v[i];
+            best = i;
+        }
+    }
+    return (int32_t)best;
+}
+
+static int run_speculative_parity_tests(const char *model_path)
+{
+    char err[256] = {0};
+    LilaAsiModel *model = lila_asi_open(model_path, err, sizeof(err));
+    if (!model)
+    {
+        fprintf(stderr, "FAIL: lila_asi_open(%s) failed in spec test: %s\n", model_path, err);
+        return 1;
+    }
+    AsiV2ModelConfig cfg;
+    if (lila_asi_model_info(model, &cfg) != 0)
+    {
+        lila_asi_close(model);
+        return 1;
+    }
+    uint32_t vocab = cfg.vocab_size;
+    float *logits_ref = (float *)calloc(vocab, sizeof(float));
+    float *logits_spec = (float *)calloc(vocab, sizeof(float));
+    if (!logits_ref || !logits_spec)
+    {
+        free(logits_ref); free(logits_spec);
+        lila_asi_close(model);
+        return 1;
+    }
+
+    const char *old_spec_env = getenv("LILA_ASI_SPECULATIVE");
+    char *saved_spec = old_spec_env ? strdup(old_spec_env) : NULL;
+    const char *old_dl_env = getenv("LILA_ASI_SPEC_DRAFT_LEN");
+    char *saved_dl = old_dl_env ? strdup(old_dl_env) : NULL;
+
+    setenv("LILA_ASI_SPECULATIVE", "0", 1);
+    LilaAsiSession *s_ref = lila_asi_session_create(model, 128, 2, err, sizeof(err));
+    setenv("LILA_ASI_SPECULATIVE", "1", 1);
+    setenv("LILA_ASI_SPEC_DRAFT_LEN", "3", 1);
+    LilaAsiSession *s_spec = lila_asi_session_create(model, 128, 2, err, sizeof(err));
+
+    if (saved_spec) setenv("LILA_ASI_SPECULATIVE", saved_spec, 1); else unsetenv("LILA_ASI_SPECULATIVE");
+    if (saved_dl) setenv("LILA_ASI_SPEC_DRAFT_LEN", saved_dl, 1); else unsetenv("LILA_ASI_SPEC_DRAFT_LEN");
+    free(saved_spec);
+    free(saved_dl);
+
+    if (!s_ref || !s_spec)
+    {
+        fprintf(stderr, "FAIL: session_create failed in spec test: %s\n", err);
+        lila_asi_session_free(s_ref); lila_asi_session_free(s_spec);
+        free(logits_ref); free(logits_spec);
+        lila_asi_close(model);
+        return 1;
+    }
+
+    float max_diff_all = 0.0f;
+    uint32_t total_steps = 0, argmax_matches = 0;
+
+    /* 1. Prompt with repeated L>=3, L==2 patterns + 28 greedy decode steps */
+    int32_t greedy_prompt[12] = {
+        1 % (int32_t)vocab, 5 % (int32_t)vocab, 17 % (int32_t)vocab, 9 % (int32_t)vocab,
+        1 % (int32_t)vocab, 5 % (int32_t)vocab, 17 % (int32_t)vocab, 9 % (int32_t)vocab,
+        1 % (int32_t)vocab, 5 % (int32_t)vocab, 17 % (int32_t)vocab,
+        (vocab == 248320u) ? 248068 : (9 % (int32_t)vocab)
+    };
+    if (lila_asi_eval_batch(s_ref, greedy_prompt, 11, 0, logits_ref) != 0 ||
+        lila_asi_eval_batch(s_spec, greedy_prompt, 11, 0, logits_spec) != 0)
+    {
+        fprintf(stderr, "FAIL: spec test batch prefill failed\n");
+        goto fail_spec;
+    }
+    int32_t cur_tok = greedy_prompt[11];
+    for (uint32_t step = 0; step < 28; ++step)
+    {
+        uint32_t pos = 11u + step;
+        if (lila_asi_eval_token(s_ref, cur_tok, pos, logits_ref) != 0 ||
+            lila_asi_eval_token(s_spec, cur_tok, pos, logits_spec) != 0)
+        {
+            fprintf(stderr, "FAIL: spec greedy step %u failed\n", step);
+            goto fail_spec;
+        }
+        float d = max_abs_diff(logits_ref, logits_spec, vocab);
+        if (d > max_diff_all) max_diff_all = d;
+        int32_t ar = spec_argmax(logits_ref, vocab);
+        int32_t as = spec_argmax(logits_spec, vocab);
+        total_steps++;
+        if (ar == as) argmax_matches++;
+        if (d != 0.0f || ar != as)
+        {
+            fprintf(stderr, "FAIL: spec greedy parity mismatch at step=%u pos=%u diff=%.8g (%d vs %d)\n",
+                    step, pos, d, ar, as);
+            goto fail_spec;
+        }
+        cur_tok = ar;
+    }
+
+    /* 2. Scripted speculative misses (m=0), partial cache hits, mid-cache divergence, <think> */
+    lila_asi_session_reset(s_ref);
+    lila_asi_session_reset(s_spec);
+    int32_t script[24] = {
+        2 % (int32_t)vocab, 3 % (int32_t)vocab, 4 % (int32_t)vocab,
+        8 % (int32_t)vocab, 9 % (int32_t)vocab, 10 % (int32_t)vocab,
+        12 % (int32_t)vocab, 13 % (int32_t)vocab, 14 % (int32_t)vocab,
+        15 % (int32_t)vocab, 16 % (int32_t)vocab, 17 % (int32_t)vocab,
+        2 % (int32_t)vocab, 3 % (int32_t)vocab, 4 % (int32_t)vocab, /* triggers L>=3 -> draft [8,9,10] */
+        11 % (int32_t)vocab, /* wrong at draft[0] (miss / step-0 divergence) */
+        12 % (int32_t)vocab, 13 % (int32_t)vocab, 14 % (int32_t)vocab, /* triggers L>=3 -> draft [15,16,17] */
+        15 % (int32_t)vocab, /* step 0 token */
+        19 % (int32_t)vocab, /* diverge after step 0 (mid-cache divergence if m>=1) */
+        (vocab == 248320u) ? 248068 : (21 % (int32_t)vocab),
+        271 % (int32_t)vocab, /* if <think>, consumes step 0 */
+        22 % (int32_t)vocab   /* diverge before </think> */
+    };
+    if (lila_asi_eval_batch(s_ref, script, 12, 0, logits_ref) != 0 ||
+        lila_asi_eval_batch(s_spec, script, 12, 0, logits_spec) != 0)
+    {
+        goto fail_spec;
+    }
+    for (uint32_t p = 12; p < 24; ++p)
+    {
+        if (lila_asi_eval_token(s_ref, script[p], p, logits_ref) != 0 ||
+            lila_asi_eval_token(s_spec, script[p], p, logits_spec) != 0)
+        {
+            fprintf(stderr, "FAIL: scripted eval_token failed at pos=%u\n", p);
+            goto fail_spec;
+        }
+        float d = max_abs_diff(logits_ref, logits_spec, vocab);
+        if (d > max_diff_all) max_diff_all = d;
+        int32_t ar = spec_argmax(logits_ref, vocab);
+        int32_t as = spec_argmax(logits_spec, vocab);
+        total_steps++;
+        if (ar == as) argmax_matches++;
+        if (d != 0.0f || ar != as)
+        {
+            fprintf(stderr, "FAIL: scripted divergence parity mismatch at pos=%u diff=%.8g (%d vs %d)\n",
+                    p, d, ar, as);
+            goto fail_spec;
+        }
+    }
+
+    /* 3. Prefix save/restore + disk load under SPEC=1 vs SPEC=0 */
+    lila_asi_session_reset(s_ref);
+    lila_asi_session_reset(s_spec);
+    int32_t pfx_toks[8] = {
+        3 % (int32_t)vocab, 7 % (int32_t)vocab, 11 % (int32_t)vocab, 13 % (int32_t)vocab,
+        3 % (int32_t)vocab, 7 % (int32_t)vocab, 11 % (int32_t)vocab, 13 % (int32_t)vocab
+    };
+    if (lila_asi_eval_batch(s_ref, pfx_toks, 8, 0, logits_ref) != 0 ||
+        lila_asi_eval_batch(s_spec, pfx_toks, 8, 0, logits_spec) != 0 ||
+        lila_asi_session_save_prefix(s_ref, 8) != 0 ||
+        lila_asi_session_save_prefix(s_spec, 8) != 0)
+    {
+        goto fail_spec;
+    }
+    const char *spec_pfx_path = "/tmp/test_asi_v2_spec_pfx.bin";
+    uint8_t key_hash[32];
+    for (size_t i = 0; i < 32; ++i) key_hash[i] = (uint8_t)(0x55u + i);
+    if (lila_asi_session_save_prefix_file(s_spec, key_hash, spec_pfx_path) != 0)
+    {
+        goto fail_spec;
+    }
+    /* Pollute state + speculative cache past prefix, then restore in-memory prefix */
+    for (uint32_t k = 0; k < 5; ++k)
+    {
+        int32_t t = pfx_toks[k % 4];
+        if (lila_asi_eval_token(s_ref, t, 8u + k, logits_ref) != 0 ||
+            lila_asi_eval_token(s_spec, t, 8u + k, logits_spec) != 0)
+        {
+            goto fail_spec;
+        }
+    }
+    uint32_t rn_ref = 0, rn_spec = 0;
+    if (lila_asi_session_restore_prefix(s_ref, &rn_ref) != 0 ||
+        lila_asi_session_restore_prefix(s_spec, &rn_spec) != 0 ||
+        rn_ref != 8u || rn_spec != 8u)
+    {
+        fprintf(stderr, "FAIL: restore_prefix failed in spec test\n");
+        goto fail_spec;
+    }
+    for (uint32_t k = 0; k < 8; ++k)
+    {
+        int32_t t = (k == 0) ? (3 % (int32_t)vocab) : (k == 1 ? (7 % (int32_t)vocab) : ((int32_t)(20u + k) % (int32_t)vocab));
+        if (lila_asi_eval_token(s_ref, t, 8u + k, logits_ref) != 0 ||
+            lila_asi_eval_token(s_spec, t, 8u + k, logits_spec) != 0)
+        {
+            goto fail_spec;
+        }
+        float d = max_abs_diff(logits_ref, logits_spec, vocab);
+        if (d > max_diff_all) max_diff_all = d;
+        int32_t ar = spec_argmax(logits_ref, vocab);
+        int32_t as = spec_argmax(logits_spec, vocab);
+        total_steps++;
+        if (ar == as) argmax_matches++;
+        if (d != 0.0f || ar != as)
+        {
+            fprintf(stderr, "FAIL: post-restore parity mismatch at k=%u diff=%.8g\n", k, d);
+            goto fail_spec;
+        }
+    }
+    /* Also verify load_prefix_file parity */
+    lila_asi_session_reset(s_ref);
+    lila_asi_session_reset(s_spec);
+    if (lila_asi_session_load_prefix_file(s_ref, key_hash, spec_pfx_path, &rn_ref) != 0 ||
+        lila_asi_session_load_prefix_file(s_spec, key_hash, spec_pfx_path, &rn_spec) != 0 ||
+        rn_ref != 8u || rn_spec != 8u)
+    {
+        fprintf(stderr, "FAIL: load_prefix_file failed in spec test\n");
+        goto fail_spec;
+    }
+    for (uint32_t k = 0; k < 6; ++k)
+    {
+        int32_t t = (vocab == 248320u && k == 1) ? 248068 : ((int32_t)(30u + (k % 3u)) % (int32_t)vocab);
+        if (lila_asi_eval_token(s_ref, t, 8u + k, logits_ref) != 0 ||
+            lila_asi_eval_token(s_spec, t, 8u + k, logits_spec) != 0)
+        {
+            goto fail_spec;
+        }
+        float d = max_abs_diff(logits_ref, logits_spec, vocab);
+        if (d > max_diff_all) max_diff_all = d;
+        int32_t ar = spec_argmax(logits_ref, vocab);
+        int32_t as = spec_argmax(logits_spec, vocab);
+        total_steps++;
+        if (ar == as) argmax_matches++;
+        if (d != 0.0f || ar != as)
+        {
+            fprintf(stderr, "FAIL: post-disk-load parity mismatch at k=%u diff=%.8g\n", k, d);
+            goto fail_spec;
+        }
+    }
+    unlink(spec_pfx_path);
+
+    printf("PASS: Speculative parity (%s): steps=%u argmax=%u/%u max_diff=%.6f\n",
+           model_path, total_steps, argmax_matches, total_steps, max_diff_all);
+    lila_asi_session_free(s_ref); lila_asi_session_free(s_spec);
+    free(logits_ref); free(logits_spec);
+    lila_asi_close(model);
+    return 0;
+
+fail_spec:
+    unlink("/tmp/test_asi_v2_spec_pfx.bin");
+    lila_asi_session_free(s_ref); lila_asi_session_free(s_spec);
+    free(logits_ref); free(logits_spec);
+    lila_asi_close(model);
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2)
@@ -648,6 +904,7 @@ int main(int argc, char **argv)
     }
 
     int rc = run_session_and_prefix_tests(synth_a, synth_b);
+    if (rc == 0) rc = run_speculative_parity_tests(synth_a);
     unlink(synth_a);
     unlink(synth_b);
     if (rc != 0) return rc;
@@ -655,6 +912,7 @@ int main(int argc, char **argv)
     if (ext_session_path)
     {
         rc = run_session_and_prefix_tests(ext_session_path, NULL);
+        if (rc == 0) rc = run_speculative_parity_tests(ext_session_path);
         if (rc != 0) return rc;
     }
 

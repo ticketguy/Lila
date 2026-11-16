@@ -259,6 +259,20 @@ To test whether zero-training speculative verification and vocabulary narrowing 
   2. *Unsound heuristic `lm_head` margin gating:* Under `LILA_ASI_LMHEAD_SHORTLIST=1`, `english_qa` step 8 replaced token `40755` (`" Tables"`, page `159`, outside `0..32767` and unvisited in `token_history`) with `6424` (`" Table"`, page `25`), breaking greedy parity (`eq_v2.2 = false`). Exact `lm_head` pruning requires provable Cauchy-Schwarz / row-norm upper bounds rather than empirical Stage-1 logit margins.
   3. *Revert to `v2.2`:* All 4 prototype C files were reverted cleanly to **`v2.2`** (`dot2=1/1`, `621.6 MiB` RSS), preserving `100%` greedy parity and maintaining `v2.2`'s clear decode lead over `llama.cpp` across `t1_dec` (`14.15` vs `12.12`), `t2_dec` (`12.92` vs `12.24`), `english_qa` (`13.50` vs `13.15`), `rag_edit` (`13.29` vs `12.17`), `tool_json` (`13.56` vs `10.60`), and `spanish` (`12.08` vs `11.56`).
 
+### 8.6 ASI v2.3 — Kernel Vectorization & Zero-Rollback Stack-Scratch Speculation (Trial 12)
+
+Building on Trial 11's root-cause findings, Trial 12 ships **ASI v2.3** (`LILA_ASI_SPECULATIVE=1` default, `LILA_ASI_LMHEAD_SHORTLIST=0`) with four targeted fixes across [`q4k.h`](file:///home/ticket/workspaces/lila/source/engine/runtime/q4k.h), [`asi_arch.h`](file:///home/ticket/workspaces/lila/source/engine/asi/asi_arch.h), [`asi_arch.c`](file:///home/ticket/workspaces/lila/source/engine/asi/asi_arch.c), and [`lila_asi.c`](file:///home/ticket/workspaces/lila/source/engine/asi/lila_asi.c):
+1. **Pure-SIMD `Q4_K` scale broadcasts & 32-byte aligned `LilaQ8KBlock`:** Doubles isolated `64 MiB` DRAM `Q4_K dot2` bandwidth on Broadwell from `3.82 / 3.90 GB/s` (1T/2T) to **`7.43 / 7.58 GB/s`** ([`roofline_broadwell.json`](file:///home/ticket/workspaces/lila/source/paper/roofline_broadwell.json)).
+2. **Parallel `conv1d` & `full_attn`:** Parallelizes causal convolution and full-attention loops across the thread pool.
+3. **Register-direct small-batch GEMM (`B <= 4`):** Eliminates temporary reduction buffers for small-batch quantized GEMM.
+4. **Zero-rollback stack-scratch speculation (`>= 2-gram` strict):** Replaces the `+25.5 MiB` 18-layer DeltaNet snapshot/replay with stack-allocated scratch state (`+4.11 MiB` RSS vs `v2.2`: `625.67` vs `621.56 MiB`) and disables permissive `1-gram` triggers.
+
+- **Verification Gates (`v2.3` on Idle Broadwell):**
+  - *G0 Strict ([`correctness_broadwell_n64.json`](file:///home/ticket/workspaces/lila/source/paper/correctness_broadwell_n64.json)):* `batch_vs_token = 320/320` (`100.00%`, `0.0` diff), `teacher_forced = 316/320` (`98.75%`), `ASI Rel-L2 = 0.047385` (`ratio = 0.9952 <= 1.05`), `5`-run determinism `PASS` (`threads = 1, 2`) -> **`OVERALL G0 VERDICT: PASS`**.
+  - *Qualification ([`qualify_asi_backend.py`](file:///home/ticket/workspaces/lila/source/engine/tests/qualify_asi_backend.py)):* **6/6 PASS** (live `LilaDaemon` mTLS `/chat` 200 in `1.4s`, `N = 5` `t1_dec = 13.68` vs `13.18`, `t2_dec = 14.38` vs `12.12 tok/s`, `load = 0.42` vs `2.09 s`).
+  - *Claim Check ([`claim_verdict_broadwell.json`](file:///home/ticket/workspaces/lila/source/paper/claim_verdict_broadwell.json)):* `all_passed: true` (`G0: PASS`, `G1 Tier: BEATS` on `results_broadwell_n15.json`).
+  - *Ablation (`trial12_ablation_n3.json`) & 6-Prompt Suite (`trial12_multilang.json`, `N = 3`, `n_gen = 64`):* `100%` lossless greedy parity with `v2.2` across all prompts (`eq_v2.2 = true`). `v2.3_spec` outperforms `llama.cpp` on all 6 multilingual/agentic prompts (`english_qa`: `12.45` vs `12.13`; `rag_edit`: `12.63` vs `10.10`; `tool_json`: `13.61` vs `10.08`; `french`: `14.47` vs `10.70`; `spanish`: `14.26` vs `11.28`; `yoruba`: `16.04` vs `11.46 tok/s`).
+
 ---
 
 ## 9. Honest Limitations & Future Work

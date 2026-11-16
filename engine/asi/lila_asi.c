@@ -169,6 +169,11 @@ int lila_asi_eval_token(LilaAsiSession *session,
 {
     if (!session || !session->model || !session->model->handler) return -1;
     omp_set_num_threads((int)session->n_threads);
+    if (session->model->handler->forward_speculative)
+    {
+        return session->model->handler->forward_speculative(
+            session->arch_session, token_id, pos, out_logits);
+    }
     return session->model->handler->forward_token(session->arch_session, token_id, pos, out_logits);
 }
 

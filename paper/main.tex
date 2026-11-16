@@ -349,6 +349,19 @@ Two root causes explain why all four C prototype files (\texttt{asi\_arch.h}, \t
 \end{enumerate}
 Reverting to \texttt{v2.2} (\texttt{dot2=1/1}, 621.6\,MiB RSS) preserves exact greedy parity while maintaining \texttt{v2.2}'s decode advantage over \texttt{llama.cpp} across \texttt{t1\_dec} (14.15 vs.\ 12.12), \texttt{t2\_dec} (12.92 vs.\ 12.24), \texttt{english\_qa} (13.50 vs.\ 13.15), \texttt{rag\_edit} (13.29 vs.\ 12.17), \texttt{tool\_json} (13.56 vs.\ 10.60), and \texttt{spanish} (12.08 vs.\ 11.56\,tok/s).
 
+\subsection{ASI v2.3: Kernel Vectorization and Zero-Rollback Speculation}
+\label{subsec:v23_trial12}
+
+Building on Trial~11's root-cause analysis, Trial~12 ships \texttt{ASI v2.3} (\texttt{LILA\_ASI\_SPECULATIVE=1} default, \texttt{LILA\_ASI\_LMHEAD\_SHORTLIST=0}) with four targeted fixes across \texttt{q4k.h}, \texttt{asi\_arch.h}, \texttt{asi\_arch.c}, and \texttt{lila\_asi.c}:
+\begin{enumerate}
+    \item \textbf{Pure-SIMD \texttt{Q4\_K} Scale Broadcasts and 32-Byte Aligned \texttt{LilaQ8KBlock}:} Eliminating scalar scale unpacking in the AVX2 \texttt{Q4\_K} loop doubles isolated 64\,MiB DRAM \texttt{Q4\_K dot2} throughput on Broadwell from 3.82/3.90\,GB/s (1T/2T) to \textbf{7.43/7.58\,GB/s} (\texttt{roofline\_broadwell.json}).
+    \item \textbf{Parallel \texttt{conv1d} and \texttt{full\_attn}:} Parallelizes causal convolution and full-attention loops across the thread pool.
+    \item \textbf{Register-Direct Small-Batch GEMM ($B \le 4$):} Keeps small-batch quantized GEMM accumulators register-resident without temporary reduction buffers.
+    \item \textbf{Zero-Rollback Stack-Scratch Speculation ($\ge 2$-gram strict):} Replaces the $+25.5$\,MiB 18-layer DeltaNet snapshot/replay with stack-allocated scratch state ($+4.11$\,MiB RSS vs.\ \texttt{v2.2}: 625.67 vs.\ 621.56\,MiB) and suppresses permissive \texttt{1-gram} triggers.
+\end{enumerate}
+
+All verification gates pass on idle Broadwell: G0 strict (\texttt{correctness\_broadwell\_n64.json}) achieves 320/320 (100.00\%, \texttt{0.0} diff) batch-vs-token parity, 316/320 (98.75\%) teacher-forced agreement, \texttt{ASI} Rel-$L_2 = 0.047385$ (ratio $0.9952 \le 1.05$), and 5-run determinism \texttt{PASS} at \texttt{threads=1,2}; \texttt{qualify\_asi\_backend.py} passes 6/6 checks (including live \texttt{LilaDaemon} mTLS \texttt{/chat} in 1.4\,s and $N=5$ decode 13.68/14.38 vs.\ \texttt{llama.cpp} 13.18/12.12\,tok/s); and \texttt{claim\_check.py --strict} reports \texttt{all\_passed=true} (\texttt{G0: PASS}, \texttt{G1 Tier: BEATS}). In controlled $N=3$ ablations (\texttt{trial12\_ablation\_n3.json}, \texttt{trial12\_multilang.json}, \texttt{n\_gen=64}), \texttt{v2.3\_spec} preserves 100\% greedy parity with \texttt{v2.2} on every prompt while outperforming \texttt{llama.cpp} across all six multilingual and agentic workloads (\texttt{english\_qa}: 12.45 vs.\ 12.13; \texttt{rag\_edit}: 12.63 vs.\ 10.10; \texttt{tool\_json}: 13.61 vs.\ 10.08; \texttt{french}: 14.47 vs.\ 10.70; \texttt{spanish}: 14.26 vs.\ 11.28; \texttt{yoruba}: 16.04 vs.\ 11.46\,tok/s).
+
 \section{Honest Limitations and Future Work}
 
 \begin{enumerate}

@@ -53,6 +53,12 @@ typedef struct {
                             const uint8_t expected_key_hash[32],
                             const char *filepath,
                             uint32_t *out_n_tokens);
+
+    /* Optional speculative single-token forward pass (falls back to forward_token when NULL). */
+    int (*forward_speculative)(AsiArchSession *session,
+                               int32_t token_id,
+                               uint32_t pos,
+                               float *out_logits);
 } AsiArchHandler;
 
 /* Lookup a registered architecture handler by AsiV2ArchId. Returns NULL if unsupported. */
