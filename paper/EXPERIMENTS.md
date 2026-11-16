@@ -202,4 +202,67 @@
     - Medians across the 10 interleaved pairs: `load_s = 0.086 s` (`[0.082..0.091]`) vs `1.015 s` (`[0.976..1.722]`), `t1_ttft = 1.036 s` (`[1.027..1.642]`) vs `1.136 s` (`[1.132..2.210]`), `t1_dec = 12.90 tok/s` (`12.895`, `[8.06..13.04]`) vs `13.80 tok/s` (`[6.44..13.88]`), `t2_ttft = 0.552 s` (`0.5515`, `[0.538..0.927]`) vs `0.654 s` (`0.6535`, `[0.629..0.734]`), `t2_dec = 12.73 tok/s` (`[4.45..12.92]`) vs `13.64 tok/s` (`[6.87..13.87]`), `long_prefill_tps = 44.38 tok/s` (`44.375`, `[41.95..47.29]`) vs `41.03 tok/s` (`41.025`, `[40.82..44.10]`), steady-state `rss_mb = 619.8` vs `1107.9 MiB` (`1107.85`), and peak `vm_hwm_mb = 619.8` vs `1381.7 MiB`.
     - Because commit `4e73276` was pre-v2.2 (`N = 10 < 15`, prior to `dot2=1` defaults, SMT spin-backoff `spin_limit=64` / `yield_limit=128`, and `/proc/stat` steal-time logging), it does not qualify for formal G1 certification; [`colab_asi_benchmark.ipynb`](file:///home/ticket/workspaces/lila/source/engine/tests/colab_asi_benchmark.ipynb) is updated for `N = 15`, `threads = 1, 2`, `N_GEN = 64` G0 check, `claim_check.py`, and `steal_jiffies` logging as the next cloud verification run.
 
+---
+
+## Trial 11 — ASI v2.3 Prototype (Evaluated & Discarded): Zero-Training Jev-Style Batched Speculative Verification & Dynamic Two-Stage `lm_head` Shortlisting
+
+- **Motivation & Literature Context:**
+  - Trial 10's roofline audit established that full-model `Qwen3.5-0.8B` decode on Broadwell (`i5-5300U`, `2C/4T`, DDR3-1600, `12.08 GB/s` DRAM-RO ceiling) streams `518.34 MB`/token, with tied `token_embd`/`lm_head` (`248,320 × 1024` `Q6_K`) accounting for **`208.59 MB` (`40.24%` of active bytes)** and **`~23–26 ms` (`~36%` of `~68 ms/tok` steady-state decode)**.
+  - Prior inference work attacks this memory-bandwidth wall via speculative verification and vocabulary narrowing: **Speculative Decoding / Speculative Sampling** (Leviathan, Kalman, & Matias, ICML 2023; Chen et al., 2023) verifies $K$ drafted tokens in one batched target forward pass using an auxiliary draft model; **Medusa** (Cai et al., ICML 2024) adds trained parallel decoding heads; **Lookahead Decoding** (Fu et al., ICML 2024) trades abundant parallel GPU FLOPs for Jacobi n-gram verification; **Prompt Lookup Decoding** (Saxena, 2023) removes the draft model entirely by proposing prompt/context n-gram matches; and **FR-Spec** (Zhao et al., ACL 2025) accelerates large-vocabulary models by restricting draft projection to frequency-ranked token subsets while preserving exact target verification.
+  - To avoid auxiliary draft models (RSS/load penalty), trained heads (format/model dependence), and English-specific static token tables, Trial 11 prototyped a **100% language-agnostic** (pure token-ID driven), zero-training speculative verifier plus dynamic per-session `lm_head` shortlisting inside the `.asi` v2 runtime—remaining drop-in compatible with existing `.asi` v2 cartridges and `llama-cpp-python` callers (`lila_asi_eval_token` / `lila_asi_eval_batch`).
+
+- **Prototype Scope (Reverted cleanly to `v2.2` after evaluation):**
+  - *Speculative suffix proposer (`qwen35_propose_draft`):* Language-agnostic `4 -> 3 -> 2 -> 1-gram` token-ID history suffix matcher over `token_history`, `<think>` transition heuristic, and `fail_hash[1024]` failed-transition filter (gated by `LILA_ASI_SPECULATIVE` and logged via `LILA_ASI_SPEC_STATS`).
+  - *Jev-style batched verification & DeltaNet rewind (`qwen35_forward_speculative`):* `B = 1 + K = 4` batched forward pass across all `24` layers and the `248,320`-row `lm_head`, `18`-layer DeltaNet pre-batch snapshot + `qwen35_rewind_deltanet_to` state replay on rejection, and reusable session buffers adding **`+25.5 MiB` RSS** (`647.055` vs `621.559 MiB` in the `N = 3` run).
+  - *Language-adaptive two-stage `lm_head` (`matvec_shortlist_q8k_pool`):* `LILA_ASI_LMHEAD_SHORTLIST`-gated 256-row page bitmap activating base pages (`0..32767`), special tail pages, and pages observed in `token_history`, with a heuristic Stage-1 early exit (`top1 >= 18.0f && (top1 - top2) >= 2.0f`).
+  - *Files touched & cleanly reverted:* Prototype edits in [`asi_arch.h`](file:///home/ticket/workspaces/lila/source/engine/asi/asi_arch.h), [`asi_arch.c`](file:///home/ticket/workspaces/lila/source/engine/asi/asi_arch.c), [`lila_asi.c`](file:///home/ticket/workspaces/lila/source/engine/asi/lila_asi.c), and [`test_asi_v2.c`](file:///home/ticket/workspaces/lila/source/engine/tests/test_asi_v2.c) were reverted cleanly back to `v2.2` following evaluation.
+
+- **Measured Results (verified from `v23_correctness_n64.json`, `v23_ablation_n3.json`, and `v23_multilang_ablation.json`):**
+  1. **G0 Correctness & Host Qualification (`v2.3_spec`, `LILA_ASI_LMHEAD_SHORTLIST=0`, `v23_correctness_n64.json`):**
+     - Passed G0 identically to `v2.2` ([`correctness_broadwell_n64.json`](file:///home/ticket/workspaces/lila/source/paper/correctness_broadwell_n64.json)): `batch_vs_token = 320/320 (100.0%, max_abs_diff = 0.0, max_rel_l2 = 0.0)`, `100%` identical generated texts, summaries, and determinism SHA-256 digests (`1f118f98...` / `9c1ed373...`) to `v2.2`, `teacher_forced = 316/320 (98.75%)` vs `llama.cpp` (`315/320 = 98.44%` vs `FP32-Ref`), `ASI Rel-L2 mean = 0.047385` (`median = 0.038031`, vs `llama.cpp 0.047615`, ratio `0.9952 <= 1.05`), and `5`-subprocess determinism `PASS` (`threads = 1, 2`, exact `32/32` cross-thread parity).
+     - Prototype verification also passed `ASan+UBSan+LSan` cleanly and passed all 6 checks in [`qualify_asi_backend.py`](file:///home/ticket/workspaces/lila/source/engine/tests/qualify_asi_backend.py) (`t1_dec = 14.08`, `t2_dec = 12.47` vs `llama.cpp 13.01 / 12.75 tok/s`).
+  2. **`bench_strict_bar.py` `N = 3` Controlled 4-Way Ablation (`v23_ablation_n3.json`, `n_threads = 2`, `n_gen = 32`, `T1 = 53`, `T2 = 27`, `Long = 939`, `--prepopulate`, `steal_jiffies = 0` across all 12 runs):**
+
+| Metric | `v2.2` `med [min..max]` | `v2.3_spec` `med [min..max]` | `v2.3_spec_shortlist` `med [min..max]` | `llama.cpp` `med [min..max]` |
+|---|---|---|---|---|
+| `t1_ttft` (s, lower) | `0.883 [0.831..1.113]` | `1.140 [0.899..1.279]` | **`0.880 [0.859..0.975]`** | `1.196 [1.168..1.553]` |
+| `t1_dec` (tok/s, higher) | **`14.152 [12.624..14.610]`** | `11.613 [9.405..12.588]` | `12.124 [11.925..12.256]` | `12.121 [10.735..14.055]` |
+| `t2_ttft` (s, lower) | `0.613 [0.465..0.653]` | **`0.506 [0.482..0.642]`** | `0.516 [0.463..0.658]` | `0.591 [0.588..0.645]` |
+| `t2_dec` (tok/s, higher) | **`12.918 [12.225..13.939]`** | `8.209 [7.660..10.601]` | `11.527 [9.163..11.644]` | `12.240 [11.824..12.662]` |
+| `long_prefill_tps` (higher) | `48.889 [37.061..53.392]` | `44.548 [37.955..49.349]` | **`51.918 [43.903..54.256]`** | `43.302 [41.007..51.207]` |
+| `rss_mb` (MiB, lower) | **`621.559 [621.512..621.660]`** | `647.055 [647.051..647.121]` | `647.000 [646.988..647.070]` | `979.582 [979.578..979.594]` |
+| `load_s` (s, lower) | **`0.056 [0.054..0.061]`** | `0.062 [0.054..0.075]` | `0.059 [0.055..0.060]` | `2.463 [2.371..2.549]` |
+
+  - *`[SPEC STATS]` & Greedy Parity (`v23_ablation_n3.json` `spec_inspection`):* Both `v2.3_spec` and `v2.3_spec_shortlist` produced `100%` identical tokens to `v2.2` on `T1`, `T2`, and `Long decode` with identical speculation counts: **`T1`** (`32` calls): `6` batches / `18` proposed / `4` accepted / `4` misses; **`T2` (`t2_delta`, `32` calls)**: `13` batches / `39` proposed / `7` accepted / `9` misses (`T1+T2` total `64` calls: `19` batches / `57` proposed / `11` accepted / `13` misses); **`Long decode`** (`32` calls): `14` batches / `42` proposed / `4` accepted / `12` misses (`Long prefill` = `0` calls).
+
+  3. **6-Prompt Agentic & Multilingual Suite (`v23_multilang_ablation.json`, `N = 3`, `n_threads = 2`, `n_gen = 64`):**
+
+| Prompt (`prompt_len`) | `eq_v2.2` (`spec` / `short`) | `v2.2` `tok/s` `med [min..max]` | `v2.3_spec` `tok/s` `med [min..max]` | `v2.3_spec_shortlist` `tok/s` `med [min..max]` | `llama.cpp` `tok/s` `med [min..max]` | `[SPEC STATS]` (`batches / prop / acc / miss`) |
+|---|---|---|---|---|---|---|
+| `english_qa` (`52`) | `true` / **`false`** | **`13.50 [11.80..14.56]`** | `10.82 [9.50..10.93]` | `11.90 [6.09..12.20]` *(wrong!)* | `13.15 [11.79..13.17]` | `spec`: `18 / 54 / 7 / 15`; `short`: `15 / 45 / 9 / 10` |
+| `rag_edit` (`185`) | `true` / `true` | **`13.29 [11.30..13.83]`** | `11.05 [7.99..14.38]` | `11.33 [10.90..13.21]` | `12.17 [9.82..13.17]` | `18 / 54 / 25 / 8` |
+| `tool_json` (`164`) | `true` / `true` | **`13.56 [11.61..13.89]`** | `11.48 [9.91..11.77]` | `10.71 [8.88..12.23]` | `10.60 [9.29..13.24]` *(48, EOS)* | `23 / 69 / 19 / 15` |
+| `french` (`28`) | `true` / `true` | `12.66 [8.65..14.38]` | `14.88 [12.27..15.48]` | **`16.20 [15.00..16.43]`** | `12.87 [11.52..12.94]` | `12 / 36 / 23 / 3` |
+| `spanish` (`26`) | `true` / `true` | `12.08 [10.42..14.35]` | **`12.62 [8.62..12.71]`** | `12.53 [12.36..12.88]` | `11.56 [9.54..13.25]` | `14 / 42 / 12 / 8` |
+| `yoruba` (`54`) | `true` / `true` | `12.76 [9.70..13.19]` | `12.92 [9.25..13.74]` | **`14.82 [13.85..14.90]`** | `12.90 [10.97..13.02]` | `20 / 59 / 30 / 7` |
+
+  - **`LILA_ASI_LMHEAD_SHORTLIST=1` Correctness Bug (`english_qa` step 8):** On `english_qa`, `v2.3_spec_shortlist` broke greedy parity at decode step 8 (`eq_v2.2 = false`): token `40755` (`" Tables"`, page `159`, outside base pages `0..32767` and not yet in `token_history`) was skipped by the Stage-1 confidence gate in favor of token `6424` (`" Table"`, page `25`), diverging `56/64` subsequent tokens (`"**Virtual Memory Page Table (VPM)**"` instead of `"**Virtual Memory Page Tables**"`). Note also that on `tool_json`, `llama.cpp` emitted EOS after `48` decode evals while ASI ran all `63` evals (`n_gen = 64`).
+
+- **Root-Cause Analysis & Discard Decision:**
+  1. **Why `B = 4` Speculation Slowed Real `2C/4T` DDR3-1600 Decode:** Unlike GPU tensor cores where extra batch columns are compute-free, Broadwell `2C/4T` executes `4×` inner dot products across all 24 layers + the `248,320`-row `lm_head` + `18`-layer DeltaNet snapshot/rewind (`qwen35_rewind_deltanet_to`), costing `~2.5×–3.0×` a single `B = 1` `dot2` decode step. Consequently, breaking even requires `>2–2.5` accepted tokens per batch. Permissive `1-gram` fallback triggering inflated miss rates (`15/18` batches on `english_qa`, `15/23` on `tool_json`, `8/18` on `rag_edit`, `12/14` on `long_decode`), causing even `rag_edit` (`25/18 = 1.39` accepted/batch, `11.05` vs `13.29 tok/s`) and `tool_json` (`19/23 = 0.83` accepted/batch, `11.48` vs `13.56 tok/s`) to regress behind `v2.2`. Only repetitive phrasing (`french`: `23/12 = 1.92` accepted/batch, `3` misses) improved (`+17.5%`, `14.88` vs `12.66 tok/s`, and `yoruba` `30/20 = 1.50` accepted/batch stayed near parity at `12.92` vs `12.76 tok/s`).
+  2. **Why Confidence-Gated `lm_head` Shortlisting Is Unsafe Without Strict Bounds:** Heuristic Stage-1 logit margins (`top1 >= 18.0f && (top1 - top2) >= 2.0f`) over base + history pages provide no mathematical guarantee against unvisited rows exceeding `top1`, as exposed by token `40755 -> 6424` on `english_qa`. Lossless `lm_head` pruning requires exact Cauchy-Schwarz / row-norm upper bounds (`||w_r||_2 * ||x||_2`) or restricting vocabulary pruning strictly to a draft stage verified against full `lm_head` (as in FR-Spec).
+  3. **Discard Decision:** All 4 C files (`asi_arch.h`, `asi_arch.c`, `lila_asi.c`, `test_asi_v2.c`) were reverted cleanly back to **`v2.2`** (`dot2=1/1`, `621.6 MiB` RSS vs `647.1 MiB`), preserving lossless parity and retaining `v2.2`'s lead over `llama.cpp` across `t1_dec` (`14.15` vs `12.12`), `t2_dec` (`12.92` vs `12.24`), `english_qa` (`13.50` vs `13.15`), `rag_edit` (`13.29` vs `12.17`), `tool_json` (`13.56` vs `10.60`), and `spanish` (`12.08` vs `11.56`).
+
+---
+
+## References (Trial 11 Literature)
+
+1. Yaniv Leviathan, Matan Kalman, and Yossi Matias. *Fast Inference from Transformers via Speculative Decoding*. Proceedings of the 40th International Conference on Machine Learning (ICML 2023), PMLR 202:19274–19286, 2023. `arXiv:2211.17192`.
+2. Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre, and John Jumper. *Accelerating Large Language Model Decoding with Speculative Sampling*. `arXiv:2302.01318`, 2023.
+3. Apoorv Saxena. *Prompt Lookup Decoding*. GitHub technical release (`github.com/apoorvumang/prompt-lookup-decoding`), November 2023.
+4. Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, Jason D. Lee, Deming Chen, and Tri Dao. *Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads*. International Conference on Machine Learning (ICML 2024), `arXiv:2401.10774`, 2024.
+5. Yichao Fu, Peter Bailis, Ion Stoica, and Hao Zhang. *Break the Sequential Dependency of LLM Inference Using Lookahead Decoding*. International Conference on Machine Learning (ICML 2024), `arXiv:2402.02057`, 2024.
+6. Weilin Zhao, Tengyu Pan, Xu Han, Yudi Zhang, Ao Sun, Yuxiang Huang, Kaihuo Zhang, Weilun Zhao, Yuxuan Li, Jie Zhou, Hao Zhou, Jianyong Wang, Zhiyuan Liu, and Maosong Sun. *FR-Spec: Accelerating Large-Vocabulary Language Models via Frequency-Ranked Speculative Sampling*. Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (ACL 2025, Volume 1: Long Papers), `10.18653/v1/2025.acl-long.198`, `arXiv:2502.14856`, 2025.
+
+
 

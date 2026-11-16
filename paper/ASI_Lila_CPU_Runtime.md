@@ -218,12 +218,64 @@ Evaluated via `claim_check.py` against [`results_broadwell_n15.json`](file:///ho
 - **Verified Claim Verdict:** `G1 Tier: BEATS` (`3` primary `WIN`s, `0` primary losses, `rss_mb` `STRONG WIN`), `overall_passed = true`, allowed claim: **`"Beats llama.cpp on Intel(R) Core(TM) i5-5300U CPU @ 2.30GHz (2 threads)"`**. *Scope note:* the 15 raw timing pairs in `results_broadwell_n15.json` were captured on the pre-v2.2 build before `dot2=1` defaults, SMT spin-backoff, and `steal_jiffies` telemetry (`has_telemetry = false`).
 - **Cross-Machine Colab Xeon Reference (`N = 10`, commit `4e73276`, `Intel(R) Xeon(R) CPU @ 2.20GHz`, 1 physical core / 2 logical CPUs, AVX2+FMA, same `d9662c91` GGUF):** Across 10 pre-v2.2 interleaved pairs, ASI achieved lower load latency (`0.086` vs `1.015 s`), faster Turn-1 TTFT (`1.036` vs `1.136 s`) and Turn-2 TTFT (`0.552` vs `0.654 s`), higher 939-token prefill (`44.38` vs `41.03 tok/s`), lower steady-state RSS (`619.8` vs `1107.9 MiB`) and peak HWM (`619.8` vs `1381.7 MiB`), while showing SMT tail dips (`min = 4.45 / 8.06 tok/s`) on Turn-1/Turn-2 decode (`12.90` vs `13.80 tok/s` and `12.73` vs `13.64 tok/s`). Because commit `4e73276` had `N = 10 < 15` and predated v2.2's SMT spin-backoff (`spin_limit=64` / `yield_limit=128`), `dot2=1` defaults, and `steal_jiffies` logging, it is reported as cross-machine historical context rather than a G1 pass; [`colab_asi_benchmark.ipynb`](file:///home/ticket/workspaces/lila/source/engine/tests/colab_asi_benchmark.ipynb) is prepared for a full `N = 15`, `threads = 1, 2` v2.2 cloud rerun.
 
+### 8.5 Negative Results — Zero-Training N-Gram Speculative Verification and Dynamic `lm_head` Shortlisting on Hybrid CPUs
+
+To test whether zero-training speculative verification and vocabulary narrowing could break past Broadwell's `518.34 MB/tok` DRAM decode ceiling and `208.59 MB` `lm_head` bottleneck without requiring an auxiliary draft model [1, 2], trained Medusa heads [4], GPU-oriented Jacobi FLOP overprovisioning [5], or English-biased static frequency tables [6], we prototyped and evaluated an `ASI v2.3` candidate (Trial 11, subsequently reverted cleanly to `v2.2`):
+
+- **Design (100% Language-Agnostic & Cartridge-Compatible):**
+  1. *Suffix proposer (`qwen35_propose_draft`):* Following Prompt Lookup Decoding [3], a pure token-ID `4 -> 3 -> 2 -> 1-gram` suffix matcher over `token_history`, paired with a `<think>` transition heuristic and a `fail_hash[1024]` failed-transition filter (no natural-language tables).
+  2. *Batched verification & DeltaNet rewind (`qwen35_forward_speculative`):* Single `B = 1 + K = 4` batched forward pass across all `24` layers and the `248,320`-row `lm_head`, backed by an `18`-layer DeltaNet state snapshot and `qwen35_rewind_deltanet_to` replay on rejection (`+25.5 MiB` reusable session RSS: `647.055` vs `621.559 MiB`).
+  3. *Language-adaptive two-stage `lm_head` (`matvec_shortlist_q8k_pool`):* Inspired by FR-Spec [6], a 256-row page bitmap activating base rows (`0..32767`), special tail pages, and `token_history` pages with heuristic Stage-1 early exit (`top1 >= 18.0f && (top1 - top2) >= 2.0f`).
+
+- **G0 Correctness & Qualification (`v2.3_spec`, `SHORTLIST=0`):** Passed G0 with `320/320` (`100.0%`, `0.0` diff) batch-vs-token parity, `100%` identical outputs to `v2.2` ([`correctness_broadwell_n64.json`](file:///home/ticket/workspaces/lila/source/paper/correctness_broadwell_n64.json)), `316/320` (`98.75%`) teacher-forced agreement vs `llama.cpp`, `ASI Rel-L2 = 0.047385`, `5`-subprocess determinism `PASS`, clean `ASan+UBSan+LSan`, and `6/6` in [`qualify_asi_backend.py`](file:///home/ticket/workspaces/lila/source/engine/tests/qualify_asi_backend.py) (`t1_dec = 14.08`, `t2_dec = 12.47` vs `llama.cpp 13.01 / 12.75 tok/s`).
+
+- **`bench_strict_bar.py` `N = 3` Controlled 4-Way Ablation (`n_threads = 2`, `n_gen = 32`, `steal_jiffies = 0` across all 12 runs):**
+
+| Metric | `v2.2` `med [min..max]` | `v2.3_spec` `med [min..max]` | `v2.3_spec_shortlist` `med [min..max]` | `llama.cpp` `med [min..max]` |
+|---|---|---|---|---|
+| `t1_ttft` (s, lower) | `0.883 [0.831..1.113]` | `1.140 [0.899..1.279]` | **`0.880 [0.859..0.975]`** | `1.196 [1.168..1.553]` |
+| `t1_dec` (tok/s, higher) | **`14.152 [12.624..14.610]`** | `11.613 [9.405..12.588]` | `12.124 [11.925..12.256]` | `12.121 [10.735..14.055]` |
+| `t2_ttft` (s, lower) | `0.613 [0.465..0.653]` | **`0.506 [0.482..0.642]`** | `0.516 [0.463..0.658]` | `0.591 [0.588..0.645]` |
+| `t2_dec` (tok/s, higher) | **`12.918 [12.225..13.939]`** | `8.209 [7.660..10.601]` | `11.527 [9.163..11.644]` | `12.240 [11.824..12.662]` |
+| `long_prefill_tps` (higher) | `48.889 [37.061..53.392]` | `44.548 [37.955..49.349]` | **`51.918 [43.903..54.256]`** | `43.302 [41.007..51.207]` |
+| `rss_mb` (MiB, lower) | **`621.559 [621.512..621.660]`** | `647.055 [647.051..647.121]` | `647.000 [646.988..647.070]` | `979.582 [979.578..979.594]` |
+| `load_s` (s, lower) | **`0.056 [0.054..0.061]`** | `0.062 [0.054..0.075]` | `0.059 [0.055..0.060]` | `2.463 [2.371..2.549]` |
+
+  `[SPEC STATS]` (`eq_v2.2 = true` on `T1`, `T2`, `Long`): **`T1`**: `6` batches / `18` proposed / `4` accepted / `4` misses; **`T2` delta**: `13` batches / `39` proposed / `7` accepted / `9` misses; **`Long decode`**: `14` batches / `42` proposed / `4` accepted / `12` misses.
+
+- **6-Prompt Agentic & Multilingual Suite (`N = 3`, `n_threads = 2`, `n_gen = 64`):**
+
+| Prompt (`len`) | `eq_v2.2` (`spec`/`short`) | `v2.2` `tok/s` | `v2.3_spec` `tok/s` | `v2.3_spec_shortlist` `tok/s` | `llama.cpp` `tok/s` | `[SPEC STATS]` (`b / p / a / m`) |
+|---|---|---|---|---|---|---|
+| `english_qa` (`52`) | `true` / **`false`** | **`13.50 [11.80..14.56]`** | `10.82 [9.50..10.93]` | `11.90 [6.09..12.20]` *(bug)* | `13.15 [11.79..13.17]` | `18/54/7/15` (`short`: `15/45/9/10`) |
+| `rag_edit` (`185`) | `true` / `true` | **`13.29 [11.30..13.83]`** | `11.05 [7.99..14.38]` | `11.33 [10.90..13.21]` | `12.17 [9.82..13.17]` | `18 / 54 / 25 / 8` |
+| `tool_json` (`164`) | `true` / `true` | **`13.56 [11.61..13.89]`** | `11.48 [9.91..11.77]` | `10.71 [8.88..12.23]` | `10.60 [9.29..13.24]` *(48, EOS)* | `23 / 69 / 19 / 15` |
+| `french` (`28`) | `true` / `true` | `12.66 [8.65..14.38]` | `14.88 [12.27..15.48]` | **`16.20 [15.00..16.43]`** | `12.87 [11.52..12.94]` | `12 / 36 / 23 / 3` |
+| `spanish` (`26`) | `true` / `true` | `12.08 [10.42..14.35]` | **`12.62 [8.62..12.71]`** | `12.53 [12.36..12.88]` | `11.56 [9.54..13.25]` | `14 / 42 / 12 / 8` |
+| `yoruba` (`54`) | `true` / `true` | `12.76 [9.70..13.19]` | `12.92 [9.25..13.74]` | **`14.82 [13.85..14.90]`** | `12.90 [10.97..13.02]` | `20 / 59 / 30 / 7` |
+
+- **Root Causes & Why `v2.2` Was Retained:**
+  1. *`B = 4` compute & rewind overhead on 2-core DDR3-1600:* Computing `4×` inner dot products across all 24 layers + `248,320`-row `lm_head` + `18`-layer DeltaNet snapshot/rewind costs `~2.5×–3.0×` a single `B = 1` `dot2` step, demanding `>2–2.5` accepted tokens per batch just to break even. Permissive `1-gram` triggers inflated miss counts (`15/18` on `english_qa`, `15/23` on `tool_json`, `8/18` on `rag_edit`, `12/14` on `long_decode`), slowing even high-acceptance agentic workloads (`rag_edit`: `11.05` vs `13.29 tok/s`, `tool_json`: `11.48` vs `13.56 tok/s`); only repetitive `french` (`23/12`, `3` misses) improved (`+17.5%`).
+  2. *Unsound heuristic `lm_head` margin gating:* Under `LILA_ASI_LMHEAD_SHORTLIST=1`, `english_qa` step 8 replaced token `40755` (`" Tables"`, page `159`, outside `0..32767` and unvisited in `token_history`) with `6424` (`" Table"`, page `25`), breaking greedy parity (`eq_v2.2 = false`). Exact `lm_head` pruning requires provable Cauchy-Schwarz / row-norm upper bounds rather than empirical Stage-1 logit margins.
+  3. *Revert to `v2.2`:* All 4 prototype C files were reverted cleanly to **`v2.2`** (`dot2=1/1`, `621.6 MiB` RSS), preserving `100%` greedy parity and maintaining `v2.2`'s clear decode lead over `llama.cpp` across `t1_dec` (`14.15` vs `12.12`), `t2_dec` (`12.92` vs `12.24`), `english_qa` (`13.50` vs `13.15`), `rag_edit` (`13.29` vs `12.17`), `tool_json` (`13.56` vs `10.60`), and `spanish` (`12.08` vs `11.56`).
+
 ---
 
 ## 9. Honest Limitations & Future Work
 
 1. **Pre-v2.2 `N = 15` / `N = 10` Raw Captures:** Both `results_broadwell_n15.json` (`G1 Tier: BEATS`) and the Colab `N = 10` (`4e73276`) baseline predate v2.2 (`LILA_ASI_Q6K_DOT2=1`, `LILA_ASI_Q4K_DOT2=1`, SMT `spin_limit=64` backoff, and `/proc/stat` `steal_jiffies` telemetry). Re-running `N = 15` interleaved G1 pairs on Broadwell and Colab Xeon via [`colab_asi_benchmark.ipynb`](file:///home/ticket/workspaces/lila/source/engine/tests/colab_asi_benchmark.ipynb) is the next immediate empirical step.
 2. **Untested Wide-SIMD & ARM64 Hardware Execution:** Only AVX2 + FMA + F16C has been executed on physical hardware (`i5-5300U` and Colab `Xeon`). Although `#if defined(__AVX512F__)` paths were refactored for bit-exact `__m256` reduction alignment and clean builds were verified across AVX-512, AVX-512-VNNI, non-`F16C`, scalar fallback, and `ASan+UBSan+LSan`, physical execution on AVX-512 (e.g., Sapphire Rapids / Zen 4) and ARM64 NEON/DotProd hardware remains to be validated.
-3. **DRAM Bandwidth Ceiling & `lm_head` Dominance:** On Broadwell (`12.08 GB/s` 2T DRAM-RO ceiling), `518.34 MB` of active decode weights bounds theoretical maximum decode to `23.31 tok/s`, and `lm_head` (`248,320 × 1024` `Q6_K`) alone accounts for `40.24%` of active bytes (`~36%` of decode latency). Further speedup requires vocabulary narrowing/speculative decoding or weight repacking tradeoffs beyond pure `dot2`.
+3. **DRAM Bandwidth Ceiling & `lm_head` Dominance:** On Broadwell (`12.08 GB/s` 2T DRAM-RO ceiling), `518.34 MB` of active decode weights bounds theoretical maximum decode to `23.31 tok/s`, and `lm_head` (`248,320 × 1024` `Q6_K`) alone accounts for `40.24%` of active bytes (`~36%` of decode latency). As shown in Section 8.5, naive `B = 4` n-gram speculation and heuristic `lm_head` shortlisting fail to clear the `2C/4T` compute/rewind bar or maintain exact parity; further speedup requires exact Cauchy-Schwarz row-norm-bounded `lm_head` pruning, strictly draft-scoped vocabulary compression, or weight repacking tradeoffs beyond pure `dot2`.
 4. **Lazy `mmap` Cold-Fault Tradeoff:** Disabling eager `LILA_ASI_VERIFY_CRC=1` keeps `lila_asi_open` near `27 ms`, but without `--prepopulate` (`madvise(MADV_WILLNEED)`), cold page faults shift disk latency into Turn-1 prefill/decode.
 5. **Architecture Coverage:** `g_asi_arch_hybrid_qwen35` is complete and G0-verified, whereas `g_asi_arch_dense_transformer` (`dense_llama`, `dense_gemma`, `dense_qwen2`, `dense_qwen3`) still registers `NULL` handler pointers in `asi_arch.c`.
+
+---
+
+## 10. References
+
+1. **Leviathan, Y., Kalman, M., & Matias, Y. (2023).** *Fast Inference from Transformers via Speculative Decoding.* Proceedings of the 40th International Conference on Machine Learning (ICML 2023), PMLR 202:19274–19286. `arXiv:2211.17192`.
+2. **Chen, C., Borgeaud, S., Irving, G., Lespiau, J.-B., Sifre, L., & Jumper, J. (2023).** *Accelerating Large Language Model Decoding with Speculative Sampling.* `arXiv:2302.01318`.
+3. **Saxena, A. (2023).** *Prompt Lookup Decoding.* Open-source technical release, `github.com/apoorvumang/prompt-lookup-decoding` (November 2023).
+4. **Cai, T., Li, Y., Geng, Z., Peng, H., Lee, J. D., Chen, D., & Dao, T. (2024).** *Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads.* International Conference on Machine Learning (ICML 2024). `arXiv:2401.10774`.
+5. **Fu, Y., Bailis, P., Stoica, I., & Zhang, H. (2024).** *Break the Sequential Dependency of LLM Inference Using Lookahead Decoding.* International Conference on Machine Learning (ICML 2024). `arXiv:2402.02057`.
+6. **Zhao, W., Pan, T., Han, X., Zhang, Y., Sun, A., Huang, Y., Zhang, K., Zhao, W., Li, Y., Zhou, J., Zhou, H., Wang, J., Liu, Z., & Sun, M. (2025).** *FR-Spec: Accelerating Large-Vocabulary Language Models via Frequency-Ranked Speculative Sampling.* Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (ACL 2025, Volume 1: Long Papers), `10.18653/v1/2025.acl-long.198`. `arXiv:2502.14856`.

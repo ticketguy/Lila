@@ -42,7 +42,7 @@
 \begin{abstract}
 Local-first AI agents running on commodity laptops operate under tight memory, thermal, and startup-latency budgets without discrete GPUs. We present \textbf{ASI (Active System Image)}, a standalone C11/SIMD inference runtime and portable binary cartridge format (\texttt{.asi} v2) engineered for CPU-only execution and integrated into the Lila agent host via \texttt{AsiLlamaAdapter} and \texttt{LilaCore.\_boot\_gguf()}. ASI separates model distribution from execution using a 4\,KiB page-aligned, \texttt{mmap}-able cartridge (\texttt{AsiV2Header}, \texttt{AsiV2SectionEntry}, \texttt{AsiV2TensorEntry}) and executes hybrid state-space/attention architectures---specifically Qwen3.5 Gated DeltaNet + Grouped-Query Attention (\texttt{ASI\_ARCH\_HYBRID\_QWEN35})---with persistent scratch arenas, an SMT-aware spin-then-sleep thread pool (\texttt{AsiThreadPool}), integer-SIMD 2-row \texttt{dot2} and 1$\times$ row-unpack GEMM kernels (\texttt{Q4\_K} $\times$ \texttt{Q8\_K} and \texttt{Q6\_K} $\times$ \texttt{Q8\_K}), and crash-safe disk-persisted system-prefix snapshots (\texttt{ASIPFX02}).
 
-In ASI v2.2 on \texttt{Intel(R) Core(TM) i5-5300U CPU @ 2.30GHz} (\texttt{Qwen3.5-0.8B} \texttt{Q4\_K\_M}, 2 threads), we integrate an automated \textbf{G0 correctness gate} (\texttt{correctness\_broadwell\_n64.json}), a hardware \textbf{roofline and active-weight audit} (\texttt{roofline\_broadwell.json}), and a statistical \textbf{G1 performance claim gate} (\texttt{claim\_verdict\_broadwell.json}). Under G0 across 320 positions (\texttt{N\_GEN=64} over 5 prompts), \texttt{ASI(Q8\_K)} achieves \textbf{320/320 (100.0\%)} batch-vs-token parity (\texttt{0.0} relative $L_2$), \textbf{316/320 (98.75\%)} teacher-forced top-1 agreement with \texttt{llama.cpp}, \textbf{315/320 (98.44\%)} agreement and lower mean logit relative $L_2$ error against unquantized \texttt{FP32-Ref} than \texttt{llama.cpp} (\texttt{0.047385} vs.\ \texttt{0.047615}, ratio $0.9952 \le 1.05$, all 4 flips at near-tie \texttt{FP32-Ref} margins $\le 0.0948$), and 5-subprocess determinism (\texttt{PASS} at 1 and 2 threads with \texttt{32/32} cross-thread agreement). Roofline measurements reconcile isolated 2\,MiB L3 kernel throughput ($\sim$27--42\,GFLOP/s) with full-model decode (518.34\,MB active weights streamed per token, 57.33\% \texttt{Q6\_K} including 40.24\% in tied \texttt{token\_embd}/\texttt{lm\_head}, against a 11.53/12.08\,GB/s DRAM read-only ceiling) and justify enabling \texttt{LILA\_ASI\_Q6K\_DOT2=1} and \texttt{LILA\_ASI\_Q4K\_DOT2=1} by default, lifting idle 2T $3\times 32$-token decode from 8.88 to 13.58\,tok/s. Under G1 (\texttt{claim\_check.py} over $N=15$ prepopulated pairs), ASI achieves tier \textbf{BEATS} with the verified claim \emph{``Beats llama.cpp on Intel(R) Core(TM) i5-5300U CPU @ 2.30GHz (2 threads)''}: \texttt{WIN} on Turn-1 TTFT (0.908 vs.\ 1.094\,s, $+17.1\%$, $p=0.00105$), Turn-2 TTFT (0.487 vs.\ 0.607\,s, $+19.9\%$, $p=0.003691$), and 939-token prefill (52.799 vs.\ 46.213\,tok/s, $+14.3\%$, $p=0.0003609$), statistical \texttt{PARITY} on Turn-1/Turn-2 decode, and non-overlapping \texttt{STRONG WIN} on RSS (616.266 vs.\ 978.223\,MiB, $-37.0\%$, $p=3.341\times 10^{-6}$), peak HWM (638.824 vs.\ 1406.730\,MiB, $-54.6\%$), and load time (0.053 vs.\ 2.182\,s, $-97.5\%$). Both the $N=15$ Broadwell capture and a companion $N=10$ Colab Xeon run (\texttt{4e73276}) predate v2.2 \texttt{dot2=1} defaults and SMT spin-backoff, and AVX-512/NEON kernels are compile- and audit-verified only.
+In ASI v2.2 on \texttt{Intel(R) Core(TM) i5-5300U CPU @ 2.30GHz} (\texttt{Qwen3.5-0.8B} \texttt{Q4\_K\_M}, 2 threads), we integrate an automated \textbf{G0 correctness gate} (\texttt{correctness\_broadwell\_n64.json}), a hardware \textbf{roofline and active-weight audit} (\texttt{roofline\_broadwell.json}), and a statistical \textbf{G1 performance claim gate} (\texttt{claim\_verdict\_broadwell.json}). Under G0 across 320 positions (\texttt{N\_GEN=64} over 5 prompts), \texttt{ASI(Q8\_K)} achieves \textbf{320/320 (100.0\%)} batch-vs-token parity (\texttt{0.0} relative $L_2$), \textbf{316/320 (98.75\%)} teacher-forced top-1 agreement with \texttt{llama.cpp}, \textbf{315/320 (98.44\%)} agreement and lower mean logit relative $L_2$ error against unquantized \texttt{FP32-Ref} than \texttt{llama.cpp} (\texttt{0.047385} vs.\ \texttt{0.047615}, ratio $0.9952 \le 1.05$, all 4 flips at near-tie \texttt{FP32-Ref} margins $\le 0.0948$), and 5-subprocess determinism (\texttt{PASS} at 1 and 2 threads with \texttt{32/32} cross-thread agreement). Roofline measurements reconcile isolated 2\,MiB L3 kernel throughput ($\sim$27--42\,GFLOP/s) with full-model decode (518.34\,MB active weights streamed per token, 57.33\% \texttt{Q6\_K} including 40.24\% in tied \texttt{token\_embd}/\texttt{lm\_head}, against a 11.53/12.08\,GB/s DRAM read-only ceiling) and justify enabling \texttt{LILA\_ASI\_Q6K\_DOT2=1} and \texttt{LILA\_ASI\_Q4K\_DOT2=1} by default, lifting idle 2T $3\times 32$-token decode from 8.88 to 13.58\,tok/s. Under G1 (\texttt{claim\_check.py} over $N=15$ prepopulated pairs), ASI achieves tier \textbf{BEATS} with the verified claim \emph{``Beats llama.cpp on Intel(R) Core(TM) i5-5300U CPU @ 2.30GHz (2 threads)''}: \texttt{WIN} on Turn-1 TTFT (0.908 vs.\ 1.094\,s, $+17.1\%$, $p=0.00105$), Turn-2 TTFT (0.487 vs.\ 0.607\,s, $+19.9\%$, $p=0.003691$), and 939-token prefill (52.799 vs.\ 46.213\,tok/s, $+14.3\%$, $p=0.0003609$), statistical \texttt{PARITY} on Turn-1/Turn-2 decode, and non-overlapping \texttt{STRONG WIN} on RSS (616.266 vs.\ 978.223\,MiB, $-37.0\%$, $p=3.341\times 10^{-6}$), peak HWM (638.824 vs.\ 1406.730\,MiB, $-54.6\%$), and load time (0.053 vs.\ 2.182\,s, $-97.5\%$). Both the $N=15$ Broadwell capture and a companion $N=10$ Colab Xeon run (\texttt{4e73276}) predate v2.2 \texttt{dot2=1} defaults and SMT spin-backoff, and AVX-512/NEON kernels are compile- and audit-verified only. Finally, we report a negative evaluation of an experimental v2.3 candidate combining zero-training $B=4$ n-gram speculative verification and heuristic two-stage \texttt{lm\_head} shortlisting, which was cleanly reverted to v2.2 after 2-core DDR3-1600 batch/rewind overheads and a logit-margin parity bug outweighed its gains.
 \end{abstract}
 
 \section{Introduction, Motivation, and Contributions}
@@ -289,14 +289,108 @@ Metric (unit, dir, role) & ASI \texttt{med} / \texttt{[min..max]} (\texttt{p5/p9
 
 On Google Colab Xeon (\texttt{Intel(R) Xeon(R) CPU @ 2.20GHz}, 1 physical core / 2 SMT threads, AVX2+FMA, commit \texttt{4e73276}, $N=10$ pre-v2.2 pairs on the identical \texttt{d9662c91} GGUF), ASI achieved lower load latency (0.086 vs.\ 1.015\,s), faster Turn-1 TTFT (1.036 vs.\ 1.136\,s) and Turn-2 TTFT (0.552 vs.\ 0.654\,s), higher 939-token prefill (44.38 vs.\ 41.03\,tok/s), and lower memory (RSS 619.8 vs.\ 1107.9\,MiB; peak HWM 619.8 vs.\ 1381.7\,MiB), alongside SMT tail dips (\texttt{min=4.45/8.06\,tok/s}) on decode (12.90 vs.\ 13.80 and 12.73 vs.\ 13.64\,tok/s). Because \texttt{4e73276} had $N=10 < 15$ and predated v2.2's SMT spin-backoff (\texttt{spin\_limit=64}), \texttt{dot2=1} defaults, and \texttt{steal\_jiffies} telemetry, \texttt{colab\_asi\_benchmark.ipynb} is prepared for a full $N=15$, \texttt{threads=1,2} v2.2 cloud rerun.
 
+\subsection{Negative Results: Zero-Training N-Gram Speculation and Dynamic \texttt{lm\_head} Shortlisting}
+\label{subsec:neg_spec}
+
+To test whether speculative batch verification and vocabulary narrowing could surpass Broadwell's 518.34\,MB/tok DRAM decode ceiling and 208.59\,MB \texttt{lm\_head} bottleneck without an auxiliary draft model~\cite{leviathan2023,chen2023}, trained auxiliary heads~\cite{cai2024}, GPU-style Jacobi FLOP overprovisioning~\cite{fu2024}, or English-only static frequency tables~\cite{zhao2025}, we prototyped an experimental \texttt{v2.3} candidate (Trial~11) built on three language-agnostic, cartridge-compatible mechanisms:
+\begin{itemize}
+    \item \textbf{Zero-Training Suffix Proposer (\texttt{qwen35\_propose\_draft}):} Inspired by Prompt Lookup Decoding~\cite{saxena2023}, a token-ID-only $4 \to 3 \to 2 \to 1$-gram suffix matcher over \texttt{token\_history}, a \texttt{<think>} transition heuristic, and a \texttt{fail\_hash[1024]} failed-transition filter (no natural-language word tables).
+    \item \textbf{Jev-Style Batched Verification and DeltaNet Rewind (\texttt{qwen35\_forward\_speculative}):} A $B = 1 + K = 4$ batched forward pass across all 24 layers and the 248,320-row \texttt{lm\_head}, paired with an 18-layer DeltaNet pre-batch snapshot and \texttt{qwen35\_rewind\_deltanet\_to} replay on rejection, adding $+25.5$\,MiB RSS (647.055 vs.\ 621.559\,MiB).
+    \item \textbf{Dynamic Two-Stage \texttt{lm\_head} Shortlisting (\texttt{matvec\_shortlist\_q8k\_pool}):} Following frequency-ranked shortlisting~\cite{zhao2025} without static language bias, a 256-row page bitmap activating base rows (\texttt{0..32767}), special tail pages, and \texttt{token\_history} pages, gated by a heuristic Stage-1 margin (\texttt{top1 >= 18.0f \&\& (top1 - top2) >= 2.0f}).
+\end{itemize}
+
+With \texttt{LILA\_ASI\_LMHEAD\_SHORTLIST=0}, \texttt{v2.3\_spec} passed G0 (\texttt{v23\_correctness\_n64.json}) with 320/320 (100.0\%, \texttt{0.0} diff) batch-vs-token parity, 100\% identical outputs to \texttt{v2.2}, 316/320 (98.75\%) teacher-forced agreement vs.\ \texttt{llama.cpp}, \texttt{ASI} Rel-$L_2 = 0.047385$, 5-subprocess determinism \texttt{PASS}, clean \texttt{ASan+UBSan+LSan}, and 6/6 on \texttt{qualify\_asi\_backend.py} (\texttt{t1\_dec = 14.08}, \texttt{t2\_dec = 12.47} vs.\ \texttt{llama.cpp} 13.01/12.75\,tok/s). However, controlled $N=3$ ablations on Broadwell (\texttt{n\_threads=2}, Tables~\ref{tab:v23_ablation}--\ref{tab:v23_multilang}) exposed severe throughput regressions and a shortlisting correctness bug.
+
+\begin{table}[h]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}lllll@{}}
+\toprule
+Metric (unit, dir) & \texttt{v2.2} \texttt{med [min..max]} & \texttt{v2.3\_spec} \texttt{med [min..max]} & \texttt{v2.3\_spec\_shortlist} & \texttt{llama.cpp} \texttt{med [min..max]} \\
+\midrule
+\texttt{t1\_ttft} (s, $\downarrow$) & \shortstack[l]{\texttt{0.883}\\\scriptsize\texttt{[0.831..1.113]}} & \shortstack[l]{\texttt{1.140}\\\scriptsize\texttt{[0.899..1.279]}} & \shortstack[l]{\textbf{\texttt{0.880}}\\\scriptsize\texttt{[0.859..0.975]}} & \shortstack[l]{\texttt{1.196}\\\scriptsize\texttt{[1.168..1.553]}} \\
+\texttt{t1\_dec} (tok/s, $\uparrow$) & \shortstack[l]{\textbf{\texttt{14.152}}\\\scriptsize\texttt{[12.624..14.610]}} & \shortstack[l]{\texttt{11.613}\\\scriptsize\texttt{[9.405..12.588]}} & \shortstack[l]{\texttt{12.124}\\\scriptsize\texttt{[11.925..12.256]}} & \shortstack[l]{\texttt{12.121}\\\scriptsize\texttt{[10.735..14.055]}} \\
+\texttt{t2\_ttft} (s, $\downarrow$) & \shortstack[l]{\texttt{0.613}\\\scriptsize\texttt{[0.465..0.653]}} & \shortstack[l]{\textbf{\texttt{0.506}}\\\scriptsize\texttt{[0.482..0.642]}} & \shortstack[l]{\texttt{0.516}\\\scriptsize\texttt{[0.463..0.658]}} & \shortstack[l]{\texttt{0.591}\\\scriptsize\texttt{[0.588..0.645]}} \\
+\texttt{t2\_dec} (tok/s, $\uparrow$) & \shortstack[l]{\textbf{\texttt{12.918}}\\\scriptsize\texttt{[12.225..13.939]}} & \shortstack[l]{\texttt{8.209}\\\scriptsize\texttt{[7.660..10.601]}} & \shortstack[l]{\texttt{11.527}\\\scriptsize\texttt{[9.163..11.644]}} & \shortstack[l]{\texttt{12.240}\\\scriptsize\texttt{[11.824..12.662]}} \\
+\texttt{long\_prefill\_tps} ($\uparrow$) & \shortstack[l]{\texttt{48.889}\\\scriptsize\texttt{[37.061..53.392]}} & \shortstack[l]{\texttt{44.548}\\\scriptsize\texttt{[37.955..49.349]}} & \shortstack[l]{\textbf{\texttt{51.918}}\\\scriptsize\texttt{[43.903..54.256]}} & \shortstack[l]{\texttt{43.302}\\\scriptsize\texttt{[41.007..51.207]}} \\
+\texttt{rss\_mb} (MiB, $\downarrow$) & \shortstack[l]{\textbf{\texttt{621.559}}\\\scriptsize\texttt{[621.512..621.660]}} & \shortstack[l]{\texttt{647.055}\\\scriptsize\texttt{[647.051..647.121]}} & \shortstack[l]{\texttt{647.000}\\\scriptsize\texttt{[646.988..647.070]}} & \shortstack[l]{\texttt{979.582}\\\scriptsize\texttt{[979.578..979.594]}} \\
+\texttt{load\_s} (s, $\downarrow$) & \shortstack[l]{\textbf{\texttt{0.056}}\\\scriptsize\texttt{[0.054..0.061]}} & \shortstack[l]{\texttt{0.062}\\\scriptsize\texttt{[0.054..0.075]}} & \shortstack[l]{\texttt{0.059}\\\scriptsize\texttt{[0.055..0.060]}} & \shortstack[l]{\texttt{2.463}\\\scriptsize\texttt{[2.371..2.549]}} \\
+\bottomrule
+\end{tabular}
+\caption{Controlled $N=3$ 4-way ablation (\texttt{bench\_strict\_bar.py}, \texttt{n\_threads=2}, \texttt{n\_gen=32}, \texttt{steal\_jiffies=0} across all 12 runs, \texttt{v23\_ablation\_n3.json}). \texttt{[SPEC STATS]} for both \texttt{v2.3} modes (\texttt{eq\_v2.2=true}): \texttt{T1} = 6 batches / 18 proposed / 4 accepted / 4 misses; \texttt{T2} delta = 13 / 39 / 7 / 9; \texttt{Long decode} = 14 / 42 / 4 / 12.}
+\label{tab:v23_ablation}
+\end{table}
+
+\begin{table}[h]
+\centering
+\footnotesize
+\setlength{\tabcolsep}{3.2pt}
+\begin{tabular}{@{}lclllll@{}}
+\toprule
+Prompt (\texttt{len}) & \texttt{eq\_v2.2} (\texttt{s}/\texttt{sh}) & \texttt{v2.2} (tok/s) & \texttt{v2.3\_spec} & \texttt{v2.3\_shortlist} & \texttt{llama.cpp} & \texttt{[SPEC STATS]} (\texttt{b/p/a/m}) \\
+\midrule
+\texttt{english\_qa} (52) & \texttt{T}/\textbf{\texttt{F}} & \shortstack[l]{\textbf{\texttt{13.50}}\\\scriptsize\texttt{[11.80..14.56]}} & \shortstack[l]{\texttt{10.82}\\\scriptsize\texttt{[9.50..10.93]}} & \shortstack[l]{\texttt{11.90} (bug)\\\scriptsize\texttt{[6.09..12.20]}} & \shortstack[l]{\texttt{13.15}\\\scriptsize\texttt{[11.79..13.17]}} & \shortstack[l]{\texttt{spec: 18/54/7/15}\\\scriptsize\texttt{short: 15/45/9/10}} \\
+\texttt{rag\_edit} (185) & \texttt{T}/\texttt{T} & \shortstack[l]{\textbf{\texttt{13.29}}\\\scriptsize\texttt{[11.30..13.83]}} & \shortstack[l]{\texttt{11.05}\\\scriptsize\texttt{[7.99..14.38]}} & \shortstack[l]{\texttt{11.33}\\\scriptsize\texttt{[10.90..13.21]}} & \shortstack[l]{\texttt{12.17}\\\scriptsize\texttt{[9.82..13.17]}} & \texttt{18/54/25/8} \\
+\texttt{tool\_json} (164) & \texttt{T}/\texttt{T} & \shortstack[l]{\textbf{\texttt{13.56}}\\\scriptsize\texttt{[11.61..13.89]}} & \shortstack[l]{\texttt{11.48}\\\scriptsize\texttt{[9.91..11.77]}} & \shortstack[l]{\texttt{10.71}\\\scriptsize\texttt{[8.88..12.23]}} & \shortstack[l]{\texttt{10.60} (48,EOS)\\\scriptsize\texttt{[9.29..13.24]}} & \texttt{23/69/19/15} \\
+\texttt{french} (28) & \texttt{T}/\texttt{T} & \shortstack[l]{\texttt{12.66}\\\scriptsize\texttt{[8.65..14.38]}} & \shortstack[l]{\texttt{14.88}\\\scriptsize\texttt{[12.27..15.48]}} & \shortstack[l]{\textbf{\texttt{16.20}}\\\scriptsize\texttt{[15.00..16.43]}} & \shortstack[l]{\texttt{12.87}\\\scriptsize\texttt{[11.52..12.94]}} & \texttt{12/36/23/3} \\
+\texttt{spanish} (26) & \texttt{T}/\texttt{T} & \shortstack[l]{\texttt{12.08}\\\scriptsize\texttt{[10.42..14.35]}} & \shortstack[l]{\textbf{\texttt{12.62}}\\\scriptsize\texttt{[8.62..12.71]}} & \shortstack[l]{\texttt{12.53}\\\scriptsize\texttt{[12.36..12.88]}} & \shortstack[l]{\texttt{11.56}\\\scriptsize\texttt{[9.54..13.25]}} & \texttt{14/42/12/8} \\
+\texttt{yoruba} (54) & \texttt{T}/\texttt{T} & \shortstack[l]{\texttt{12.76}\\\scriptsize\texttt{[9.70..13.19]}} & \shortstack[l]{\texttt{12.92}\\\scriptsize\texttt{[9.25..13.74]}} & \shortstack[l]{\textbf{\texttt{14.82}}\\\scriptsize\texttt{[13.85..14.90]}} & \shortstack[l]{\texttt{12.90}\\\scriptsize\texttt{[10.97..13.02]}} & \texttt{20/59/30/7} \\
+\bottomrule
+\end{tabular}
+\caption{Six-prompt agentic and multilingual suite ($N=3$, \texttt{n\_threads=2}, \texttt{n\_gen=64}, \texttt{v23\_multilang\_ablation.json}). Columns list median \texttt{[min..max]} decode throughput (tok/s), greedy parity with \texttt{v2.2} (\texttt{s}=\texttt{v2.3\_spec}, \texttt{sh}=\texttt{v2.3\_spec\_shortlist}), and \texttt{[SPEC STATS]} (\texttt{draft\_batches/proposed/accepted\_tokens/misses}). On \texttt{tool\_json}, \texttt{llama.cpp} stopped at EOS after 48 decode evals vs.\ 63 for ASI.}
+\label{tab:v23_multilang}
+\end{table}
+
+Two root causes explain why all four C prototype files (\texttt{asi\_arch.h}, \texttt{asi\_arch.c}, \texttt{lila\_asi.c}, \texttt{test\_asi\_v2.c}) were cleanly reverted back to \texttt{v2.2}:
+\begin{enumerate}
+    \item \textbf{Compute and Rewind Cost of $B=4$ Verification on 2-Core DDR3-1600:} Evaluating $4\times$ inner dot products across all 24 layers and the 248,320-row \texttt{lm\_head}, plus 18-layer DeltaNet snapshot and rewind (\texttt{qwen35\_rewind\_deltanet\_to}), takes $\sim$2.5--3.0$\times$ a single $B=1$ \texttt{dot2} step, requiring $>2\text{--}2.5$ accepted tokens/batch to break even. Permissive \texttt{1-gram} triggering inflated miss rates (15/18 batches on \texttt{english\_qa}, 15/23 on \texttt{tool\_json}, 8/18 on \texttt{rag\_edit}, 12/14 on \texttt{long\_decode}), slowing even high-acceptance agentic tasks (\texttt{rag\_edit}: 11.05 vs.\ 13.29\,tok/s; \texttt{tool\_json}: 11.48 vs.\ 13.56\,tok/s); only repetitive phrasing (\texttt{french}: 23/12 accepted/batch, $+17.5\%$) improved.
+    \item \textbf{Unsound Heuristic \texttt{lm\_head} Margin Gating:} Under \texttt{LILA\_ASI\_LMHEAD\_SHORTLIST=1}, \texttt{english\_qa} step~8 substituted token \texttt{6424} (page~25, inside \texttt{0..32767}) for unvisited token \texttt{40755} (page~159), breaking greedy parity (\texttt{eq\_v2.2=false}). Exact shortlisting requires provable Cauchy--Schwarz row-norm upper bounds or confining vocabulary pruning strictly to a draft stage verified by the full \texttt{lm\_head}~\cite{zhao2025}.
+\end{enumerate}
+Reverting to \texttt{v2.2} (\texttt{dot2=1/1}, 621.6\,MiB RSS) preserves exact greedy parity while maintaining \texttt{v2.2}'s decode advantage over \texttt{llama.cpp} across \texttt{t1\_dec} (14.15 vs.\ 12.12), \texttt{t2\_dec} (12.92 vs.\ 12.24), \texttt{english\_qa} (13.50 vs.\ 13.15), \texttt{rag\_edit} (13.29 vs.\ 12.17), \texttt{tool\_json} (13.56 vs.\ 10.60), and \texttt{spanish} (12.08 vs.\ 11.56\,tok/s).
+
 \section{Honest Limitations and Future Work}
 
 \begin{enumerate}
     \item \textbf{Pre-v2.2 $N=15$ / $N=10$ Captures:} Both \texttt{results\_broadwell\_n15.json} (\texttt{G1 Tier: BEATS}) and Colab $N=10$ (\texttt{4e73276}) predate v2.2 (\texttt{dot2=1} defaults, SMT spin-backoff, and \texttt{/proc/stat} \texttt{steal\_jiffies} telemetry). Full $N=15$ G1 re-runs on Broadwell and Colab Xeon via \texttt{colab\_asi\_benchmark.ipynb} remain the immediate empirical priority.
     \item \textbf{Compile-Only Wide-SIMD and ARM64 Paths:} Only AVX2 + FMA + F16C has been executed on physical silicon; AVX-512, AVX-512-VNNI, non-\texttt{F16C}, and ARM64 NEON branches are compile/audit-verified only and require execution on Sapphire Rapids/Zen~4 and ARM64 hardware.
-    \item \textbf{DRAM Ceiling and \texttt{lm\_head} Dominance:} On Broadwell (12.08\,GB/s DRAM-RO), 518.34\,MB/tok limits pure DRAM-bound decode to 23.31\,tok/s, with \texttt{lm\_head} consuming 40.24\% of active bytes ($\sim$36\% of decode latency).
+    \item \textbf{DRAM Ceiling and \texttt{lm\_head} Dominance:} On Broadwell (12.08\,GB/s DRAM-RO), 518.34\,MB/tok limits pure DRAM-bound decode to 23.31\,tok/s, with \texttt{lm\_head} consuming 40.24\% of active bytes ($\sim$36\% of decode latency). As shown in Section~\ref{subsec:neg_spec}, naive $B=4$ lookup speculation and heuristic margin shortlisting fail on 2-core CPUs; future work must explore exact Cauchy--Schwarz norm-bounded \texttt{lm\_head} pruning or strictly draft-scoped vocabulary compression.
     \item \textbf{Lazy \texttt{mmap} Cold-Fault Tradeoff:} Skipping \texttt{LILA\_ASI\_VERIFY\_CRC=1} keeps \texttt{lila\_asi\_open} near 27\,ms, but without \texttt{-{}-prepopulate}, cold page faults shift into Turn-1 TTFT.
     \item \textbf{Dense Architecture Dispatch:} \texttt{g\_asi\_arch\_hybrid\_qwen35} is complete and G0-verified, whereas \texttt{g\_asi\_arch\_dense\_transformer} currently registers \texttt{NULL} handlers in \texttt{asi\_arch.c}.
 \end{enumerate}
+
+\begin{thebibliography}{9}
+
+\bibitem{leviathan2023}
+Yaniv Leviathan, Matan Kalman, and Yossi Matias.
+\newblock Fast Inference from Transformers via Speculative Decoding.
+\newblock In \emph{Proceedings of the 40th International Conference on Machine Learning (ICML 2023)}, PMLR 202:19274--19286, 2023. \href{https://arxiv.org/abs/2211.17192}{arXiv:2211.17192}.
+
+\bibitem{chen2023}
+Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre, and John Jumper.
+\newblock Accelerating Large Language Model Decoding with Speculative Sampling.
+\newblock \href{https://arxiv.org/abs/2302.01318}{arXiv:2302.01318}, 2023.
+
+\bibitem{saxena2023}
+Apoorv Saxena.
+\newblock Prompt Lookup Decoding.
+\newblock Open-source technical release, \url{https://github.com/apoorvumang/prompt-lookup-decoding}, November 2023.
+
+\bibitem{cai2024}
+Tianle Cai, Yuhong Li, Zhengyang Geng, Hongwu Peng, Jason D. Lee, Deming Chen, and Tri Dao.
+\newblock Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads.
+\newblock In \emph{Proceedings of the 41st International Conference on Machine Learning (ICML 2024)}, 2024. \href{https://arxiv.org/abs/2401.10774}{arXiv:2401.10774}.
+
+\bibitem{fu2024}
+Yichao Fu, Peter Bailis, Ion Stoica, and Hao Zhang.
+\newblock Break the Sequential Dependency of LLM Inference Using Lookahead Decoding.
+\newblock In \emph{Proceedings of the 41st International Conference on Machine Learning (ICML 2024)}, 2024. \href{https://arxiv.org/abs/2402.02057}{arXiv:2402.02057}.
+
+\bibitem{zhao2025}
+Weilin Zhao, Tengyu Pan, Xu Han, Yudi Zhang, Ao Sun, Yuxiang Huang, Kaihuo Zhang, Weilun Zhao, Yuxuan Li, Jie Zhou, Hao Zhou, Jianyong Wang, Zhiyuan Liu, and Maosong Sun.
+\newblock FR-Spec: Accelerating Large-Vocabulary Language Models via Frequency-Ranked Speculative Sampling.
+\newblock In \emph{Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (ACL 2025, Volume 1: Long Papers)}, DOI: 10.18653/v1/2025.acl-long.198, 2025. \href{https://arxiv.org/abs/2502.14856}{arXiv:2502.14856}.
+
+\end{thebibliography}
 
 \end{document}
